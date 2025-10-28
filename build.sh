@@ -6,7 +6,7 @@ set -euo pipefail
 # NOTE: This script does NOT clone repositories. Prepare sources yourself.
 
 # Defaults
-PROJECTS="all"       # all|llama|whisper|sd (stable-diffusion)
+PROJECTS="all"       # all|llama|whisper|sd|tts (stable-diffusion|tts)
 DEVICES="auto"       # auto|cpu|vulkan|cuda|opencl|all (comma-separated allowed)
 JOBS=""              # empty => cmake default; else e.g. -j 8
 CLEAN=0
@@ -19,21 +19,24 @@ OUT_DIR="$ROOT_DIR/EVA_BACKEND"
 LLAMA_SRC_CLI="";   : "${LLAMA_SRC:=}"
 WHISPER_SRC_CLI=""; : "${WHISPER_SRC:=}"
 SD_SRC_CLI="";      : "${SD_SRC:=}"
+TTS_SRC_CLI="";     : "${TTS_SRC:=}"
 
 # Pinned refs (only checked and warned; no automatic checkout)
 LLAMA_EXPECT_REF="b6746"
 WHISPER_EXPECT_TAG="v1.8.1"
 SD_EXPECT_REF="0585e2609d26fc73cde0dd963127ae585ca62d49"
+TTS_EXPECT_REF="e4634fb"
 
 usage() {
-  echo "Usage: $0 [-p projects] [-d devices] [-j jobs] [--clean] [--llama-src PATH] [--whisper-src PATH] [--sd-src PATH]"
-  echo "  -p, --projects  all|llama|whisper|sd (comma-separated)"
+  echo "Usage: $0 [-p projects] [-d devices] [-j jobs] [--clean] [--llama-src PATH] [--whisper-src PATH] [--sd-src PATH] [--tts-src PATH]"
+  echo "  -p, --projects  all|llama|whisper|sd|tts (comma-separated)"
   echo "  -d, --devices   auto|cpu|vulkan|cuda|opencl|all (comma-separated)"
   echo "  -j, --jobs      parallel build jobs (passed to cmake --build --parallel)"
   echo "      --clean     remove prior build trees for selected projects/devices"
   echo "      --llama-src PATH     explicit llama.cpp source dir"
   echo "      --whisper-src PATH   explicit whisper.cpp source dir"
   echo "      --sd-src PATH        explicit stable-diffusion.cpp source dir"
+  echo "      --tts-src PATH       explicit tts.cpp source dir"
 }
 
 parse_args() {
@@ -46,6 +49,7 @@ parse_args() {
       --llama-src)   LLAMA_SRC_CLI="$2"; shift 2;;
       --whisper-src) WHISPER_SRC_CLI="$2"; shift 2;;
       --sd-src)      SD_SRC_CLI="$2"; shift 2;;
+      --tts-src)     TTS_SRC_CLI="$2"; shift 2;;
       -h|--help)     usage; exit 0;;
       *) echo "Unknown arg: $1"; usage; exit 1;;
     esac
@@ -126,7 +130,7 @@ resolve_devices() {
 }
 
 resolve_src_dir() {
-  # $1=name (llama|whisper|sd), $2=cliOverride, $3=envVarName
+  # $1=name (llama|whisper|sd|tts), $2=cliOverride, $3=envVarName
   local name="$1" cli="$2" envname="$3"
   local val=""
   if [[ -n "$cli" ]]; then echo "$cli"; return 0; fi
@@ -144,6 +148,10 @@ resolve_src_dir() {
       done;;
     sd)
       for cand in "$ROOT_DIR/stable-diffusion.cpp" "$EXTERN_DIR/stable-diffusion.cpp"; do
+        if [[ -f "$cand/CMakeLists.txt" ]]; then echo "$cand"; return 0; fi
+      done;;
+    tts)
+      for cand in "$ROOT_DIR/tts.cpp" "$EXTERN_DIR/tts.cpp"; do
         if [[ -f "$cand/CMakeLists.txt" ]]; then echo "$cand"; return 0; fi
       done;;
   esac
@@ -299,6 +307,39 @@ build_sd() {
   copy_bin "$bdir" sd "$out" "$exe_suf" || true
 }
 
+build_tts() {
+  local device="$1" os="$2" arch="$3" exe_suf="$4"
+  local src
+  src="$(resolve_src_dir tts "$TTS_SRC_CLI" TTS_SRC)"
+  if [[ -z "$src" ]]; then
+    echo "[error] tts.cpp source not found. Provide --tts-src or set TTS_SRC or place repo at ./tts.cpp or ./external/tts.cpp" >&2
+    exit 2
+  fi
+  show_version_note "tts.cpp" "$src" "$TTS_EXPECT_REF" ""
+  local bdir="$BUILD_DIR/tts.cpp/$device"
+  if [[ $CLEAN -eq 1 ]]; then rm -rf "$bdir"; fi
+  mkdir -p "$bdir"
+  local vflag="-DGGML_VULKAN=OFF" cuflag="-DGGML_CUDA=OFF" ocflag="-DGGML_OPENCL=OFF"
+  local native_extra=""
+  case "$device" in
+    vulkan) vflag="-DGGML_VULKAN=ON" ;;
+    cuda)   cuflag="-DGGML_CUDA=ON"; native_extra="-DGGML_NATIVE=OFF" ;;
+    opencl) ocflag="-DGGML_OPENCL=ON" ;;
+    cpu)    ;;
+    *)
+      echo "[warn] tts.cpp: skipping unsupported device '$device'" >&2
+      return 0
+      ;;
+  esac
+  cmake -S "$src" -B "$bdir" $(cmake_gen) \
+    -DBUILD_SHARED_LIBS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+    -DTTS_BUILD_EXAMPLES=ON \
+    $vflag $cuflag $ocflag $native_extra -DCMAKE_BUILD_TYPE=Release
+  cmake --build "$bdir" $(cmake_jobs_flag) --config Release --target tts-cli
+  local out="$OUT_DIR/$arch/$os/$device/tts.cpp"
+  copy_bin "$bdir" tts-cli "$out" "$exe_suf" || true
+}
+
 main() {
   parse_args "$@"
   local OS=$(os_id) ARCH=$(arch_id)
@@ -309,7 +350,7 @@ main() {
   # Resolve project list
   local PROJ_ARR=()
   if [[ "$PROJECTS" == "all" ]]; then
-    PROJ_ARR=(llama whisper sd)
+    PROJ_ARR=(llama whisper sd tts)
   else
     IFS=',' read -r -a PROJ_ARR <<< "$PROJECTS"
   fi
@@ -323,6 +364,7 @@ main() {
         llama)   build_llama   "$dev" "$OS" "$ARCH" "$EXE_SUF";;
         whisper) build_whisper "$dev" "$OS" "$ARCH" "$EXE_SUF";;
         sd)      build_sd      "$dev" "$OS" "$ARCH" "$EXE_SUF";;
+        tts)     build_tts     "$dev" "$OS" "$ARCH" "$EXE_SUF";;
         *) echo "Unknown project: $proj"; exit 1;;
       esac
     done
