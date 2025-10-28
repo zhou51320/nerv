@@ -8,3 +8,4 @@ EVA_BACKEND
 old-cmake
 EVA_TEMP
 eva.exe
+tts.cpp/.venv
