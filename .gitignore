@@ -11,3 +11,5 @@ eva.exe
 tts.cpp/.venv
 build-x86_64-linux
 build-aarch64-linux
+build-x86_64-win
+build-x86_64-win7
