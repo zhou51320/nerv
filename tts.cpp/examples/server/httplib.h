@@ -2688,29 +2688,59 @@ inline bool mmap::open(const char *path) {
   close();
 
 #if defined(_WIN32)
-  std::wstring wpath;
-  for (size_t i = 0; i < strlen(path); i++) {
-    wpath += path[i];
-  }
+  auto wpath = u8string_to_wstring(path);
+  if (wpath.empty()) { return false; }
 
+#if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_APP | WINAPI_PARTITION_SYSTEM | WINAPI_PARTITION_GAMES) && (_WIN32_WINNT >= _WIN32_WINNT_WIN8)
   hFile_ = ::CreateFile2(wpath.c_str(), GENERIC_READ, FILE_SHARE_READ,
                          OPEN_EXISTING, NULL);
-
+#else
+  hFile_ = ::CreateFileW(wpath.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL,
+                         OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+#endif
   if (hFile_ == INVALID_HANDLE_VALUE) { return false; }
 
   LARGE_INTEGER size{};
   if (!::GetFileSizeEx(hFile_, &size)) { return false; }
+  // If the following line doesn't compile due to QuadPart, update Windows SDK.
+  // See:
+  // https://github.com/yhirose/cpp-httplib/issues/1903#issuecomment-2316520721
+  if (static_cast<ULONGLONG>(size.QuadPart) >
+      (std::numeric_limits<decltype(size_)>::max)()) {
+    // `size_t` might be 32-bits, on 32-bits Windows.
+    return false;
+  }
   size_ = static_cast<size_t>(size.QuadPart);
 
+#if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_APP | WINAPI_PARTITION_SYSTEM) && (_WIN32_WINNT >= _WIN32_WINNT_WIN8)
   hMapping_ =
       ::CreateFileMappingFromApp(hFile_, NULL, PAGE_READONLY, size_, NULL);
+#else
+  hMapping_ =
+      ::CreateFileMappingW(hFile_, NULL, PAGE_READONLY, size.HighPart,
+                           size.LowPart, NULL);
+#endif
+  // Special treatment for an empty file...
+  if (hMapping_ == NULL && size_ == 0) {
+    close();
+    is_open_empty_file = true;
+    return true;
+  }
 
   if (hMapping_ == NULL) {
     close();
     return false;
   }
 
+#if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_APP | WINAPI_PARTITION_SYSTEM) && (_WIN32_WINNT >= _WIN32_WINNT_WIN8)
   addr_ = ::MapViewOfFileFromApp(hMapping_, FILE_MAP_READ, 0, 0);
+#else
+  addr_ = ::MapViewOfFile(hMapping_, FILE_MAP_READ, 0, 0, 0);
+#endif
+  if (addr_ == nullptr) {
+    close();
+    return false;
+  }
 #else
   fd_ = ::open(path, O_RDONLY);
   if (fd_ == -1) { return false; }
@@ -2723,12 +2753,14 @@ inline bool mmap::open(const char *path) {
   size_ = static_cast<size_t>(sb.st_size);
 
   addr_ = ::mmap(NULL, size_, PROT_READ, MAP_PRIVATE, fd_, 0);
-#endif
 
-  if (addr_ == nullptr) {
+  // Special treatment for an empty file...
+  if (addr_ == MAP_FAILED && size_ == 0) {
     close();
+    is_open_empty_file = true;
     return false;
   }
+#endif
 
   return true;
 }
