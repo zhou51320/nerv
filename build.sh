@@ -236,7 +236,7 @@ build_llama() {
   local help_out
   help_out=$(cmake --build "$bdir" --config Release --target help 2>/dev/null || true)
   local targets=()
-  for t in llama-server llama-quantize llama-tts; do
+  for t in llama-server llama-quantize; do
     if echo "$help_out" | grep -q "$t"; then targets+=("$t"); fi
   done
   if [[ "${#targets[@]}" -eq 0 ]]; then
@@ -248,7 +248,6 @@ build_llama() {
   local out="$OUT_DIR/$arch/$os/$device/llama.cpp"
   copy_bin "$bdir" llama-server "$out" "$exe_suf" || true
   copy_bin "$bdir" llama-quantize "$out" "$exe_suf" || true
-  copy_bin "$bdir" llama-tts "$out" "$exe_suf" || true
 }
 
 build_whisper() {
@@ -309,6 +308,10 @@ build_sd() {
 
 build_tts() {
   local device="$1" os="$2" arch="$3" exe_suf="$4"
+  if [[ "$device" != "cpu" ]]; then
+    echo "[info] tts.cpp: only CPU builds supported; skipping device '$device'"
+    return 0
+  fi
   local src
   src="$(resolve_src_dir tts "$TTS_SRC_CLI" TTS_SRC)"
   if [[ -z "$src" ]]; then
@@ -321,16 +324,6 @@ build_tts() {
   mkdir -p "$bdir"
   local vflag="-DGGML_VULKAN=OFF" cuflag="-DGGML_CUDA=OFF" ocflag="-DGGML_OPENCL=OFF"
   local native_extra=""
-  case "$device" in
-    vulkan) vflag="-DGGML_VULKAN=ON" ;;
-    cuda)   cuflag="-DGGML_CUDA=ON"; native_extra="-DGGML_NATIVE=OFF" ;;
-    opencl) ocflag="-DGGML_OPENCL=ON" ;;
-    cpu)    ;;
-    *)
-      echo "[warn] tts.cpp: skipping unsupported device '$device'" >&2
-      return 0
-      ;;
-  esac
   cmake -S "$src" -B "$bdir" $(cmake_gen) \
     -DBUILD_SHARED_LIBS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
     -DTTS_BUILD_EXAMPLES=ON \
@@ -344,6 +337,7 @@ main() {
   parse_args "$@"
   local OS=$(os_id) ARCH=$(arch_id)
   local EXE_SUF=""; if [[ "$OS" == "win" ]]; then EXE_SUF=".exe"; fi
+  BUILD_DIR="$ROOT_DIR/build-$ARCH-$OS"
 
   IFS=' ' read -r -a DEV_ARR <<< "$(resolve_devices)"
 
@@ -374,5 +368,3 @@ main() {
 }
 
 main "$@"
-
-

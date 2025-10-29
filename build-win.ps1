@@ -195,12 +195,11 @@ function Build-Llama([string]$device,[string]$arch) {
   if ($device -in @('vulkan','cuda','opencl')) { Assert-BackendEnabled $bdir $device 'llama.cpp' }
   $help = Get-AvailableTargets $bdir
   $targets = @()
-  foreach ($t in @('llama-server','llama-quantize','llama-tts')) { if ($help -match [regex]::Escape($t)) { $targets += $t } }
+  foreach ($t in @('llama-server','llama-quantize')) { if ($help -match [regex]::Escape($t)) { $targets += $t } }
   if ($targets.Count -eq 0) { Invoke-CMakeBuild $bdir @() } else { Invoke-CMakeBuild $bdir $targets }
   $out = Join-Path (Join-Path (Join-Path (Join-Path $OUT $arch) $OS_ID) $device) 'llama.cpp'
   Copy-Binary $bdir 'llama-server' $out
   Copy-Binary $bdir 'llama-quantize' $out
-  Copy-Binary $bdir 'llama-tts' $out
 }
 function Build-Whisper([string]$device,[string]$arch) {
   $src = Resolve-Src 'whisper.cpp' $WhisperSrc 'WHISPER_SRC' @((Join-Path $ROOT 'whisper.cpp'), (Join-Path $EXTERN 'whisper.cpp'))
@@ -244,23 +243,21 @@ function Build-SD([string]$device,[string]$arch) {
 }
 
 function Build-TTS([string]$device,[string]$arch) {
+  if ($device -ne 'cpu') {
+    Write-Host "[info] tts.cpp: only CPU builds supported; skipping device '$device'"
+    return
+  }
   $src = Resolve-Src 'tts.cpp' $TTSSrc 'TTS_SRC' @((Join-Path $ROOT 'tts.cpp'), (Join-Path $EXTERN 'tts.cpp'))
   if (-not $src) { throw "tts.cpp source not found. Provide -TTSSrc or set TTS_SRC or place repo at .\tts.cpp or .\external\tts.cpp." }
   Show-Version 'tts.cpp' $src $TTS_EXPECT_REF ''
   $bdir = Join-Path (Join-Path $BUILD 'tts.cpp') $device
   if ($Clean) { Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $bdir }
-  $defs = @('-D','TTS_BUILD_EXAMPLES=ON')
-  switch ($device) {
-    'vulkan' {  $defs += @('-D','GGML_VULKAN=ON','-D','GGML_CUDA=OFF') }
-    'cuda'   {  $defs += @('-D','GGML_CUDA=ON','-D','GGML_VULKAN=OFF','-D','GGML_NATIVE=OFF') }
-    'opencl' {  $defs += @('-D','GGML_OPENCL=ON','-D','GGML_VULKAN=OFF','-D','GGML_CUDA=OFF') }
-    'cpu'    {  $defs += @('-D','GGML_VULKAN=OFF','-D','GGML_CUDA=OFF') }
-    default  {
-      Write-Warning "tts.cpp [$device]: backend not supported by build script; skipping."
-      return
-    }
-  }
-  if ($device -ne 'opencl') { $defs += @('-D','GGML_OPENCL=OFF') }
+  $defs = @(
+    '-D','TTS_BUILD_EXAMPLES=ON',
+    '-D','GGML_VULKAN=OFF',
+    '-D','GGML_CUDA=OFF',
+    '-D','GGML_OPENCL=OFF'
+  )
   $gen = Get-Generator $arch
   Invoke-CMakeConfigure $src $bdir $gen $defs
   if ($device -in @('vulkan','cuda','opencl')) { Assert-BackendEnabled $bdir $device 'tts.cpp' }
@@ -269,6 +266,7 @@ function Build-TTS([string]$device,[string]$arch) {
   Copy-Binary $bdir 'tts-cli' $out
 }
 $arch = Resolve-Arch
+$BUILD = Join-Path $ROOT ("build-$arch-$OS_ID")
 $devs = Resolve-Devices $Devices
 if ($Projects -eq 'all') { $projs = @('llama','whisper','sd','tts') } else { $projs = $Projects.Split(',') }
 Write-Host "==> OS=$OS_ID ARCH=$arch DEVICES=$($devs -join ',') PROJECTS=$($projs -join ',')"
