@@ -9,3 +9,5 @@ old-cmake
 EVA_TEMP
 eva.exe
 tts.cpp/.venv
+build-x86_64-linux
+build-aarch64-linux

@@ -455,13 +455,13 @@ struct kokoro_runner : tts_generation_runner {
 
     std::vector<std::string_view> list_voices() override;
     std::vector<std::vector<uint32_t>> tokenize_chunks(std::vector<std::string> clauses);
-    void assign_weight(const char * name, ggml_tensor & tensor);
-    void prepare_post_load();
+    void assign_weight(const char * name, ggml_tensor & tensor) override;
+    void prepare_post_load() override;
     kokoro_ubatch build_worst_case_batch();
     void set_inputs(kokoro_ubatch & batch, uint32_t total_size);
     struct ggml_cgraph * build_kokoro_graph(kokoro_ubatch & batch);
     void run(kokoro_ubatch & batch, tts_response & outputs);
-    void generate(const char * prompt, tts_response & response, const generation_configuration & config);
+    void generate(const char * prompt, tts_response & response, const generation_configuration & config) override;
 private:
     string voice{};
     string espeak_voice_id{};

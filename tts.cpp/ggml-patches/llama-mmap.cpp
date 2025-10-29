@@ -4,6 +4,8 @@
 #include "../ggml/src/ggml-impl.h"
 
 #include <cstring>
+#include <string>
+#include <cstdio>
 #include <climits>
 #include <stdexcept>
 #include <cerrno>
@@ -302,10 +304,17 @@ struct llama_mmap::impl {
         if (prefetch && !writable) {
             // MADV_POPULATE_WRITE is a pessimization
 #ifdef __linux__
+    #ifdef MADV_POPULATE_READ
             if (madvise(addr, prefetch, MADV_POPULATE_READ)) {
                 GGML_LOG_WARN("warning: madvise(.., MADV_POPULATE_READ) failed: %s\n",
                         strerror(errno));
             }
+    #else
+            if (posix_madvise(addr, prefetch, POSIX_MADV_WILLNEED)) {
+                GGML_LOG_WARN("warning: posix_madvise(.., POSIX_MADV_WILLNEED) failed: %s\n",
+                        strerror(errno));
+            }
+    #endif
 #else
             if (posix_madvise(addr, prefetch, POSIX_MADV_WILLNEED)) {
                 GGML_LOG_WARN("warning: posix_madvise(.., POSIX_MADV_WILLNEED) failed: %s\n",

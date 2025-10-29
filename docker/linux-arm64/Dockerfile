@@ -119,7 +119,15 @@ ENV Vulkan_GLSLC_EXECUTABLE=/usr/local/bin/glslc
 ENV PATH=/opt/vulkan-sdk/bin:$PATH
 ENV LD_LIBRARY_PATH=/opt/vulkan-sdk/lib:$LD_LIBRARY_PATH
 
-
+# 安装 clang 14 工具链
+RUN apt-get update && apt-get install -y wget gnupg software-properties-common && \
+    wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh && \
+    chmod +x /tmp/llvm.sh && \
+    /tmp/llvm.sh 14 && \
+    apt-get install -y clang-14 libc++-14-dev libc++abi-14-dev && \
+    rm -f /tmp/llvm.sh && \
+    rm -rf /var/lib/apt/lists/*
+    
 # 设置工作目录
 WORKDIR /workspace
 

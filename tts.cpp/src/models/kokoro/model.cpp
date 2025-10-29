@@ -1450,8 +1450,12 @@ void kokoro_runner::generate(const char * prompt, tts_response & response, const
 }
 
 std::vector<std::string_view> kokoro_runner::list_voices() {
-    const auto voices{ views::keys(model->voices) | views::transform([](const auto & x) { return string_view{ x }; }) };
-    return std::vector(cbegin(voices), cend(voices));
+    std::vector<std::string_view> voices;
+    voices.reserve(model->voices.size());
+    for (const auto & kv : model->voices) {
+        voices.emplace_back(kv.first);
+    }
+    return voices;
 }
 
 const char * get_espeak_id_from_kokoro_voice(std::string voice) {

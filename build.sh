@@ -21,6 +21,13 @@ WHISPER_SRC_CLI=""; : "${WHISPER_SRC:=}"
 SD_SRC_CLI="";      : "${SD_SRC:=}"
 TTS_SRC_CLI="";     : "${TTS_SRC:=}"
 
+# Toolchain overrides for tts.cpp (auto-detect clang unless overridden)
+: "${TTS_CC:=clang-14}"
+: "${TTS_CXX:=clang++-14}"
+: "${TTS_USE_LIBCXX:=1}"
+: "${TTS_LIBCXX_FLAG:=-stdlib=libc++}"
+: "${TTS_MIN_CLANG_MAJOR:=14}"
+
 # Pinned refs (only checked and warned; no automatic checkout)
 LLAMA_EXPECT_REF="b6746"
 WHISPER_EXPECT_TAG="v1.8.1"
@@ -78,6 +85,49 @@ arch_id() {
 }
 
 have() { command -v "$1" >/dev/null 2>&1; }
+
+clang_major_version() {
+  local bin="$1"
+  local ver_line major=""
+  ver_line=$("$bin" --version 2>/dev/null | head -n1 || true)
+  if [[ "$ver_line" =~ ([0-9]+)\.[0-9]+\.[0-9]+ ]]; then
+    major="${BASH_REMATCH[1]}"
+  elif [[ "$ver_line" =~ version[[:space:]]([0-9]+) ]]; then
+    major="${BASH_REMATCH[1]}"
+  fi
+  if [[ -n "$major" ]]; then
+    echo "$major"
+    return 0
+  fi
+  return 1
+}
+
+detect_clang_binary() {
+  local base="$1"
+  local min_major="${2:-0}"
+  local versions=("" "-18" "-17" "-16" "-15" "-14" "-13" "-12" "-11" "-10")
+  local candidate suffix
+  for suffix in "${versions[@]}"; do
+    candidate="${base}${suffix}"
+    if have "$candidate"; then
+      if [[ "$min_major" -gt 0 ]]; then
+        local major
+        major=$(clang_major_version "$candidate" 2>/dev/null || echo "")
+        if [[ "$major" =~ ^[0-9]+$ && "$min_major" =~ ^[0-9]+$ ]]; then
+          if (( major < min_major )); then
+            continue
+          fi
+        elif [[ "$min_major" =~ ^[0-9]+$ && "$min_major" -gt 0 ]]; then
+          # Could not determine version; skip when minimum specified.
+          continue
+        fi
+      fi
+      echo "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
 
 # Device detection
 can_vulkan() {
@@ -321,13 +371,78 @@ build_tts() {
   show_version_note "tts.cpp" "$src" "$TTS_EXPECT_REF" ""
   local bdir="$BUILD_DIR/tts.cpp/$device"
   if [[ $CLEAN -eq 1 ]]; then rm -rf "$bdir"; fi
+  local desired_cc="${TTS_CC:-}"
+  local desired_cxx="${TTS_CXX:-}"
+  if [[ -n "$desired_cxx" ]]; then
+    if ! have "$desired_cxx"; then
+      echo "[warn] tts.cpp: preferred compiler '$desired_cxx' not found; falling back to auto-detect" >&2
+      desired_cxx=""
+    fi
+  fi
+  if [[ -z "$desired_cxx" ]]; then
+    if desired_cxx=$(detect_clang_binary clang++ "$TTS_MIN_CLANG_MAJOR"); then
+      echo "[info] tts.cpp: auto-detected C++ compiler '$desired_cxx'"
+    else
+      echo "[error] tts.cpp: could not find any clang++ binary meeting minimum version $TTS_MIN_CLANG_MAJOR; install clang-$TTS_MIN_CLANG_MAJOR or set TTS_CXX manually" >&2
+      exit 3
+    fi
+  fi
+  local clang_suffix=""
+  if [[ "$desired_cxx" == clang++-* ]]; then
+    clang_suffix="${desired_cxx#clang++}"
+  fi
+  if [[ -n "$desired_cc" ]]; then
+    if ! have "$desired_cc"; then
+      echo "[warn] tts.cpp: preferred compiler '$desired_cc' not found; falling back to auto-detect" >&2
+      desired_cc=""
+    fi
+  fi
+  if [[ -z "$desired_cc" && -n "$clang_suffix" ]]; then
+    local paired="clang${clang_suffix}"
+    if have "$paired"; then
+      desired_cc="$paired"
+    fi
+  fi
+  if [[ -z "$desired_cc" ]]; then
+    if desired_cc=$(detect_clang_binary clang "$TTS_MIN_CLANG_MAJOR"); then
+      echo "[info] tts.cpp: auto-detected C compiler '$desired_cc'"
+    else
+      echo "[error] tts.cpp: could not find any clang binary meeting minimum version $TTS_MIN_CLANG_MAJOR; install clang-$TTS_MIN_CLANG_MAJOR or set TTS_CC manually" >&2
+      exit 3
+    fi
+  fi
+  TTS_CXX="$desired_cxx"
+  TTS_CC="$desired_cc"
   mkdir -p "$bdir"
+  if [[ -f "$bdir/CMakeCache.txt" ]]; then
+    local cache_cxx
+    cache_cxx=$(grep -E '^CMAKE_CXX_COMPILER:FILEPATH=' "$bdir/CMakeCache.txt" 2>/dev/null | cut -d= -f2 || true)
+    if [[ -n "$cache_cxx" && "$cache_cxx" != *"$(basename "$desired_cxx")" ]]; then
+      echo "[info] tts.cpp: switching compiler to $desired_cxx; clearing previous cache ($cache_cxx)"
+      rm -rf "$bdir"
+      mkdir -p "$bdir"
+    fi
+  fi
+  if ! have "$desired_cc"; then
+    echo "[error] tts.cpp: requested compiler '$desired_cc' not found in PATH" >&2
+    exit 3
+  fi
+  if ! have "$desired_cxx"; then
+    echo "[error] tts.cpp: requested compiler '$desired_cxx' not found in PATH" >&2
+    exit 3
+  fi
+  echo "[info] tts.cpp: using CC='$desired_cc' CXX='$desired_cxx'"
+  local libcxx_args=()
+  if [[ "${TTS_USE_LIBCXX}" == "1" || "${TTS_USE_LIBCXX}" == "true" ]]; then
+    libcxx_args+=(-DCMAKE_CXX_FLAGS="$TTS_LIBCXX_FLAG" -DCMAKE_EXE_LINKER_FLAGS="$TTS_LIBCXX_FLAG")
+  fi
   local vflag="-DGGML_VULKAN=OFF" cuflag="-DGGML_CUDA=OFF" ocflag="-DGGML_OPENCL=OFF"
   local native_extra=""
-  cmake -S "$src" -B "$bdir" $(cmake_gen) \
+  CC="$desired_cc" CXX="$desired_cxx" cmake -S "$src" -B "$bdir" $(cmake_gen) \
     -DBUILD_SHARED_LIBS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
     -DTTS_BUILD_EXAMPLES=ON \
-    $vflag $cuflag $ocflag $native_extra -DCMAKE_BUILD_TYPE=Release
+    $vflag $cuflag $ocflag $native_extra -DCMAKE_BUILD_TYPE=Release \
+    "${libcxx_args[@]}"
   cmake --build "$bdir" $(cmake_jobs_flag) --config Release --target tts-cli
   local out="$OUT_DIR/$arch/$os/$device/tts.cpp"
   copy_bin "$bdir" tts-cli "$out" "$exe_suf" || true
