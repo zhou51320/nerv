@@ -317,7 +317,9 @@ void string_to_spv_func(std::string name, std::string in_path, std::string out_p
 
     // disable spirv-opt for coopmat shaders for https://github.com/ggerganov/llama.cpp/issues/10734
     // disable spirv-opt for bf16 shaders for https://github.com/ggml-org/llama.cpp/issues/15344
-    std::string opt_level = (coopmat || name.find("bf16") != std::string::npos) ? "" : "-O";
+    // also disable for rope_* f16 variants due to SPIR-V optimizer bug (OpFConvert width) in some shaderc versions
+    bool rope_f16_variant = (name.find("rope_") != std::string::npos) && (name.find("_f16") != std::string::npos);
+    std::string opt_level = (coopmat || rope_f16_variant || name.find("bf16") != std::string::npos) ? "" : "-O";
 
     #ifdef _WIN32
         std::vector<std::string> cmd = {GLSLC, "-fshader-stage=compute", target_env, opt_level, "\"" + in_path + "\"", "-o", "\"" + out_path + "\""};

@@ -30,10 +30,18 @@
         #define NOMINMAX
     #endif
     #include <windows.h>
+    #include <memoryapi.h>
     #ifndef PATH_MAX
         #define PATH_MAX MAX_PATH
     #endif
     #include <io.h>
+#endif
+
+#if defined(_WIN32) && !defined(PWIN32_MEMORY_RANGE_ENTRY)
+typedef struct _WIN32_MEMORY_RANGE_ENTRY {
+    PVOID  VirtualAddress;
+    SIZE_T NumberOfBytes;
+} WIN32_MEMORY_RANGE_ENTRY, *PWIN32_MEMORY_RANGE_ENTRY;
 #endif
 
 #if defined(__APPLE__)

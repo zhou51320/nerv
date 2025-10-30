@@ -439,7 +439,7 @@ function Build-TTS([string]$device,[string]$arch) {
   Copy-Binary $bdir 'tts-cli' $out
   $cpuBinary = Join-Path $out $binaryName
   Ensure-MingwRuntime $out
-  if (Test-Path $cpuBinary -and $script:AllDevices -and $script:AllDevices.Count -gt 0) {
+  if ((Test-Path $cpuBinary) -and $script:AllDevices -and ($script:AllDevices.Count -gt 0)) {
     foreach ($extra in $script:AllDevices) {
       if ($extra -eq 'cpu') { continue }
       $extraDir = Get-ProjectOutDir $arch $extra $project
@@ -468,11 +468,16 @@ Write-Host "==> OS=$OS_ID ARCH=$arch COMPILER=$CompilerMode OUT_OS=$OutOsId GENE
 foreach ($d in $devs) {
   foreach ($p in $projs) {
     Write-Host "--- Building $p [$d] ---"
-    switch ($p.Trim()) {
-      'llama'   { Build-Llama   $d $arch }
-      'whisper' { Build-Whisper $d $arch }
-      'sd'      { Build-SD      $d $arch }
-      'tts'     { Build-TTS     $d $arch }
+    switch ($p.Trim().ToLowerInvariant()) {
+      'llama'               { Build-Llama   $d $arch }
+      'llama.cpp'           { Build-Llama   $d $arch }
+      'whisper'             { Build-Whisper $d $arch }
+      'whisper.cpp'         { Build-Whisper $d $arch }
+      'sd'                  { Build-SD      $d $arch }
+      'stable-diffusion'    { Build-SD      $d $arch }
+      'stable-diffusion.cpp' { Build-SD      $d $arch }
+      'tts'                 { Build-TTS     $d $arch }
+      'tts.cpp'             { Build-TTS     $d $arch }
       default   { throw "Unknown project: $p" }
     }
   }
