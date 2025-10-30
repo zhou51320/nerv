@@ -11,9 +11,17 @@ build.bat
 默认只会编译cpu和vulkan版本，-d all 为所有版本 -Compiler msvc 指定编译器
 
 ## 更新后端时注意
+
+- 为了能在win7下运行所有项目的主CMakeLists.txt中顶部添加
+```txt
+if (MSVC)
+    unset(GGML_WIN_VER CACHE)
+else()
+    set(GGML_WIN_VER "0x601" CACHE STRING "ggml: Windows version")
+endif()
+```
 - llama.cpp 为了能在win7下运行
     - 使用mingw编译器 gcc 12版本以上
-    - CMakeLists.txt中顶部添加 set(GGML_WIN_VER "0x601" CACHE STRING   "ggml: Windows version") 
     - 去掉llama.cpp/vendor/cpp-httplib/httplib.h 中 
 ```cpp
 #ifdef _WIN32

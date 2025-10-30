@@ -17,7 +17,11 @@ endif()
 
 # Add path to modules
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/")
-set(GGML_WIN_VER "0x601" CACHE STRING   "ggml: Windows version") 
+if (MSVC)
+    unset(GGML_WIN_VER CACHE)
+else()
+    set(GGML_WIN_VER "0x601" CACHE STRING "ggml: Windows version")
+endif()
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 if (CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)

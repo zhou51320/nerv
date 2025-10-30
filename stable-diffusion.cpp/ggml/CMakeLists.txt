@@ -176,8 +176,10 @@ set(GGML_CPU_ARM_ARCH        "" CACHE STRING "ggml: CPU architecture for ARM")
 set(GGML_CPU_POWERPC_CPUTYPE "" CACHE STRING "ggml: CPU type for PowerPC")
 
 
-if (MINGW)
-    set(GGML_WIN_VER "0x601" CACHE STRING   "ggml: Windows version")
+if (MSVC)
+    unset(GGML_WIN_VER CACHE)
+else()
+    set(GGML_WIN_VER "0x601" CACHE STRING "ggml: Windows version")
 endif()
 
 # ggml core

@@ -11,7 +11,11 @@ if (NOT XCODE AND NOT MSVC AND NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
     set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS "Debug" "Release" "MinSizeRel" "RelWithDebInfo")
 endif()
-set(GGML_WIN_VER "0x601" CACHE STRING   "ggml: Windows version") 
+if (MSVC)
+    unset(GGML_WIN_VER CACHE)
+else()
+    set(GGML_WIN_VER "0x601" CACHE STRING "ggml: Windows version")
+endif()
 message("CMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}")
 
 # Add path to modules

@@ -37,7 +37,8 @@
     #include <io.h>
 #endif
 
-#if defined(_WIN32) && !defined(PWIN32_MEMORY_RANGE_ENTRY)
+#if defined(_WIN32) && (!defined(_WIN32_WINNT) || _WIN32_WINNT < 0x0602)
+// Older Windows SDKs (< Win8) do not expose WIN32_MEMORY_RANGE_ENTRY
 typedef struct _WIN32_MEMORY_RANGE_ENTRY {
     PVOID  VirtualAddress;
     SIZE_T NumberOfBytes;
