@@ -14,6 +14,7 @@ ROOT_DIR="$(pwd)"
 EXTERN_DIR="$ROOT_DIR/external"
 BUILD_DIR="$ROOT_DIR/build"
 OUT_DIR="$ROOT_DIR/EVA_BACKEND"
+ALL_DEVICES=()
 
 # Optional source path overrides (env or CLI)
 LLAMA_SRC_CLI="";   : "${LLAMA_SRC:=}"
@@ -358,8 +359,32 @@ build_sd() {
 
 build_tts() {
   local device="$1" os="$2" arch="$3" exe_suf="$4"
+  local project="tts.cpp"
+  local bin_name="tts-cli$exe_suf"
+  local cpu_out="$OUT_DIR/$arch/$os/cpu/$project"
+  local cpu_bin="$cpu_out/$bin_name"
   if [[ "$device" != "cpu" ]]; then
-    echo "[info] tts.cpp: only CPU builds supported; skipping device '$device'"
+    local target_dir="$OUT_DIR/$arch/$os/$device/$project"
+    local target_bin="$target_dir/$bin_name"
+    if [[ -f "$target_bin" ]]; then
+      echo "[info] tts.cpp: reusing CPU binary for device '$device'"
+      return 0
+    fi
+    if [[ ! -f "$cpu_bin" ]]; then
+      echo "[info] tts.cpp: CPU binary missing; building CPU variant first."
+      build_tts cpu "$os" "$arch" "$exe_suf"
+    fi
+    if [[ -f "$target_bin" ]]; then
+      echo "[info] tts.cpp: populated device '$device' from CPU build"
+      return 0
+    fi
+    if [[ ! -f "$cpu_bin" ]]; then
+      echo "[warn] tts.cpp: CPU binary unavailable; cannot populate device '$device'" >&2
+      return 0
+    fi
+    mkdir -p "$target_dir"
+    cp -f "$cpu_bin" "$target_dir/"
+    echo "Copied $(basename "$cpu_bin") -> $target_dir"
     return 0
   fi
   local src
@@ -444,8 +469,19 @@ build_tts() {
     $vflag $cuflag $ocflag $native_extra -DCMAKE_BUILD_TYPE=Release \
     "${libcxx_args[@]}"
   cmake --build "$bdir" $(cmake_jobs_flag) --config Release --target tts-cli
-  local out="$OUT_DIR/$arch/$os/$device/tts.cpp"
+  local out="$OUT_DIR/$arch/$os/$device/$project"
   copy_bin "$bdir" tts-cli "$out" "$exe_suf" || true
+  local cpu_bin_path="$out/$bin_name"
+  if [[ -f "$cpu_bin_path" && ${#ALL_DEVICES[@]} -gt 0 ]]; then
+    local extra
+    for extra in "${ALL_DEVICES[@]}"; do
+      [[ "$extra" == "cpu" ]] && continue
+      local extra_dir="$OUT_DIR/$arch/$os/$extra/$project"
+      mkdir -p "$extra_dir"
+      cp -f "$cpu_bin_path" "$extra_dir/"
+      echo "Copied $(basename "$cpu_bin_path") -> $extra_dir"
+    done
+  fi
 }
 
 main() {
@@ -455,6 +491,7 @@ main() {
   BUILD_DIR="$ROOT_DIR/build-$ARCH-$OS"
 
   IFS=' ' read -r -a DEV_ARR <<< "$(resolve_devices)"
+  ALL_DEVICES=("${DEV_ARR[@]}")
 
   # Resolve project list
   local PROJ_ARR=()
