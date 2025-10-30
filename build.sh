@@ -29,7 +29,7 @@ TTS_SRC_CLI="";     : "${TTS_SRC:=}"
 : "${TTS_MIN_CLANG_MAJOR:=14}"
 
 # Pinned refs (only checked and warned; no automatic checkout)
-LLAMA_EXPECT_REF="b6746"
+LLAMA_EXPECT_REF="b6880"
 WHISPER_EXPECT_TAG="v1.8.1"
 SD_EXPECT_REF="0585e2609d26fc73cde0dd963127ae585ca62d49"
 TTS_EXPECT_REF="e4634fb"
