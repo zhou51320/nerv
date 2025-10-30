@@ -14,6 +14,15 @@ build.bat
 - llama.cpp 为了能在win7下运行
     - 使用mingw编译器 gcc 12版本以上
     - CMakeLists.txt中顶部添加 set(GGML_WIN_VER "0x601" CACHE STRING   "ggml: Windows version") 
+    - 去掉llama.cpp/vendor/cpp-httplib/httplib.h 中 
+```cpp
+#ifdef _WIN32
+#if defined(_WIN32_WINNT) && _WIN32_WINNT < 0x0A00
+#error                                                                         \
+    "cpp-httplib doesn't support Windows 8 or lower. Please use Windows 10 or later."
+#endif
+#endif
+```
     - common/CMakeLists.txt 搜索(${TARGET} PRIVATE ${LLAMA_COMMON_EXTRA_LIBS} PUBLIC llama Threads::Threads) 下面添加
 ```txt
 if (WIN32)
