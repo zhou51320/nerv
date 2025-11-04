@@ -25,7 +25,8 @@ TTS_SRC_CLI="";     : "${TTS_SRC:=}"
 # Toolchain overrides for tts.cpp (auto-detect clang unless overridden)
 : "${TTS_CC:=clang-14}"
 : "${TTS_CXX:=clang++-14}"
-: "${TTS_USE_LIBCXX:=1}"
+: "${TTS_USE_LIBCXX:=auto}"
+: "${TTS_STATIC_STDLIB:=auto}"
 : "${TTS_LIBCXX_FLAG:=-stdlib=libc++}"
 : "${TTS_MIN_CLANG_MAJOR:=14}"
 
@@ -457,9 +458,71 @@ build_tts() {
     exit 3
   fi
   echo "[info] tts.cpp: using CC='$desired_cc' CXX='$desired_cxx'"
-  local libcxx_args=()
-  if [[ "${TTS_USE_LIBCXX}" == "1" || "${TTS_USE_LIBCXX}" == "true" ]]; then
-    libcxx_args+=(-DCMAKE_CXX_FLAGS="$TTS_LIBCXX_FLAG" -DCMAKE_EXE_LINKER_FLAGS="$TTS_LIBCXX_FLAG")
+  local host_uname
+  host_uname=$(uname -s)
+  local cmake_flag_args=()
+  local cxx_flags=()
+  local link_flags=()
+  local use_libcxx_raw="${TTS_USE_LIBCXX:-}"
+  local use_libcxx_lc
+  use_libcxx_lc=$(printf '%s' "$use_libcxx_raw" | tr '[:upper:]' '[:lower:]')
+  local use_libcxx=""
+  case "$use_libcxx_lc" in
+    1|true|yes|on) use_libcxx="1";;
+    0|false|no|off) use_libcxx="0";;
+    auto|"") if [[ "$host_uname" == "Darwin" ]]; then use_libcxx="1"; else use_libcxx="0"; fi;;
+    *) use_libcxx="0";;
+  esac
+  if [[ "$use_libcxx" == "1" ]]; then
+    echo "[info] tts.cpp: linking with libc++ runtime"
+    cxx_flags+=("$TTS_LIBCXX_FLAG")
+    link_flags+=("$TTS_LIBCXX_FLAG")
+  else
+    echo "[info] tts.cpp: linking with libstdc++ runtime"
+  fi
+  local static_stdlib_raw="${TTS_STATIC_STDLIB:-auto}"
+  local static_stdlib_lc
+  static_stdlib_lc=$(printf '%s' "$static_stdlib_raw" | tr '[:upper:]' '[:lower:]')
+  local static_stdlib=""
+  case "$static_stdlib_lc" in
+    1|true|yes|on) static_stdlib="1";;
+    0|false|no|off) static_stdlib="0";;
+    auto|"")
+      if [[ "$os" == "win" ]]; then
+        static_stdlib="0"
+      elif [[ "$use_libcxx" == "1" ]]; then
+        static_stdlib="0"
+      else
+        static_stdlib="1"
+      fi
+      ;;
+    *) static_stdlib="0";;
+  esac
+  if [[ "$static_stdlib" == "1" ]]; then
+    if [[ "$use_libcxx" == "1" ]]; then
+      echo "[warn] tts.cpp: static stdlib requested but libc++ selected; resulting binary may still depend on libc++.so" >&2
+    else
+      link_flags+=("-static-libstdc++" "-static-libgcc")
+      echo "[info] tts.cpp: enabling static libstdc++/libgcc linking"
+    fi
+  fi
+  if [[ -n "${TTS_EXTRA_CXX_FLAGS:-}" ]]; then
+    cxx_flags+=("${TTS_EXTRA_CXX_FLAGS}")
+  fi
+  if [[ -n "${TTS_EXTRA_LINKER_FLAGS:-}" ]]; then
+    link_flags+=("${TTS_EXTRA_LINKER_FLAGS}")
+  fi
+  if (( ${#cxx_flags[@]} )); then
+    local cxx_flags_str
+    printf -v cxx_flags_str '%s ' "${cxx_flags[@]}"
+    cxx_flags_str="${cxx_flags_str% }"
+    cmake_flag_args+=(-DCMAKE_CXX_FLAGS="$cxx_flags_str")
+  fi
+  if (( ${#link_flags[@]} )); then
+    local link_flags_str
+    printf -v link_flags_str '%s ' "${link_flags[@]}"
+    link_flags_str="${link_flags_str% }"
+    cmake_flag_args+=(-DCMAKE_EXE_LINKER_FLAGS="$link_flags_str")
   fi
   local vflag="-DGGML_VULKAN=OFF" cuflag="-DGGML_CUDA=OFF" ocflag="-DGGML_OPENCL=OFF"
   local native_extra=""
@@ -467,7 +530,7 @@ build_tts() {
     -DBUILD_SHARED_LIBS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
     -DTTS_BUILD_EXAMPLES=ON \
     $vflag $cuflag $ocflag $native_extra -DCMAKE_BUILD_TYPE=Release \
-    "${libcxx_args[@]}"
+    "${cmake_flag_args[@]}"
   cmake --build "$bdir" $(cmake_jobs_flag) --config Release --target tts-cli
   local out="$OUT_DIR/$arch/$os/$device/$project"
   copy_bin "$bdir" tts-cli "$out" "$exe_suf" || true
