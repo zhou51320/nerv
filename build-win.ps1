@@ -273,7 +273,10 @@ function Build-Llama([string]$device,[string]$arch) {
     'opencl' {  $defs += @('-D','GGML_OPENCL=ON','-D','SD_OPENCL=ON') }
     default  { $defs += @('-D','GGML_VULKAN=OFF','-D','GGML_CUDA=OFF','-D','GGML_OPENCL=OFF') }
   }
-  if ($script:CompilerMode -eq 'mingw') { $defs += @('-D','CMAKE_OBJECT_PATH_MAX=196') }
+  if ($script:CompilerMode -eq 'mingw') {
+    $defs += @('-D','CMAKE_OBJECT_PATH_MAX=196')
+    $defs += @('-D','GGML_WIN_VER=0x601')
+  }
   $gen = $GeneratorSpec
   Invoke-CMakeConfigure $src $bdir $gen $defs
   if ($device -in @('vulkan','cuda','opencl')) { Assert-BackendEnabled $bdir $device 'llama.cpp' }
