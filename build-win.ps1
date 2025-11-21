@@ -259,6 +259,29 @@ function Assert-BackendEnabled([string]$bdir,[string]$device,[string]$project) {
   }
 }
 
+function Add-MingwCpuAccelGuards {
+  param(
+    [string[]]$defs,
+    [string]$device,
+    [switch]$IncludeLlamaNative
+  )
+  $result = @()
+  if ($defs) { $result += $defs }
+  if (($script:CompilerMode -eq 'mingw') -and ($device -eq 'cpu')) {
+    $result += @(
+      '-D', 'GGML_NATIVE=OFF',
+      '-D', 'GGML_AVX=OFF',
+      '-D', 'GGML_AVX2=OFF',
+      '-D', 'GGML_FMA=OFF',
+      '-D', 'GGML_F16C=OFF'
+    )
+    if ($IncludeLlamaNative) {
+      $result += @('-D', 'LLAMA_NATIVE=OFF')
+    }
+  }
+  return $result
+}
+
 
 function Build-Llama([string]$device,[string]$arch) {
   $src = Resolve-Src 'llama.cpp' $LlamaSrc 'LLAMA_SRC' @((Join-Path $ROOT 'llama.cpp'), (Join-Path $EXTERN 'llama.cpp'))
@@ -273,6 +296,7 @@ function Build-Llama([string]$device,[string]$arch) {
     'opencl' {  $defs += @('-D','GGML_OPENCL=ON','-D','SD_OPENCL=ON') }
     default  { $defs += @('-D','GGML_VULKAN=OFF','-D','GGML_CUDA=OFF','-D','GGML_OPENCL=OFF') }
   }
+  $defs = Add-MingwCpuAccelGuards -defs $defs -device $device -IncludeLlamaNative
   if ($script:CompilerMode -eq 'mingw') {
     $defs += @('-D','CMAKE_OBJECT_PATH_MAX=196')
     $defs += @('-D','GGML_WIN_VER=0x601')
@@ -301,6 +325,7 @@ function Build-Whisper([string]$device,[string]$arch) {
     'opencl' {  $defs += @('-D','GGML_OPENCL=ON','-D','SD_OPENCL=ON') }
     default  { $defs += @('-D','GGML_VULKAN=OFF','-D','GGML_CUDA=OFF','-D','GGML_OPENCL=OFF') }
   }
+  $defs = Add-MingwCpuAccelGuards -defs $defs -device $device
   $gen = $GeneratorSpec
   Invoke-CMakeConfigure $src $bdir $gen $defs
   if ($device -in @('vulkan','cuda','opencl')) { Assert-BackendEnabled $bdir $device 'whisper.cpp' }
@@ -321,6 +346,7 @@ function Build-SD([string]$device,[string]$arch) {
     'opencl' {  $defs += @('-D','GGML_OPENCL=ON','-D','SD_OPENCL=ON') }
     default  { $defs += @('-D','GGML_VULKAN=OFF','-D','GGML_CUDA=OFF','-D','GGML_OPENCL=OFF') }
   }
+  $defs = Add-MingwCpuAccelGuards -defs $defs -device $device
   $gen = $GeneratorSpec
   Invoke-CMakeConfigure $src $bdir $gen $defs
   if ($device -in @('vulkan','cuda','opencl')) { Assert-BackendEnabled $bdir $device 'stable-diffusion.cpp' }
@@ -369,6 +395,7 @@ function Build-TTS([string]$device,[string]$arch) {
     '-D','GGML_CUDA=OFF',
     '-D','GGML_OPENCL=OFF'
   )
+  $defs = Add-MingwCpuAccelGuards -defs $defs -device $device
   $gen = $GeneratorSpec
   Invoke-CMakeConfigure $src $bdir $gen $defs
   if ($device -in @('vulkan','cuda','opencl')) { Assert-BackendEnabled $bdir $device 'tts.cpp' }
@@ -398,13 +425,7 @@ if ($CompilerMode -eq 'mingw') {
     '-D', "CMAKE_CXX_FLAGS:STRING=$compileFlags",
     '-D', "CMAKE_EXE_LINKER_FLAGS:STRING=$linkFlags",
     '-D', "CMAKE_SHARED_LINKER_FLAGS:STRING=$linkFlags",
-    '-D', "CMAKE_MODULE_LINKER_FLAGS:STRING=$linkFlags",
-    '-D', 'LLAMA_NATIVE=OFF',
-    '-D', 'GGML_NATIVE=OFF',
-    '-D', 'GGML_AVX=OFF',
-    '-D', 'GGML_AVX2=OFF',
-    '-D', 'GGML_FMA=OFF',
-    '-D', 'GGML_F16C=OFF'
+    '-D', "CMAKE_MODULE_LINKER_FLAGS:STRING=$linkFlags"
   )
 }
 $buildOsTag = if ($CompilerMode -eq 'mingw') { 'win7' } else { $OS_ID }
