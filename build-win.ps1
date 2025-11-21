@@ -370,9 +370,8 @@ function Build-TTS([string]$device,[string]$arch) {
   Invoke-CMakeConfigure $src $bdir $gen $defs
   if ($device -in @('vulkan','cuda','opencl')) { Assert-BackendEnabled $bdir $device 'tts.cpp' }
   Invoke-CMakeBuild $bdir @('tts-cli')
-  $out = $cpuOutDir
-  Copy-Binary $bdir 'tts-cli' $out
-  $cpuBinary = Join-Path $out $binaryName
+  Copy-Binary $bdir 'tts-cli' $cpuOutDir
+  $cpuBinary = Join-Path $cpuOutDir $binaryName
   if ((Test-Path $cpuBinary) -and $script:AllDevices -and ($script:AllDevices.Count -gt 0)) {
     foreach ($extra in $script:AllDevices) {
       if ($extra -eq 'cpu') { continue }
