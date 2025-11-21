@@ -18,17 +18,7 @@ $OS_ID     = 'win'
 $script:OutOsId = $OS_ID
 $script:AllDevices = @()
 $script:CompilerMode = 'auto'
-$script:MingwRuntimePaths = @()
-$script:MingwRuntimeDlls = @(
-  'libatomic-1.dll',
-  'libgcc_s_seh-1.dll',
-  'libgfortran-5.dll',
-  'libgomp-1.dll',
-  'libquadmath-0.dll',
-  'libstdc++-6.dll',
-  'libwinpthread-1.dll'
-)
-$script:RuntimeDirsCopied = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+$script:GlobalCMakeConfigureArgs = @()
 
 $Compiler = if ($Compiler) { $Compiler.Trim() } else { 'auto' }
 $Compiler = $Compiler.ToLowerInvariant()
@@ -206,7 +196,10 @@ function Invoke-CMakeConfigure([string]$src,[string]$bdir,[hashtable]$gen,[strin
   $args = @('-S', $src, '-B', $bdir, '-D', 'BUILD_SHARED_LIBS=OFF', '-D', 'CMAKE_POSITION_INDEPENDENT_CODE=ON', '-D', 'CMAKE_BUILD_TYPE=Release')
   if ($gen.G) { $args += @('-G', $gen.G) }
   if ($gen.A) { $args += @('-A', $gen.A) }
-  foreach ($d in $defs) { $args += $d }
+  $allDefs = @()
+  if ($defs -and $defs.Count -gt 0) { $allDefs += $defs }
+  if ($script:GlobalCMakeConfigureArgs -and $script:GlobalCMakeConfigureArgs.Count -gt 0) { $allDefs += $script:GlobalCMakeConfigureArgs }
+  foreach ($d in $allDefs) { $args += $d }
   & cmake @args
 }
 
@@ -236,60 +229,6 @@ function Copy-Binary([string]$bdir,[string]$tgt,[string]$outdir) {
 function Get-ProjectOutDir([string]$arch,[string]$device,[string]$project) {
   $osSegment = if ($script:OutOsId) { $script:OutOsId } else { $OS_ID }
   return Join-Path (Join-Path (Join-Path (Join-Path $OUT $arch) $osSegment) $device) $project
-}
-
-function Resolve-MingwRuntimePaths {
-  $candidates = New-Object System.Collections.Generic.List[string]
-  $pathParts = ($env:PATH -split ';') | Where-Object { $_ -and $_.Trim() -ne '' }
-  foreach ($p in $pathParts) { [void]$candidates.Add($p.Trim()) }
-  foreach ($var in @('MINGW_HOME','MINGW64_HOME','MSYS2_HOME','MSYSTEM_PREFIX')) {
-    $val = [Environment]::GetEnvironmentVariable($var)
-    if ($val -and (Test-Path $val)) {
-      [void]$candidates.Add($val)
-      $bin = Join-Path $val 'bin'
-      if (Test-Path $bin) { [void]$candidates.Add($bin) }
-    }
-  }
-  foreach ($extra in @('C:\mingw64\bin','C:\msys64\mingw64\bin')) {
-    if (Test-Path $extra) { [void]$candidates.Add($extra) }
-  }
-  $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
-  $result = New-Object System.Collections.Generic.List[string]
-  foreach ($cand in $candidates) {
-    $trim = $cand.Trim()
-    if ($trim -eq '') { continue }
-    if (-not (Test-Path $trim)) { continue }
-    if ($seen.Add($trim)) { [void]$result.Add($trim) }
-  }
-  return $result.ToArray()
-}
-
-function Ensure-MingwRuntime([string]$targetDir) {
-  if ($script:CompilerMode -ne 'mingw') { return }
-  if (-not $targetDir) { return }
-  if (-not (Test-Path $targetDir)) { return }
-  if ($script:RuntimeDirsCopied.Contains($targetDir)) { return }
-  if (-not $script:MingwRuntimePaths -or $script:MingwRuntimePaths.Count -eq 0) {
-    $script:MingwRuntimePaths = Resolve-MingwRuntimePaths
-  }
-  foreach ($dll in $script:MingwRuntimeDlls) {
-    $source = $null
-    foreach ($dir in $script:MingwRuntimePaths) {
-      $candidate = Join-Path $dir $dll
-      if (Test-Path $candidate) { $source = $candidate; break }
-    }
-    if ($source) {
-      try {
-        Copy-Item $source -Destination (Join-Path $targetDir $dll) -Force
-        Write-Host "Copied $dll -> $targetDir"
-      } catch {
-        Write-Warning "Failed to copy $dll from $source to ${targetDir}: $_"
-      }
-    } else {
-      Write-Warning "MinGW runtime DLL '$dll' not found in PATH; ensure MinGW bin directory is accessible."
-    }
-  }
-  $script:RuntimeDirsCopied.Add($targetDir) | Out-Null
 }
 
 function Get-AvailableTargets([string]$bdir) {
@@ -345,7 +284,6 @@ function Build-Llama([string]$device,[string]$arch) {
   $out = Get-ProjectOutDir $arch $device 'llama.cpp'
   Copy-Binary $bdir 'llama-server' $out
   Copy-Binary $bdir 'llama-quantize' $out
-  Ensure-MingwRuntime $out
 }
 function Build-Whisper([string]$device,[string]$arch) {
   $src = Resolve-Src 'whisper.cpp' $WhisperSrc 'WHISPER_SRC' @((Join-Path $ROOT 'whisper.cpp'), (Join-Path $EXTERN 'whisper.cpp'))
@@ -366,7 +304,6 @@ function Build-Whisper([string]$device,[string]$arch) {
   Invoke-CMakeBuild $bdir @('whisper-cli')
   $out = Get-ProjectOutDir $arch $device 'whisper.cpp'
   Copy-Binary $bdir 'whisper-cli' $out
-  Ensure-MingwRuntime $out
 }
 function Build-SD([string]$device,[string]$arch) {
   $src = Resolve-Src 'stable-diffusion.cpp' $SDSrc 'SD_SRC' @((Join-Path $ROOT 'stable-diffusion.cpp'), (Join-Path $EXTERN 'stable-diffusion.cpp'))
@@ -387,7 +324,6 @@ function Build-SD([string]$device,[string]$arch) {
   Invoke-CMakeBuild $bdir @('sd')
   $out = Get-ProjectOutDir $arch $device 'stable-diffusion.cpp'
   Copy-Binary $bdir 'sd' $out
-  Ensure-MingwRuntime $out
 }
 
 function Build-TTS([string]$device,[string]$arch) {
@@ -417,7 +353,6 @@ function Build-TTS([string]$device,[string]$arch) {
     New-Item -ItemType Directory -Force -Path $targetDir | Out-Null
     Copy-Item $cpuBinary -Destination $targetDir -Force
     Write-Host "Copied $(Split-Path $cpuBinary -Leaf) -> $targetDir"
-    Ensure-MingwRuntime $targetDir
     return
   }
   $src = Resolve-Src 'tts.cpp' $TTSSrc 'TTS_SRC' @((Join-Path $ROOT 'tts.cpp'), (Join-Path $EXTERN 'tts.cpp'))
@@ -438,7 +373,6 @@ function Build-TTS([string]$device,[string]$arch) {
   $out = $cpuOutDir
   Copy-Binary $bdir 'tts-cli' $out
   $cpuBinary = Join-Path $out $binaryName
-  Ensure-MingwRuntime $out
   if ((Test-Path $cpuBinary) -and $script:AllDevices -and ($script:AllDevices.Count -gt 0)) {
     foreach ($extra in $script:AllDevices) {
       if ($extra -eq 'cpu') { continue }
@@ -446,7 +380,6 @@ function Build-TTS([string]$device,[string]$arch) {
       New-Item -ItemType Directory -Force -Path $extraDir | Out-Null
       Copy-Item $cpuBinary -Destination $extraDir -Force
       Write-Host "Copied $(Split-Path $cpuBinary -Leaf) -> $extraDir"
-      Ensure-MingwRuntime $extraDir
     }
   }
 }
@@ -455,6 +388,17 @@ $CompilerMode = Resolve-CompilerMode $CompilerRequest
 $GeneratorSpec = Get-Generator $arch $CompilerMode
 $CompilerMode = if ($GeneratorSpec.ContainsKey('Mode')) { $GeneratorSpec.Mode } else { $CompilerMode }
 $script:CompilerMode = $CompilerMode
+if ($CompilerMode -eq 'mingw') {
+  $compileFlags = '-fopenmp -mthreads'
+  $linkFlags = '-static -static-libgcc -static-libstdc++ -fopenmp -Wl,-s -Wl,--gc-sections -mthreads -lpthread'
+  $script:GlobalCMakeConfigureArgs += @(
+    '-D', "CMAKE_C_FLAGS:STRING=$compileFlags",
+    '-D', "CMAKE_CXX_FLAGS:STRING=$compileFlags",
+    '-D', "CMAKE_EXE_LINKER_FLAGS:STRING=$linkFlags",
+    '-D', "CMAKE_SHARED_LINKER_FLAGS:STRING=$linkFlags",
+    '-D', "CMAKE_MODULE_LINKER_FLAGS:STRING=$linkFlags"
+  )
+}
 $buildOsTag = if ($CompilerMode -eq 'mingw') { 'win7' } else { $OS_ID }
 $OutOsId = $buildOsTag
 $script:OutOsId = $OutOsId
