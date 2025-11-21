@@ -398,7 +398,13 @@ if ($CompilerMode -eq 'mingw') {
     '-D', "CMAKE_CXX_FLAGS:STRING=$compileFlags",
     '-D', "CMAKE_EXE_LINKER_FLAGS:STRING=$linkFlags",
     '-D', "CMAKE_SHARED_LINKER_FLAGS:STRING=$linkFlags",
-    '-D', "CMAKE_MODULE_LINKER_FLAGS:STRING=$linkFlags"
+    '-D', "CMAKE_MODULE_LINKER_FLAGS:STRING=$linkFlags",
+    '-D', 'LLAMA_NATIVE=OFF',
+    '-D', 'GGML_NATIVE=OFF',
+    '-D', 'GGML_AVX=OFF',
+    '-D', 'GGML_AVX2=OFF',
+    '-D', 'GGML_FMA=OFF',
+    '-D', 'GGML_F16C=OFF'
   )
 }
 $buildOsTag = if ($CompilerMode -eq 'mingw') { 'win7' } else { $OS_ID }
