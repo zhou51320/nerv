@@ -1,6 +1,6 @@
 Param(
   [string]$Projects = 'all',      # all|llama|whisper|sd|tts (comma-separated)
-  [string]$Devices  = 'auto',     # auto|cpu|vulkan|cuda|opencl|all (comma-separated)
+  [string]$Devices  = 'auto',     # auto|cpu|cpu-noavx|vulkan|cuda|opencl|all (comma-separated)
   [int]$Jobs        = [int]::Parse($env:NUMBER_OF_PROCESSORS),
   [string]$Compiler = 'auto',     # auto|msvc|mingw
   [switch]$Clean,
@@ -82,6 +82,7 @@ function Resolve-Devices([string]$req) {
     if (Can-Vulkan) { $set.Add('vulkan') | Out-Null }
   } elseif ($req -eq 'all') {
     $set.Add('cpu') | Out-Null
+    $set.Add('cpu-noavx') | Out-Null
     if (Can-Vulkan) { $set.Add('vulkan') | Out-Null }
     if (Can-CUDA) { $set.Add('cuda') | Out-Null }
     if (Can-OpenCL) { $set.Add('opencl') | Out-Null }
@@ -267,7 +268,8 @@ function Add-MingwCpuAccelGuards {
   )
   $result = @()
   if ($defs) { $result += $defs }
-  if (($script:CompilerMode -eq 'mingw') -and ($device -eq 'cpu')) {
+  $disableCpuAccel = ($device -eq 'cpu-noavx')
+  if ($disableCpuAccel) {
     $result += @(
       '-D', 'GGML_NATIVE=OFF',
       '-D', 'GGML_AVX=OFF',
@@ -357,9 +359,10 @@ function Build-SD([string]$device,[string]$arch) {
 
 function Build-TTS([string]$device,[string]$arch) {
   $project = 'tts.cpp'
-  $cpuOutDir = Get-ProjectOutDir $arch 'cpu' $project
   $binaryName = 'tts-cli.exe'
-  if ($device -ne 'cpu') {
+  $cpuOutDir = Get-ProjectOutDir $arch 'cpu' $project
+  $cpuLikeDevices = @('cpu','cpu-noavx')
+  if ($device -notin $cpuLikeDevices) {
     $targetDir = Get-ProjectOutDir $arch $device $project
     $targetBinary = Join-Path $targetDir $binaryName
     if (Test-Path $targetBinary) {
@@ -384,6 +387,7 @@ function Build-TTS([string]$device,[string]$arch) {
     Write-Host "Copied $(Split-Path $cpuBinary -Leaf) -> $targetDir"
     return
   }
+  $targetOutDir = if ($device -eq 'cpu') { $cpuOutDir } else { Get-ProjectOutDir $arch $device $project }
   $src = Resolve-Src 'tts.cpp' $TTSSrc 'TTS_SRC' @((Join-Path $ROOT 'tts.cpp'), (Join-Path $EXTERN 'tts.cpp'))
   if (-not $src) { throw "tts.cpp source not found. Provide -TTSSrc or set TTS_SRC or place repo at .\tts.cpp or .\external\tts.cpp." }
   Show-Version 'tts.cpp' $src $TTS_EXPECT_REF ''
@@ -400,15 +404,17 @@ function Build-TTS([string]$device,[string]$arch) {
   Invoke-CMakeConfigure $src $bdir $gen $defs
   if ($device -in @('vulkan','cuda','opencl')) { Assert-BackendEnabled $bdir $device 'tts.cpp' }
   Invoke-CMakeBuild $bdir @('tts-cli')
-  Copy-Binary $bdir 'tts-cli' $cpuOutDir
-  $cpuBinary = Join-Path $cpuOutDir $binaryName
-  if ((Test-Path $cpuBinary) -and $script:AllDevices -and ($script:AllDevices.Count -gt 0)) {
-    foreach ($extra in $script:AllDevices) {
-      if ($extra -eq 'cpu') { continue }
-      $extraDir = Get-ProjectOutDir $arch $extra $project
-      New-Item -ItemType Directory -Force -Path $extraDir | Out-Null
-      Copy-Item $cpuBinary -Destination $extraDir -Force
-      Write-Host "Copied $(Split-Path $cpuBinary -Leaf) -> $extraDir"
+  Copy-Binary $bdir 'tts-cli' $targetOutDir
+  if ($device -eq 'cpu') {
+    $cpuBinary = Join-Path $targetOutDir $binaryName
+    if ((Test-Path $cpuBinary) -and $script:AllDevices -and ($script:AllDevices.Count -gt 0)) {
+      foreach ($extra in $script:AllDevices) {
+        if ($extra -in @('cpu','cpu-noavx')) { continue }
+        $extraDir = Get-ProjectOutDir $arch $extra $project
+        New-Item -ItemType Directory -Force -Path $extraDir | Out-Null
+        Copy-Item $cpuBinary -Destination $extraDir -Force
+        Write-Host "Copied $(Split-Path $cpuBinary -Leaf) -> $extraDir"
+      }
     }
   }
 }
