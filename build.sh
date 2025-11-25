@@ -565,7 +565,7 @@ build_tts() {
     -DBUILD_SHARED_LIBS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
     -DTTS_BUILD_EXAMPLES=ON \
     $vflag $cuflag $ocflag $native_extra -DCMAKE_BUILD_TYPE=Release \
-    "${extra_cmake[@]}"
+    "${extra_cmake[@]}" \
     "${cmake_flag_args[@]}"
   cmake --build "$bdir" $(cmake_jobs_flag) --config Release --target tts-cli
   local out="$OUT_DIR/$arch/$os/$device/$project"

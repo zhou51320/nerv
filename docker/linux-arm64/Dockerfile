@@ -72,18 +72,22 @@ RUN apt-get update && \
 
 RUN npm install -g @qwen-code/qwen-code
 
-COPY ./distribution /distribution
-
-# 设置环境变量
-ENV PATH=/distribution/Qt5.15.17-ubuntu20_04-arm64/bin:$PATH
-ENV LD_LIBRARY_PATH=/distribution/Qt5.15.17-ubuntu20_04-arm64/lib:$LD_LIBRARY_PATH
-ENV PATH=/distribution/cmake-3.31.7-linux-aarch64/bin:$PATH
-ENV PATH=/distribution/opencv-4.10.0-arm-install/bin:$PATH
-ENV LD_LIBRARY_PATH=/distribution/opencv-4.10.0-arm-install/lib:$LD_LIBRARY_PATH
-ENV PATH=/distribution/patchelf-0.18.0-aarch64/bin:$PATH
-
+# 安装 CMake 3.31.x（无需 COPY distribution）
+ARG CMAKE_VERSION=3.31.7
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      arm64) cmake_arch="aarch64" ;; \
+      amd64) cmake_arch="x86_64" ;; \
+      *) echo "Unsupported arch: $arch"; exit 1 ;; \
+    esac; \
+    wget -qO /tmp/cmake.tar.gz "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-${cmake_arch}.tar.gz"; \
+    tar -xzf /tmp/cmake.tar.gz -C /opt; \
+    ln -sf /opt/cmake-${CMAKE_VERSION}-linux-${cmake_arch}/bin/* /usr/local/bin/; \
+    rm -f /tmp/cmake.tar.gz; \
+    cmake --version
+    
 # 真正安装vulkan
-# Install a modern Vulkan-Headers so vulkan.hpp has enhanced-mode features
 # Install a modern Vulkan-Headers so vulkan.hpp has enhanced-mode features
 ARG VULKAN_HEADERS_REF=
 RUN set -eux; \
@@ -130,7 +134,19 @@ RUN apt-get update && apt-get install -y wget extra-cmake-modules gnupg software
     
 # 设置工作目录
 WORKDIR /workspace
+# 设置环境变量
+ENV PATH=/distribution/Qt5.15.17-ubuntu20_04-arm64-static/bin:$PATH
+ENV LD_LIBRARY_PATH=/distribution/Qt5.15.17-ubuntu20_04-arm64-static/lib:$LD_LIBRARY_PATH
+ENV PATH=/distribution/cmake-3.31.7-linux-aarch64/bin:$PATH
+ENV PATH=/distribution/opencv-4.10.0-arm-static-install/bin:$PATH
+ENV LD_LIBRARY_PATH=/distribution/opencv-4.10.0-arm-static-install/lib:$LD_LIBRARY_PATH
+ENV PATH=/distribution/patchelf-0.18.0-aarch64/bin:$PATH
+ENV OPENSSL_PREFIX=/distribution/openssl-3.1.1-static
+ENV PATH="$OPENSSL_PREFIX/bin:$PATH"
+ENV CPATH="$OPENSSL_PREFIX/include:$CPATH"
+ENV LIBRARY_PATH="$OPENSSL_PREFIX/lib:$LIBRARY_PATH"
+ENV OPENSSL_LIBS="-L$OPENSSL_PREFIX/lib -lssl -lcrypto -ldl -lpthread"
 
 CMD ["/bin/bash"]
 
-# 镜像构建命令 docker buildx build --platform linux/arm64 -t sjxx-qt-linux-arm:20251013-cpu -f Dockerfile .
+# 镜像构建命令 docker buildx build --platform linux/arm64 -t sjxx-qt-linux-arm:20251029-cpu -f Dockerfile .

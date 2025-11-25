@@ -237,6 +237,7 @@ jobs:
             g++-10 \
             clang-14 \
             clang++-14 \
+            libomp-14-dev \
             libc++-14-dev \
             libc++abi-14-dev \
             libvulkan1 \
@@ -324,6 +325,7 @@ jobs:
               curl \
               clang-14 \
               clang++-14 \
+              libomp-14-dev \
               libc++-14-dev \
               libc++abi-14-dev \
               libvulkan1 \
@@ -355,7 +357,7 @@ jobs:
               rm -rf "$tmpdir"
             fi
             export VULKAN_SDK="$sdk_root"
-            export EVA_CMAKE_ARGS="-DGGML_NATIVE=OFF"
+            export EVA_CMAKE_ARGS="-DGGML_NATIVE=OFF -DGGML_OPENMP=OFF"
             chmod +x build.sh
             ./build.sh -d all -j 2
             if [ -d EVA_BACKEND ]; then
