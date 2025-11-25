@@ -149,7 +149,9 @@ jobs:
       - name: Make build script executable
         run: chmod +x build.sh
 
-      - name: Install dependencies
+      - name: Install dependencies and glslc
+        env:
+          VULKAN_SDK_VERSION: ${{ env.VULKAN_SDK_VERSION }}
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -159,6 +161,7 @@ jobs:
             pkg-config \
             python3 \
             python3-pip \
+            curl \
             clang-14 \
             clang++-14 \
             libc++-14-dev \
@@ -167,9 +170,18 @@ jobs:
             libvulkan-dev \
             vulkan-tools \
             glslang-tools \
-            shaderc \
             ocl-icd-opencl-dev \
             nvidia-cuda-toolkit
+          if ! command -v glslc >/dev/null 2>&1; then
+            SDK_VER="${VULKAN_SDK_VERSION:-1.3.290.0}"
+            SDK_DIR="$HOME/.vulkan-sdk"
+            mkdir -p "$SDK_DIR"
+            curl -L -o /tmp/vulkan-sdk.tar.gz "https://sdk.lunarg.com/sdk/download/$SDK_VER/linux/vulkan-sdk-linux-x86_64-$SDK_VER.tar.gz?Human=1"
+            tar -xzf /tmp/vulkan-sdk.tar.gz -C "$SDK_DIR" --strip-components=1
+            echo "VULKAN_SDK=$SDK_DIR" >> $GITHUB_ENV
+            echo "$SDK_DIR/bin" >> $GITHUB_PATH
+            sudo ln -sf "$SDK_DIR/bin/glslc" /usr/local/bin/glslc
+          fi
 
       - name: Build EVA backend
         run: |
@@ -217,6 +229,7 @@ jobs:
               pkg-config \
               python3 \
               python3-pip \
+              curl \
               clang-14 \
               clang++-14 \
               libc++-14-dev \
@@ -225,9 +238,16 @@ jobs:
               libvulkan-dev \
               vulkan-tools \
               glslang-tools \
-              shaderc \
               git \
               ocl-icd-opencl-dev
+            if ! command -v glslc >/dev/null 2>&1; then
+              SDK_VER="${VULKAN_SDK_VERSION:-1.3.290.0}"
+              SDK_DIR="/opt/vulkan-sdk"
+              mkdir -p "$SDK_DIR"
+              curl -L -o /tmp/vulkan-sdk.tar.gz "https://sdk.lunarg.com/sdk/download/$SDK_VER/linux/vulkan-sdk-linux-aarch64-$SDK_VER.tar.gz?Human=1"
+              tar -xzf /tmp/vulkan-sdk.tar.gz -C "$SDK_DIR" --strip-components=1
+              ln -sf "$SDK_DIR/bin/glslc" /usr/local/bin/glslc
+            fi
           run: |
             set -euo pipefail
             cd "$GITHUB_WORKSPACE"
