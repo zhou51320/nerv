@@ -31,11 +31,13 @@ jobs:
           $sdkRoot = "C:\VulkanSDK\$version"
           if (-not (Test-Path $sdkRoot)) {
             $installer = Join-Path $env:RUNNER_TEMP "VulkanSDK-$version.exe"
-            $uri = "https://sdk.lunarg.com/sdk/download/$version/windows/vulkansdk-windows-X64-$version.exe"
+            $uri = "https://sdk.lunarg.com/sdk/download/$version/windows/VulkanSDK-$version-Installer.exe"
             Write-Host "Downloading Vulkan SDK $version from $uri"
-            curl.exe -L --fail --retry 5 --retry-delay 5 "$uri" -o $installer
+            Invoke-WebRequest -Uri $uri -OutFile $installer -UseBasicParsing
             Write-Host "Installing Vulkan SDK..."
-            & $installer --accept-licenses --default-answer --confirm-command install | Write-Host
+            $args = '--accept-licenses', '--default-answer', '--confirm-command', 'install'
+            $proc = Start-Process -FilePath $installer -ArgumentList $args -PassThru -Wait
+            if ($proc.ExitCode -ne 0) { throw "Vulkan SDK installer failed with exit code $($proc.ExitCode)" }
           }
           if (-not (Test-Path $sdkRoot)) { throw "Failed to install Vulkan SDK $version" }
           "VULKAN_SDK=$sdkRoot" | Out-File -FilePath $env:GITHUB_ENV -Append
@@ -129,11 +131,13 @@ jobs:
           $sdkRoot = "C:\VulkanSDK\$version"
           if (-not (Test-Path $sdkRoot)) {
             $installer = Join-Path $env:RUNNER_TEMP "VulkanSDK-$version.exe"
-            $uri = "https://sdk.lunarg.com/sdk/download/$version/windows/vulkansdk-windows-X64-$version.exe"
+            $uri = "https://sdk.lunarg.com/sdk/download/$version/windows/VulkanSDK-$version-Installer.exe"
             Write-Host "Downloading Vulkan SDK $version from $uri"
-            curl.exe -L --fail --retry 5 --retry-delay 5 "$uri" -o $installer
+            Invoke-WebRequest -Uri $uri -OutFile $installer -UseBasicParsing
             Write-Host "Installing Vulkan SDK..."
-            & $installer --accept-licenses --default-answer --confirm-command install | Write-Host
+            $args = '--accept-licenses', '--default-answer', '--confirm-command', 'install'
+            $proc = Start-Process -FilePath $installer -ArgumentList $args -PassThru -Wait
+            if ($proc.ExitCode -ne 0) { throw "Vulkan SDK installer failed with exit code $($proc.ExitCode)" }
           }
           if (-not (Test-Path $sdkRoot)) { throw "Failed to install Vulkan SDK $version" }
           "VULKAN_SDK=$sdkRoot" | Out-File -FilePath $env:GITHUB_ENV -Append
