@@ -1,0 +1,308 @@
+name: Tests
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  linux-tests:
+    name: Linux Tests
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            ninja-build \
+            pkg-config \
+            python3 \
+            python3-pip \
+            clang-14 \
+            clang++-14 \
+            libc++-14-dev \
+            libc++abi-14-dev \
+            libvulkan1 \
+            libvulkan-dev \
+            vulkan-tools \
+            glslang-tools \
+            ocl-icd-opencl-dev
+
+      - name: Build CPU/Vulkan baseline
+        run: ./build.sh -d cpu,vulkan -j $(nproc)
+
+  build-win7:
+    name: Build Win7 (MinGW)
+    needs: linux-tests
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: windows-2022
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Vulkan SDK
+        shell: pwsh
+        run: |
+          choco install vulkan-sdk --no-progress -y
+
+      - name: Expose Vulkan SDK
+        shell: pwsh
+        run: |
+          $sdkRoot = Get-ChildItem 'C:\VulkanSDK' -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First 1
+          if (-not $sdkRoot) { throw 'Vulkan SDK install not found under C:\VulkanSDK'; }
+          "VULKAN_SDK=$($sdkRoot.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$($sdkRoot.FullName)\Bin"       | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: Setup MSYS2 toolchain
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            base-devel
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+
+      - name: Add MinGW to PATH
+        shell: pwsh
+        run: |
+          "C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.15
+        with:
+          cuda: '12.4.1'
+
+      - name: Build EVA backend
+        shell: pwsh
+        run: |
+          ./build.bat -d all -Compiler mingw
+
+      - name: Package Win7 artifact
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'EVA_BACKEND')) { throw 'EVA_BACKEND directory missing'; }
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          Compress-Archive -Path 'EVA_BACKEND' -DestinationPath 'artifacts/eva-backend-win7.zip' -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: eva-backend-win7
+          path: artifacts/eva-backend-win7.zip
+          if-no-files-found: error
+
+  build-win:
+    name: Build Windows (MSVC)
+    needs: linux-tests
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: windows-2022
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Vulkan SDK
+        shell: pwsh
+        run: |
+          choco install vulkan-sdk --no-progress -y
+
+      - name: Expose Vulkan SDK
+        shell: pwsh
+        run: |
+          $sdkRoot = Get-ChildItem 'C:\VulkanSDK' -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First 1
+          if (-not $sdkRoot) { throw 'Vulkan SDK install not found under C:\VulkanSDK'; }
+          "VULKAN_SDK=$($sdkRoot.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$($sdkRoot.FullName)\Bin"       | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: Install Ninja
+        shell: pwsh
+        run: choco install ninja --no-progress -y
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.15
+        with:
+          cuda: '12.4.1'
+
+      - name: Setup MSVC environment
+        uses: microsoft/setup-vsdevcmd@v1
+        with:
+          arch: x64
+
+      - name: Build EVA backend
+        shell: pwsh
+        run: |
+          ./build.bat -d all -Compiler msvc
+
+      - name: Package Windows artifact
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'EVA_BACKEND')) { throw 'EVA_BACKEND directory missing'; }
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          Compress-Archive -Path 'EVA_BACKEND' -DestinationPath 'artifacts/eva-backend-win.zip' -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: eva-backend-win
+          path: artifacts/eva-backend-win.zip
+          if-no-files-found: error
+
+  build-linux-x86:
+    name: Build Linux x86
+    needs: linux-tests
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            ninja-build \
+            pkg-config \
+            python3 \
+            python3-pip \
+            clang-14 \
+            clang++-14 \
+            libc++-14-dev \
+            libc++abi-14-dev \
+            libvulkan1 \
+            libvulkan-dev \
+            vulkan-tools \
+            glslang-tools \
+            ocl-icd-opencl-dev
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.15
+        with:
+          cuda: '12.4.1'
+
+      - name: Build EVA backend
+        run: |
+          ./build.sh -d all -j $(nproc)
+
+      - name: Package Linux x86 artifact
+        run: |
+          test -d EVA_BACKEND
+          mkdir -p artifacts
+          tar -czf artifacts/eva-backend-linux-x86.tar.gz EVA_BACKEND
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: eva-backend-linux-x86
+          path: artifacts/eva-backend-linux-x86.tar.gz
+          if-no-files-found: error
+
+  build-linux-arm:
+    name: Build Linux ARM64
+    needs: linux-tests
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build on ARM64
+        uses: uraimo/run-on-arch-action@v2
+        with:
+          arch: aarch64
+          distro: ubuntu22.04
+          githubToken: ${{ github.token }}
+          setup: |
+            apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get install -y \
+              build-essential \
+              cmake \
+              ninja-build \
+              pkg-config \
+              python3 \
+              python3-pip \
+              clang-14 \
+              clang++-14 \
+              libc++-14-dev \
+              libc++abi-14-dev \
+              libvulkan1 \
+              libvulkan-dev \
+              vulkan-tools \
+              glslang-tools \
+              ocl-icd-opencl-dev
+          run: |
+            set -euo pipefail
+            cd "$GITHUB_WORKSPACE"
+            ./build.sh -d all -j $(nproc)
+            if [ -d EVA_BACKEND ]; then
+              chmod -R a+rX EVA_BACKEND
+            fi
+
+      - name: Package Linux ARM artifact
+        run: |
+          test -d EVA_BACKEND
+          mkdir -p artifacts
+          tar -czf artifacts/eva-backend-linux-arm.tar.gz EVA_BACKEND
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: eva-backend-linux-arm
+          path: artifacts/eva-backend-linux-arm.tar.gz
+          if-no-files-found: error
+
+  publish-nightly:
+    name: Publish Nightly Release
+    needs:
+      - build-win7
+      - build-win
+      - build-linux-x86
+      - build-linux-arm
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release
+
+      - name: Collect files
+        run: |
+          mkdir -p uploads
+          cp release/eva-backend-win7/eva-backend-win7.zip uploads/
+          cp release/eva-backend-win/eva-backend-win.zip uploads/
+          cp release/eva-backend-linux-x86/eva-backend-linux-x86.tar.gz uploads/
+          cp release/eva-backend-linux-arm/eva-backend-linux-arm.tar.gz uploads/
+
+      - name: Publish release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: nightly
+          name: Nightly
+          allowUpdates: true
+          removeArtifacts: true
+          makeLatest: true
+          artifacts: uploads/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
