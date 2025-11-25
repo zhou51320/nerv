@@ -20,18 +20,16 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Install Vulkan SDK
-        shell: pwsh
-        run: |
-          choco install vulkan-sdk --no-progress -y
+      - name: Setup Vulkan SDK
+        uses: humbletim/setup-vulkan-sdk@v1.2.0
+        with:
+          vulkan-query-version: 'latest'
+          vulkan-components: Vulkan-Headers, Vulkan-Loader, Glslang
+          vulkan-use-cache: 'true'
 
-      - name: Expose Vulkan SDK
+      - name: Install CUDA Toolkit
         shell: pwsh
-        run: |
-          $sdkRoot = Get-ChildItem 'C:\VulkanSDK' -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First 1
-          if (-not $sdkRoot) { throw 'Vulkan SDK install not found under C:\VulkanSDK'; }
-          "VULKAN_SDK=$($sdkRoot.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "$($sdkRoot.FullName)\Bin"       | Out-File -FilePath $env:GITHUB_PATH -Append
+        run: choco install cuda --no-progress -y
 
       - name: Setup MSYS2 toolchain
         uses: msys2/setup-msys2@v2
@@ -48,11 +46,6 @@ jobs:
         shell: pwsh
         run: |
           "C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-
-      - name: Install CUDA Toolkit
-        uses: Jimver/cuda-toolkit@v0.2.15
-        with:
-          cuda: '12.4.1'
 
       - name: Build EVA backend
         shell: pwsh
@@ -83,30 +76,23 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Install Vulkan SDK
-        shell: pwsh
-        run: |
-          choco install vulkan-sdk --no-progress -y
+      - name: Setup Vulkan SDK
+        uses: humbletim/setup-vulkan-sdk@v1.2.0
+        with:
+          vulkan-query-version: 'latest'
+          vulkan-components: Vulkan-Headers, Vulkan-Loader, Glslang
+          vulkan-use-cache: 'true'
 
-      - name: Expose Vulkan SDK
+      - name: Install CUDA Toolkit
         shell: pwsh
-        run: |
-          $sdkRoot = Get-ChildItem 'C:\VulkanSDK' -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First 1
-          if (-not $sdkRoot) { throw 'Vulkan SDK install not found under C:\VulkanSDK'; }
-          "VULKAN_SDK=$($sdkRoot.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "$($sdkRoot.FullName)\Bin"       | Out-File -FilePath $env:GITHUB_PATH -Append
+        run: choco install cuda --no-progress -y
 
       - name: Install Ninja
         shell: pwsh
         run: choco install ninja --no-progress -y
 
-      - name: Install CUDA Toolkit
-        uses: Jimver/cuda-toolkit@v0.2.15
-        with:
-          cuda: '12.4.1'
-
       - name: Setup MSVC environment
-        uses: microsoft/setup-vsdevcmd@v1
+        uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
 
@@ -160,12 +146,8 @@ jobs:
             libvulkan-dev \
             vulkan-tools \
             glslang-tools \
-            ocl-icd-opencl-dev
-
-      - name: Install CUDA Toolkit
-        uses: Jimver/cuda-toolkit@v0.2.15
-        with:
-          cuda: '12.4.1'
+            ocl-icd-opencl-dev \
+            nvidia-cuda-toolkit
 
       - name: Build EVA backend
         run: |
@@ -204,7 +186,7 @@ jobs:
           arch: aarch64
           distro: ubuntu22.04
           githubToken: ${{ github.token }}
-          setup: |
+          install: |
             apt-get update
             DEBIAN_FRONTEND=noninteractive apt-get install -y \
               build-essential \
