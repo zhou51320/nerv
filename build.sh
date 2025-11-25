@@ -22,6 +22,34 @@ WHISPER_SRC_CLI=""; : "${WHISPER_SRC:=}"
 SD_SRC_CLI="";      : "${SD_SRC:=}"
 TTS_SRC_CLI="";     : "${TTS_SRC:=}"
 
+# Optional extra CMake flags (space-separated) applied globally or per-project
+declare -a EVA_COMMON_CMAKE_ARGS=()
+declare -a LLAMA_CMAKE_ARGS_ARR=()
+declare -a WHISPER_CMAKE_ARGS_ARR=()
+declare -a SD_CMAKE_ARGS_ARR=()
+declare -a TTS_CMAKE_ARGS_ARR=()
+
+if [[ -n "${EVA_CMAKE_ARGS:-}" ]]; then
+  # shellcheck disable=SC2206
+  EVA_COMMON_CMAKE_ARGS=(${EVA_CMAKE_ARGS})
+fi
+if [[ -n "${LLAMA_CMAKE_ARGS:-}" ]]; then
+  # shellcheck disable=SC2206
+  LLAMA_CMAKE_ARGS_ARR=(${LLAMA_CMAKE_ARGS})
+fi
+if [[ -n "${WHISPER_CMAKE_ARGS:-}" ]]; then
+  # shellcheck disable=SC2206
+  WHISPER_CMAKE_ARGS_ARR=(${WHISPER_CMAKE_ARGS})
+fi
+if [[ -n "${SD_CMAKE_ARGS:-}" ]]; then
+  # shellcheck disable=SC2206
+  SD_CMAKE_ARGS_ARR=(${SD_CMAKE_ARGS})
+fi
+if [[ -n "${TTS_CMAKE_ARGS:-}" ]]; then
+  # shellcheck disable=SC2206
+  TTS_CMAKE_ARGS_ARR=(${TTS_CMAKE_ARGS})
+fi
+
 # Toolchain overrides for tts.cpp (auto-detect clang unless overridden)
 : "${TTS_CC:=clang-14}"
 : "${TTS_CXX:=clang++-14}"
@@ -275,6 +303,7 @@ build_llama() {
   mkdir -p "$bdir"
   local vflag="-DGGML_VULKAN=OFF" cuflag="-DGGML_CUDA=OFF" ocflag="-DGGML_OPENCL=OFF"
   local NATIVE_EXTRA=""
+  local extra_cmake=("${EVA_COMMON_CMAKE_ARGS[@]}" "${LLAMA_CMAKE_ARGS_ARR[@]}")
   case "$device" in
     vulkan) vflag="-DGGML_VULKAN=ON" ;;
     cuda)   cuflag="-DGGML_CUDA=ON"; NATIVE_EXTRA="-DGGML_NATIVE=OFF" ;;
@@ -283,7 +312,8 @@ build_llama() {
   cmake -S "$src" -B "$bdir" $(cmake_gen) \
     -DBUILD_SHARED_LIBS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DLLAMA_CURL=OFF \
     -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=ON -DLLAMA_BUILD_SERVER=ON \
-    $vflag $cuflag $ocflag $NATIVE_EXTRA -DCMAKE_BUILD_TYPE=Release
+    $vflag $cuflag $ocflag $NATIVE_EXTRA -DCMAKE_BUILD_TYPE=Release \
+    "${extra_cmake[@]}"
   # Determine available targets and build only those
   local help_out
   help_out=$(cmake --build "$bdir" --config Release --target help 2>/dev/null || true)
@@ -316,6 +346,7 @@ build_whisper() {
   mkdir -p "$bdir"
   local vflag="-DGGML_VULKAN=OFF" cuflag="-DGGML_CUDA=OFF" ocflag="-DGGML_OPENCL=OFF"
   local NATIVE_EXTRA=""
+  local extra_cmake=("${EVA_COMMON_CMAKE_ARGS[@]}" "${WHISPER_CMAKE_ARGS_ARR[@]}")
   case "$device" in
     vulkan) vflag="-DGGML_VULKAN=ON" ;;
     cuda)   cuflag="-DGGML_CUDA=ON"; NATIVE_EXTRA="-DGGML_NATIVE=OFF" ;;
@@ -324,7 +355,8 @@ build_whisper() {
   cmake -S "$src" -B "$bdir" $(cmake_gen) \
     -DBUILD_SHARED_LIBS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
     -DWHISPER_BUILD_TESTS=OFF -DWHISPER_BUILD_EXAMPLES=ON \
-    $vflag $cuflag $ocflag $NATIVE_EXTRA -DCMAKE_BUILD_TYPE=Release
+    $vflag $cuflag $ocflag $NATIVE_EXTRA -DCMAKE_BUILD_TYPE=Release \
+    "${extra_cmake[@]}"
   cmake --build "$bdir" $(cmake_jobs_flag) --config Release --target whisper-cli
   local out="$OUT_DIR/$arch/$os/$device/whisper.cpp"
   copy_bin "$bdir" whisper-cli "$out" "$exe_suf" || true
@@ -345,6 +377,7 @@ build_sd() {
   local vflag="-DGGML_VULKAN=OFF" cuflag="-DGGML_CUDA=OFF" ocflag="-DGGML_OPENCL=OFF"
   local SD_EXTRA=""
   local NATIVE_EXTRA=""
+  local extra_cmake=("${EVA_COMMON_CMAKE_ARGS[@]}" "${SD_CMAKE_ARGS_ARR[@]}")
   case "$device" in
     vulkan) vflag="-DGGML_VULKAN=ON"; SD_EXTRA="-DSD_VULKAN=ON";;
     cuda)   cuflag="-DGGML_CUDA=ON";   SD_EXTRA="-DSD_CUDA=ON"; NATIVE_EXTRA="-DGGML_NATIVE=OFF";;
@@ -352,7 +385,8 @@ build_sd() {
   esac
   cmake -S "$src" -B "$bdir" $(cmake_gen) \
     -DBUILD_SHARED_LIBS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-    $vflag $cuflag $ocflag $SD_EXTRA $NATIVE_EXTRA -DCMAKE_BUILD_TYPE=Release
+    $vflag $cuflag $ocflag $SD_EXTRA $NATIVE_EXTRA -DCMAKE_BUILD_TYPE=Release \
+    "${extra_cmake[@]}"
   cmake --build "$bdir" $(cmake_jobs_flag) --config Release --target sd
   local out="$OUT_DIR/$arch/$os/$device/stable-diffusion.cpp"
   copy_bin "$bdir" sd "$out" "$exe_suf" || true
@@ -526,10 +560,12 @@ build_tts() {
   fi
   local vflag="-DGGML_VULKAN=OFF" cuflag="-DGGML_CUDA=OFF" ocflag="-DGGML_OPENCL=OFF"
   local native_extra=""
+  local extra_cmake=("${EVA_COMMON_CMAKE_ARGS[@]}" "${TTS_CMAKE_ARGS_ARR[@]}")
   CC="$desired_cc" CXX="$desired_cxx" cmake -S "$src" -B "$bdir" $(cmake_gen) \
     -DBUILD_SHARED_LIBS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
     -DTTS_BUILD_EXAMPLES=ON \
     $vflag $cuflag $ocflag $native_extra -DCMAKE_BUILD_TYPE=Release \
+    "${extra_cmake[@]}"
     "${cmake_flag_args[@]}"
   cmake --build "$bdir" $(cmake_jobs_flag) --config Release --target tts-cli
   local out="$OUT_DIR/$arch/$os/$device/$project"

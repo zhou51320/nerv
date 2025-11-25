@@ -355,6 +355,7 @@ jobs:
               rm -rf "$tmpdir"
             fi
             export VULKAN_SDK="$sdk_root"
+            export EVA_CMAKE_ARGS="-DGGML_NATIVE=OFF"
             chmod +x build.sh
             ./build.sh -d all -j 2
             if [ -d EVA_BACKEND ]; then
