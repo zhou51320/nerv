@@ -156,14 +156,24 @@ jobs:
             nvidia-cuda-toolkit
           if ! command -v glslc >/dev/null 2>&1; then
             SDK_VER="${VULKAN_SDK_VERSION:-1.3.290.0}"
-            SDK_DIR="$HOME/.vulkan-sdk"
+            SDK_BASE="$HOME/.vulkan-sdk"
+            SDK_ROOT="$SDK_BASE/$SDK_VER"
             SDK_ARCHIVE="/tmp/vulkan-sdk.tar.xz"
-            mkdir -p "$SDK_DIR"
+            rm -rf "$SDK_ROOT"
+            mkdir -p "$SDK_BASE"
             curl -L -o "$SDK_ARCHIVE" "https://sdk.lunarg.com/sdk/download/$SDK_VER/linux/vulkan-sdk-linux-x86_64-$SDK_VER.tar.xz?Human=1"
-            tar -xJf "$SDK_ARCHIVE" -C "$SDK_DIR" --strip-components=1
-            echo "VULKAN_SDK=$SDK_DIR" >> $GITHUB_ENV
-            echo "$SDK_DIR/bin" >> $GITHUB_PATH
-            sudo ln -sf "$SDK_DIR/bin/glslc" /usr/local/bin/glslc
+            tar -xJf "$SDK_ARCHIVE" -C "$SDK_BASE"
+            SDK_FINAL="$SDK_ROOT/x86_64"
+            if [ ! -x "$SDK_FINAL/bin/glslc" ]; then
+              echo "Failed to locate glslc under $SDK_FINAL/bin" >&2
+              exit 1
+            fi
+            export VULKAN_SDK="$SDK_FINAL"
+            echo "VULKAN_SDK=$SDK_FINAL" >> $GITHUB_ENV
+            echo "$SDK_FINAL/bin" >> $GITHUB_PATH
+            export PATH="$SDK_FINAL/bin:$PATH"
+            sudo ln -sf "$SDK_FINAL/bin/glslc" /usr/local/bin/glslc
+            rm -f "$SDK_ARCHIVE"
           fi
 
       - name: Build EVA backend
@@ -225,12 +235,24 @@ jobs:
               ocl-icd-opencl-dev
             if ! command -v glslc >/dev/null 2>&1; then
               SDK_VER="${VULKAN_SDK_VERSION:-1.3.290.0}"
-              SDK_DIR="/opt/vulkan-sdk"
+              SDK_BASE="/opt/vulkan-sdks"
+              SDK_ROOT="$SDK_BASE/$SDK_VER"
               SDK_ARCHIVE="/tmp/vulkan-sdk.tar.xz"
-              mkdir -p "$SDK_DIR"
+              rm -rf "$SDK_ROOT"
+              mkdir -p "$SDK_BASE"
               curl -L -o "$SDK_ARCHIVE" "https://sdk.lunarg.com/sdk/download/$SDK_VER/linux/vulkan-sdk-linux-aarch64-$SDK_VER.tar.xz?Human=1"
-              tar -xJf "$SDK_ARCHIVE" -C "$SDK_DIR" --strip-components=1
-              ln -sf "$SDK_DIR/bin/glslc" /usr/local/bin/glslc
+              tar -xJf "$SDK_ARCHIVE" -C "$SDK_BASE"
+              SDK_FINAL="$SDK_ROOT/aarch64"
+              if [ ! -x "$SDK_FINAL/bin/glslc" ]; then
+                echo "Failed to locate glslc under $SDK_FINAL/bin" >&2
+                exit 1
+              fi
+              export VULKAN_SDK="$SDK_FINAL"
+              echo "VULKAN_SDK=$SDK_FINAL" >> $GITHUB_ENV
+              echo "$SDK_FINAL/bin" >> $GITHUB_PATH
+              export PATH="$SDK_FINAL/bin:$PATH"
+              ln -sf "$SDK_FINAL/bin/glslc" /usr/local/bin/glslc
+              rm -f "$SDK_ARCHIVE"
             fi
           run: |
             set -euo pipefail
