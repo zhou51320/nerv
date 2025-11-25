@@ -1,0 +1,28 @@
+name: "Unarchive tar"
+description: "Download a tar archive and extract it into a directory"
+inputs:
+  url:
+    description: "URL of the tar archive"
+    required: true
+  path:
+    description: "Destination directory"
+    required: true
+  type:
+    description: "Compression flag passed to tar (default: J for .tar.xz)"
+    required: false
+    default: "J"
+  strip:
+    description: "Number of leading components to strip"
+    required: false
+    default: "0"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Download and extract tarball
+      shell: bash
+      run: |
+        set -euo pipefail
+        mkdir -p "${{ inputs.path }}"
+        curl --fail --location --retry 5 --retry-delay 5 "${{ inputs.url }}" \
+          | tar -"${{ inputs.type }}"x --strip-components="${{ inputs.strip }}" -C "${{ inputs.path }}"
