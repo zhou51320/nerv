@@ -23,16 +23,58 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Setup Vulkan SDK
-        uses: humbletim/setup-vulkan-sdk@v1.2.1
-        with:
-          vulkan-query-version: ${{ env.VULKAN_SDK_VERSION }}
-          vulkan-components: Vulkan-Headers, Vulkan-Loader, SPIRV-Tools, Glslang
-          vulkan-use-cache: 'true'
+      - name: Install Vulkan SDK
+        shell: pwsh
+        run: |
+          $version = "${{ env.VULKAN_SDK_VERSION }}"
+          if (-not $version) { $version = '1.3.290.0' }
+          $sdkRoot = "C:\VulkanSDK\$version"
+          if (-not (Test-Path $sdkRoot)) {
+            $installer = Join-Path $env:RUNNER_TEMP "VulkanSDK-$version.exe"
+            $uri = "https://sdk.lunarg.com/sdk/download/$version/windows/VulkanSDK-$version-Installer.exe?Human=1"
+            Write-Host "Downloading Vulkan SDK $version from $uri"
+            Invoke-WebRequest -Uri $uri -OutFile $installer -UseBasicParsing
+            Write-Host "Installing Vulkan SDK..."
+            Start-Process -FilePath $installer -ArgumentList '/S' -NoNewWindow -Wait
+          }
+          if (-not (Test-Path $sdkRoot)) { throw "Failed to install Vulkan SDK $version" }
+          "VULKAN_SDK=$sdkRoot" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$sdkRoot\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append
 
       - name: Install CUDA Toolkit
         shell: pwsh
         run: choco install cuda --no-progress -y
+
+      - name: Configure CUDA environment
+        shell: pwsh
+        run: |
+          $base = 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA'
+          if (-not (Test-Path $base)) { throw "CUDA base path '$base' not found after installation." }
+          $versionDir = Get-ChildItem $base -Directory | Sort-Object Name -Descending | Select-Object -First 1
+          if (-not $versionDir) { throw "No CUDA versions found under $base" }
+          "CUDA_PATH=$($versionDir.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "CUDAToolkit_ROOT=$($versionDir.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$($versionDir.FullName)\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          "$($versionDir.FullName)\extras\CUPTI\lib64" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: Install OpenCL SDK
+        shell: pwsh
+        run: |
+          $sdkVersion = '2024.05.08'
+          $sdkName = "OpenCL-SDK-v$sdkVersion-Win-x64"
+          $zipPath = Join-Path $env:RUNNER_TEMP "$sdkName.zip"
+          $dest = "C:\OpenCL-SDK"
+          if (-not (Test-Path $zipPath)) {
+            $uri = "https://github.com/KhronosGroup/OpenCL-SDK/releases/download/v$sdkVersion/$sdkName.zip"
+            Write-Host "Downloading OpenCL SDK $sdkVersion ..."
+            Invoke-WebRequest -Uri $uri -OutFile $zipPath -UseBasicParsing
+          }
+          if (Test-Path $dest) { Remove-Item -Recurse -Force $dest }
+          Expand-Archive -Path $zipPath -DestinationPath $dest
+          $root = Join-Path $dest $sdkName
+          "OpenCL_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "OPENCL_SDK_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$root\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
 
       - name: Setup MSYS2 toolchain
         uses: msys2/setup-msys2@v2
@@ -79,16 +121,58 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Setup Vulkan SDK
-        uses: humbletim/setup-vulkan-sdk@v1.2.1
-        with:
-          vulkan-query-version: ${{ env.VULKAN_SDK_VERSION }}
-          vulkan-components: Vulkan-Headers, Vulkan-Loader, SPIRV-Tools, Glslang
-          vulkan-use-cache: 'true'
+      - name: Install Vulkan SDK
+        shell: pwsh
+        run: |
+          $version = "${{ env.VULKAN_SDK_VERSION }}"
+          if (-not $version) { $version = '1.3.290.0' }
+          $sdkRoot = "C:\VulkanSDK\$version"
+          if (-not (Test-Path $sdkRoot)) {
+            $installer = Join-Path $env:RUNNER_TEMP "VulkanSDK-$version.exe"
+            $uri = "https://sdk.lunarg.com/sdk/download/$version/windows/VulkanSDK-$version-Installer.exe?Human=1"
+            Write-Host "Downloading Vulkan SDK $version from $uri"
+            Invoke-WebRequest -Uri $uri -OutFile $installer -UseBasicParsing
+            Write-Host "Installing Vulkan SDK..."
+            Start-Process -FilePath $installer -ArgumentList '/S' -NoNewWindow -Wait
+          }
+          if (-not (Test-Path $sdkRoot)) { throw "Failed to install Vulkan SDK $version" }
+          "VULKAN_SDK=$sdkRoot" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$sdkRoot\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append
 
       - name: Install CUDA Toolkit
         shell: pwsh
         run: choco install cuda --no-progress -y
+
+      - name: Configure CUDA environment
+        shell: pwsh
+        run: |
+          $base = 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA'
+          if (-not (Test-Path $base)) { throw "CUDA base path '$base' not found after installation." }
+          $versionDir = Get-ChildItem $base -Directory | Sort-Object Name -Descending | Select-Object -First 1
+          if (-not $versionDir) { throw "No CUDA versions found under $base" }
+          "CUDA_PATH=$($versionDir.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "CUDAToolkit_ROOT=$($versionDir.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$($versionDir.FullName)\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          "$($versionDir.FullName)\extras\CUPTI\lib64" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: Install OpenCL SDK
+        shell: pwsh
+        run: |
+          $sdkVersion = '2024.05.08'
+          $sdkName = "OpenCL-SDK-v$sdkVersion-Win-x64"
+          $zipPath = Join-Path $env:RUNNER_TEMP "$sdkName.zip"
+          $dest = "C:\OpenCL-SDK"
+          if (-not (Test-Path $zipPath)) {
+            $uri = "https://github.com/KhronosGroup/OpenCL-SDK/releases/download/v$sdkVersion/$sdkName.zip"
+            Write-Host "Downloading OpenCL SDK $sdkVersion ..."
+            Invoke-WebRequest -Uri $uri -OutFile $zipPath -UseBasicParsing
+          }
+          if (Test-Path $dest) { Remove-Item -Recurse -Force $dest }
+          Expand-Archive -Path $zipPath -DestinationPath $dest
+          $root = Join-Path $dest $sdkName
+          "OpenCL_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "OPENCL_SDK_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$root\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
 
       - name: Install Ninja
         shell: pwsh
