@@ -354,7 +354,9 @@ jobs:
               vulkan-tools \
               glslang-tools \
               git \
-              ocl-icd-opencl-dev
+              ocl-icd-opencl-dev \
+              gcc-12 \
+              g++-12
           run: |
             set -euo pipefail
             cd "$GITHUB_WORKSPACE"
@@ -369,9 +371,12 @@ jobs:
             fi
             rm -rf "$sdk_root/x86_64/bin" "$sdk_root/x86_64/lib" || true
             export VULKAN_SDK="$sdk_root"
+            export CC=gcc-12
+            export CXX=g++-12
+            export CUDAHOSTCXX=/usr/bin/g++-12
             export EVA_CMAKE_ARGS="-DGGML_NATIVE=OFF -DGGML_OPENMP=OFF"
-            export TTS_CC="gcc"
-            export TTS_CXX="g++"
+            export TTS_CC="gcc-12"
+            export TTS_CXX="g++-12"
             chmod +x build.sh
             ./build.sh -d all -j 2
             if [ -d EVA_BACKEND ]; then
