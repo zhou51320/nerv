@@ -14,7 +14,7 @@ bool ends_with(const std::string& str, const std::string& ending);
 bool starts_with(const std::string& str, const std::string& start);
 bool contains(const std::string& str, const std::string& substr);
 
-std::string format(const char* fmt, ...);
+std::string sd_format(const char* fmt, ...);
 
 void replace_all_chars(std::string& str, char target, char replacement);
 
@@ -53,6 +53,16 @@ void log_printf(sd_log_level_t level, const char* file, int line, const char* fo
 std::string trim(const std::string& s);
 
 std::vector<std::pair<std::string, float>> parse_prompt_attention(const std::string& text);
+
+sd_progress_cb_t sd_get_progress_callback();
+void* sd_get_progress_callback_data();
+
+sd_preview_cb_t sd_get_preview_callback();
+void* sd_get_preview_callback_data();
+preview_t sd_get_preview_mode();
+int sd_get_preview_interval();
+bool sd_should_preview_denoised();
+bool sd_should_preview_noisy();
 
 #define LOG_DEBUG(format, ...) log_printf(SD_LOG_DEBUG, __FILE__, __LINE__, format, ##__VA_ARGS__)
 #define LOG_INFO(format, ...) log_printf(SD_LOG_INFO, __FILE__, __LINE__, format, ##__VA_ARGS__)

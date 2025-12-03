@@ -1,6 +1,10 @@
 cmake_minimum_required(VERSION 3.12)
 project("stable-diffusion")
-
+if (MSVC)
+    unset(GGML_WIN_VER CACHE)
+else()
+    set(GGML_WIN_VER "0x601" CACHE STRING "ggml: Windows version")
+endif()
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 if (NOT XCODE AND NOT MSVC AND NOT CMAKE_BUILD_TYPE)

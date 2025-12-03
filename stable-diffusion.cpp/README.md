@@ -15,6 +15,12 @@ API and command-line option may change frequently.***
 
 ## 🔥Important News
 
+* **2025/12/01** 🚀 stable-diffusion.cpp now supports **Z-Image**  
+  👉 Details: [PR #1020](https://github.com/leejet/stable-diffusion.cpp/pull/1020)
+
+* **2025/11/30** 🚀 stable-diffusion.cpp now supports **FLUX.2-dev**  
+  👉 Details: [PR #1016](https://github.com/leejet/stable-diffusion.cpp/pull/1016)
+
 * **2025/10/13** 🚀 stable-diffusion.cpp now supports **Qwen-Image-Edit / Qwen-Image-Edit 2509**  
   👉 Details: [PR #877](https://github.com/leejet/stable-diffusion.cpp/pull/877)
 
@@ -29,16 +35,20 @@ API and command-line option may change frequently.***
 
 ## Features
 
-- Plain C/C++ implementation based on [ggml](https://github.com/ggerganov/ggml), working in the same way as [llama.cpp](https://github.com/ggerganov/llama.cpp)
+- Plain C/C++ implementation based on [ggml](https://github.com/ggml-org/ggml), working in the same way as [llama.cpp](https://github.com/ggml-org/llama.cpp)
 - Super lightweight and without external dependencies
 - Supported models
   - Image Models
     - SD1.x, SD2.x, [SD-Turbo](https://huggingface.co/stabilityai/sd-turbo)
     - SDXL, [SDXL-Turbo](https://huggingface.co/stabilityai/sdxl-turbo)
+    - [Some SD1.x and SDXL distilled models](./docs/distilled_sd.md)
     - [SD3/SD3.5](./docs/sd3.md)
-    - [Flux-dev/Flux-schnell](./docs/flux.md)
+    - [FlUX.1-dev/FlUX.1-schnell](./docs/flux.md)
+    - [FLUX.2-dev](./docs/flux2.md)
     - [Chroma](./docs/chroma.md)
+    - [Chroma1-Radiance](./docs/chroma_radiance.md)
     - [Qwen Image](./docs/qwen_image.md)
+    - [Z-Image](./docs/z_image.md)
   - Image Edit Models
     - [FLUX.1-Kontext-dev](./docs/kontext.md)
     - [Qwen Image Edit/Qwen Image Edit 2509](./docs/qwen_image_edit.md)
@@ -79,7 +89,9 @@ API and command-line option may change frequently.***
     - [`DPM++ 2M v2`](https://github.com/AUTOMATIC1111/stable-diffusion-webui/discussions/8457)
     - `DPM++ 2S a`
     - [`LCM`](https://github.com/AUTOMATIC1111/stable-diffusion-webui/issues/13952)
-- Cross-platform reproducibility (`--rng cuda`, consistent with the `stable-diffusion-webui GPU RNG`)
+- Cross-platform reproducibility
+    - `--rng cuda`, default, consistent with the `stable-diffusion-webui GPU RNG`
+    - `--rng cpu`, consistent with the `comfyui RNG`
 - Embedds generation parameters into png output as webui-compatible text string
 
 ## Quick Start
@@ -114,12 +126,14 @@ If you want to improve performance or reduce VRAM/RAM usage, please refer to [pe
 
 - [SD1.x/SD2.x/SDXL](./docs/sd.md)
 - [SD3/SD3.5](./docs/sd3.md)
-- [Flux-dev/Flux-schnell](./docs/flux.md)
+- [FlUX.1-dev/FlUX.1-schnell](./docs/flux.md)
+- [FLUX.2-dev](./docs/flux2.md)
 - [FLUX.1-Kontext-dev](./docs/kontext.md)
 - [Chroma](./docs/chroma.md)
 - [🔥Qwen Image](./docs/qwen_image.md)
 - [🔥Qwen Image Edit/Qwen Image Edit 2509](./docs/qwen_image_edit.md)
 - [🔥Wan2.1/Wan2.2](./docs/wan.md)
+- [🔥Z-Image](./docs/z_image.md)
 - [LoRA](./docs/lora.md)
 - [LCM/LCM-LoRA](./docs/lcm.md)
 - [Using PhotoMaker to personalize image generation](./docs/photo_maker.md)
@@ -150,6 +164,7 @@ These projects use `stable-diffusion.cpp` as a backend for their image generatio
 - [sd.cpp-webui](https://github.com/daniandtheweb/sd.cpp-webui)
 - [LocalAI](https://github.com/mudler/LocalAI)
 - [Neural-Pixel](https://github.com/Luiz-Alcantara/Neural-Pixel)
+- [KoboldCpp](https://github.com/LostRuins/koboldcpp)
 
 ## Contributors
 
@@ -163,7 +178,7 @@ Thank you to all the people who have already contributed to stable-diffusion.cpp
 
 ## References
 
-- [ggml](https://github.com/ggerganov/ggml)
+- [ggml](https://github.com/ggml-org/ggml)
 - [diffusers](https://github.com/huggingface/diffusers)
 - [stable-diffusion](https://github.com/CompVis/stable-diffusion)
 - [sd3-ref](https://github.com/Stability-AI/sd3-ref)
