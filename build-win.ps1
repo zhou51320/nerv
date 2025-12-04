@@ -18,7 +18,9 @@ $OS_ID     = 'win'
 $script:OutOsId = $OS_ID
 $script:AllDevices = @()
 $script:CompilerMode = 'auto'
-$script:GlobalCMakeConfigureArgs = @()
+$script:GlobalCMakeConfigureArgs = @(
+  '-D', 'CMAKE_CUDA_FLAGS:STRING=-allow-unsupported-compiler'
+)
 
 $Compiler = if ($Compiler) { $Compiler.Trim() } else { 'auto' }
 $Compiler = $Compiler.ToLowerInvariant()
@@ -197,6 +199,19 @@ function Get-Generator([string]$arch,[string]$compiler) {
 }
 
 function Invoke-CMakeConfigure([string]$src,[string]$bdir,[hashtable]$gen,[string[]]$defs) {
+  if ($gen.G) {
+    $cache = Join-Path $bdir 'CMakeCache.txt'
+    if (Test-Path $cache) {
+      $content = Get-Content -Raw -LiteralPath $cache
+      if ($content -match 'CMAKE_GENERATOR:INTERNAL=(.+)') {
+        $cachedGen = $Matches[1].Trim()
+        if ($cachedGen -ne $gen.G) {
+          Write-Host "[info] Generator changed ($cachedGen -> $($gen.G)); removing $bdir"
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $bdir
+        }
+      }
+    }
+  }
   New-Item -ItemType Directory -Force -Path $bdir | Out-Null
   $args = @('-S', $src, '-B', $bdir, '-D', 'BUILD_SHARED_LIBS=OFF', '-D', 'CMAKE_POSITION_INDEPENDENT_CODE=ON', '-D', 'CMAKE_BUILD_TYPE=Release')
   if ($gen.G) { $args += @('-G', $gen.G) }
