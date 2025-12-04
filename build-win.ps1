@@ -119,7 +119,7 @@ function Resolve-CompilerMode([string]$requested) {
     $val = [Environment]::GetEnvironmentVariable($var)
     if ($val -and $val.ToLowerInvariant().Contains('mingw')) { return 'mingw' }
   }
-  if (Test-Cmd 'mingw32-make') { return 'mingw' }
+  if ((Test-Cmd 'mingw32-make') -and -not (Test-Cmd 'cl')) { return 'mingw' }
   if ((Test-Cmd 'gcc') -and -not (Test-Cmd 'cl')) { return 'mingw' }
   return 'auto'
 }
@@ -184,6 +184,10 @@ function Get-Generator([string]$arch,[string]$compiler) {
         if ($genLower -like 'visual studio*') { return @{ G=$genTrim; A=$msvcArch; Mode='msvc' } }
       }
       if (Test-Cmd 'ninja') { return @{ G='Ninja'; A=$null; Mode='ninja' } }
+      if (Test-Cmd 'cl') {
+        if (Test-Cmd 'nmake') { return @{ G='NMake Makefiles'; A=$null; Mode='msvc' } }
+        return @{ G=$vsDefault; A=$msvcArch; Mode='msvc' }
+      }
       return @{ G=$vsDefault; A=$msvcArch; Mode='msvc' }
     }
     default {
