@@ -424,7 +424,7 @@ $GeneratorSpec = Get-Generator $arch $CompilerMode
 $CompilerMode = if ($GeneratorSpec.ContainsKey('Mode')) { $GeneratorSpec.Mode } else { $CompilerMode }
 $script:CompilerMode = $CompilerMode
 if ($CompilerMode -eq 'mingw') {
-  $compileFlags = '-fopenmp -mthreads'
+  $compileFlags = '-fopenmp -mthreads -D_WIN32_WINNT=0x0601'
   $linkFlags = '-static -static-libgcc -static-libstdc++ -fopenmp -Wl,-s -Wl,--gc-sections -mthreads -lpthread'
   $script:GlobalCMakeConfigureArgs += @(
     '-D', "CMAKE_C_FLAGS:STRING=$compileFlags",
