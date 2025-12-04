@@ -1,7 +1,7 @@
 #include "model.h"
 
 #include <math.h>
-#include <numbers>
+#include "numbers_compat.h"
 #include <cstring>
 #include <memory>
 

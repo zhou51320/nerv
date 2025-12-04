@@ -1,7 +1,7 @@
 #ifndef util_h
 #define util_h
 
-#include <numbers>
+#include "numbers_compat.h"
 #include <math.h>
 #include <functional>
 #include <random>

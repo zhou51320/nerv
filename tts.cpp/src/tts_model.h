@@ -3,7 +3,6 @@
 
 #include <cstring>
 #include <functional>
-#include <ranges>
 #include "util.h"
 #include "common.h"
 
