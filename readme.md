@@ -8,7 +8,7 @@
 
 ## 编译
 build.bat 
-默认只会编译cpu和vulkan版本，-d all 为所有版本 -Compiler msvc 指定编译器
+默认只会编译cpu和vulkan版本，-d all 为所有版本
 如果编译器是mingw则自动编译win7版本
 ## 更新后端时注意
 - 为了能在win7下运行所有项目的主CMakeLists.txt中顶部添加
