@@ -114,7 +114,17 @@ class KokoroEncoder(TTSEncoder):
         repo_candidate = Path(repo_id)
         self.repo_path = repo_candidate if repo_candidate.exists() else None
         self.repo_id = str(repo_id) if self.repo_path is None else str(self.repo_path)
-        self.voices = voices or VOICES
+        if voices is not None:
+            self.voices = voices
+        elif self.repo_path is not None:
+            voices_dir = self.repo_path / "voices"
+            if voices_dir.is_dir():
+                detected = sorted({p.stem for p in voices_dir.glob("*.pt") if p.is_file()})
+                self.voices = detected or VOICES
+            else:
+                self.voices = VOICES
+        else:
+            self.voices = VOICES
         self.use_espeak = use_espeak
         self.phonemizer_repo = phonemizer_repo
 
@@ -425,13 +435,31 @@ class KokoroEncoder(TTSEncoder):
 
     def encode_tts_phonemizer(self):
         """
-        Downloads the TTS.cpp phonemizer from HuggingFace and adds its encoded fields to the GGUF writer
+        Loads the TTS.cpp phonemizer from HuggingFace or a local GGUF file and adds its encoded fields to the GGUF writer
         """
+        path = None
         try:
-            path = hf_hub_download(repo_id=self.phonemizer_repo, filename='tts_en_us_phonemizer.gguf')
+            candidate = Path(self.phonemizer_repo)
+            if candidate.exists():
+                if candidate.is_dir():
+                    local_path = candidate / "tts_en_us_phonemizer.gguf"
+                    if not local_path.exists():
+                        raise FileNotFoundError(f"Missing tts_en_us_phonemizer.gguf in {candidate}")
+                    path = str(local_path)
+                else:
+                    path = str(candidate)
         except Exception as e:
-            self.logger.exception(f"Failed to load phonemizer GGUF file, 'tts_en_us_phonemizer.gguf', from repositor, '{self.phonemizer_repo}'")
+            self.logger.exception(f"Failed while resolving local phonemizer path from '{self.phonemizer_repo}'")
             raise e
+
+        if path is None:
+            try:
+                path = hf_hub_download(repo_id=str(self.phonemizer_repo), filename="tts_en_us_phonemizer.gguf")
+            except Exception as e:
+                self.logger.exception(
+                    f"Failed to load phonemizer GGUF file, 'tts_en_us_phonemizer.gguf', from repository '{self.phonemizer_repo}'"
+                )
+                raise e
         reader = gguf.GGUFReader(path=path)
         for key in TTS_PHONEMIZATION_KEYS:
             field = reader.get_field(key)

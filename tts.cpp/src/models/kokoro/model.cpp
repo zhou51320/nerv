@@ -1,5 +1,6 @@
 #include "model.h"
 #include "numbers_compat.h"
+#include "multilingual.h"
 
 static struct ggml_tensor * build_albert_attn_mask(ggml_context * ctx, struct kokoro_duration_context *kctx, const kokoro_ubatch & batch) {
     kctx->attn_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (int64_t) batch.n_tokens, (int64_t) batch.n_tokens);
@@ -1390,9 +1391,13 @@ std::vector<std::vector<uint32_t>> kokoro_runner::tokenize_chunks(std::vector<st
 
 void kokoro_runner::propagate_voice_setting() {
     if (voice.empty()) {
-        voice = "af_heart";
+        if (model->voices.contains("af_heart")) {
+            voice = "af_heart";
+        } else if (!model->voices.empty()) {
+            voice = model->voices.begin()->first;
+        }
     }
-    if (!model->voices.contains(voice)) {
+    if (voice.empty() || !model->voices.contains(voice)) {
         TTS_ABORT("Failed to find Kokoro voice '%s' aborting.\n", voice.c_str());
     }
     // if the language changed then we should change the phonemization voice
@@ -1411,12 +1416,22 @@ void kokoro_runner::generate(const char * prompt, tts_response & response, const
     voice = config.voice;
     espeak_voice_id = config.espeak_voice_id;
     propagate_voice_setting();
-    // replace all non-sentence terminating characters with '--' which espeak will treat as a pause.
-    // We preserve the other punctuation for cleaner chunking pre-tokenization
+    // For espeak phonemization, replace some non-sentence terminating punctuation with '--' (pause).
     std::string normalized{prompt};
-    normalized = replace_any(prompt, ",;:", "--");
-    normalized = replace_any(prompt, "\n", " ");
-    std::string phonemized_prompt = phmzr->text_to_phonemes(normalized);
+    if (phmzr->mode == ESPEAK) {
+        normalized = replace_any(normalized, ",;:", "--");
+    }
+    normalized = replace_any(normalized, "\n", " ");
+
+    std::string phonemized_prompt;
+    // Enable built-in zh phonemization when either:
+    // - voice is Mandarin (z*)  OR
+    // - prompt contains CJK characters
+    if ((!voice.empty() && voice[0] == 'z') || kokoro_contains_cjk(normalized)) {
+        phonemized_prompt = kokoro_phonemize_multilingual(normalized, phmzr);
+    } else {
+        phonemized_prompt = phmzr->text_to_phonemes(normalized);
+    }
 
   	// Kokoro users a utf-8 single character tokenizer so if the size of the prompt is smaller than the max context length without the
   	// beginning of sentence and end of sentence tokens then we can compute it all at once.

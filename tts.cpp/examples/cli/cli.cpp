@@ -1,4 +1,16 @@
 #include <thread>
+#include <vector>
+
+#ifdef _WIN32
+#    ifndef WIN32_LEAN_AND_MEAN
+#        define WIN32_LEAN_AND_MEAN
+#    endif
+#    ifndef NOMINMAX
+#        define NOMINMAX
+#    endif
+#    include <windows.h>
+#    include <shellapi.h>
+#endif
 
 #include "../../src/models/loaders.h"
 #include "args.h"
@@ -21,7 +33,7 @@ public:
     }
 };
 
-int main(int argc, const char ** argv) {
+static int main_impl(int argc, const char ** argv) {
     const tts_timing_printer _{};
     float default_temperature = 1.0f;
     int default_n_threads = std::max((int)std::thread::hardware_concurrency(), 1);
@@ -31,7 +43,7 @@ int main(int argc, const char ** argv) {
     float default_top_p = 1.0f;
     arg_list args;
     args.add_argument(string_arg("--model-path", "(REQUIRED) The local path of the gguf model file for Parler TTS mini or large v1, Dia, or Kokoro.", "-mp", true));
-    args.add_argument(string_arg("--prompt", "(REQUIRED) The text prompt for which to generate audio in quotation markers.", "-p", true));
+    args.add_argument(string_arg("--prompt", "(REQUIRED) The text prompt for which to generate audio in quotation markers.", "-p", false));
     args.add_argument(string_arg("--save-path", "(OPTIONAL) The path to save the audio output to in a .wav format. Defaults to TTS.cpp.wav", "-sp", false, "TTS.cpp.wav"));
     args.add_argument(float_arg("--temperature", "The temperature to use when generating outputs. Defaults to 1.0.", "-t", false, &default_temperature));
     args.add_argument(int_arg("--n-threads", "The number of cpu threads to run generation with. Defaults to hardware concurrency. If hardware concurrency cannot be determined then it defaults to 1.", "-nt", false, &default_n_threads));
@@ -42,6 +54,7 @@ int main(int argc, const char ** argv) {
     args.add_argument(string_arg("--conditional-prompt", "(OPTIONAL) A distinct conditional prompt to use for generating. If none is provided the preencoded prompt is used. '--text-encoder-path' must be set to use conditional generation.", "-cp", false));
     args.add_argument(string_arg("--text-encoder-path", "(OPTIONAL) The local path of the text encoder gguf model for conditional generaiton.", "-tep", false));
     args.add_argument(string_arg("--voice", "(OPTIONAL) The voice to use to generate the audio. This is only used for models with voice packs.", "-v", false, ""));
+    args.add_argument(bool_arg("--list-voices", "(OPTIONAL) List available voices for the selected model and exit.", "-lv"));
     args.add_argument(bool_arg("--vad", "(OPTIONAL) whether to apply voice inactivity detection (VAD) and strip silence form the end of the output (particularly useful for Parler TTS). By default, no VAD is applied.", "-va"));
     args.add_argument(string_arg("--espeak-voice-id", "(OPTIONAL) The espeak voice id to use for phonemization. This should only be specified when the correct espeak voice cannot be inferred from the kokoro voice ( see MultiLanguage Configuration in the README for more info).", "-eid", false));
     args.add_argument(int_arg("--max-tokens", "(OPTIONAL) The max audio tokens or token batches to generate where each represents approximates 11 ms of audio. Only applied to Dia generation. If set to zero as is its default then the default max generation size. Warning values under 15 are not supported.", "-mt", false, &default_max_tokens));
@@ -53,6 +66,11 @@ int main(int argc, const char ** argv) {
         exit(0);
     }
     args.validate();
+
+    if (!args.get_bool_param("--list-voices") && args.get_string_param("--prompt").empty()) {
+        fprintf(stderr, "argument '--prompt' is required.\n");
+        exit(1);
+    }
 
     std::string conditional_prompt = args.get_string_param("--conditional-prompt");
     std::string text_encoder_path = args.get_string_param("--text-encoder-path");
@@ -78,6 +96,17 @@ int main(int argc, const char ** argv) {
 
     unique_ptr<tts_generation_runner> runner{runner_from_file(args.get_string_param("--model-path").c_str(), *args.get_int_param("--n-threads"), config, !args.get_bool_param("--use-metal"))};
 
+    if (args.get_bool_param("--list-voices")) {
+        if (!runner->supports_voices) {
+            fprintf(stderr, "The selected model does not support voices.\n");
+            exit(1);
+        }
+        for (const auto & v : runner->list_voices()) {
+            printf("%.*s\n", (int) v.size(), v.data());
+        }
+        exit(0);
+    }
+
     if (!conditional_prompt.empty()) {
         runner->update_conditional_prompt(text_encoder_path.c_str(), conditional_prompt.c_str());
     }
@@ -96,4 +125,41 @@ int main(int argc, const char ** argv) {
     }
     static_cast<void>(!runner.release()); // TODO the destructor doesn't work yet
     return 0;
+}
+
+int main(int argc, const char ** argv) {
+#ifdef _WIN32
+    // Ensure UTF-8 argv on Windows to support non-ASCII prompts (e.g. Chinese).
+    int wargc = 0;
+    wchar_t ** wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
+    if (!wargv || wargc <= 0) {
+        return main_impl(argc, argv);
+    }
+
+    std::vector<std::string> argv_utf8_storage;
+    argv_utf8_storage.reserve(wargc);
+
+    std::vector<const char *> argv_utf8;
+    argv_utf8.reserve(wargc);
+
+    for (int i = 0; i < wargc; ++i) {
+        const wchar_t * warg = wargv[i] ? wargv[i] : L"";
+        const int       size = WideCharToMultiByte(CP_UTF8, 0, warg, -1, nullptr, 0, nullptr, nullptr);
+        std::string     arg;
+        if (size > 0) {
+            arg.resize(static_cast<size_t>(size));
+            WideCharToMultiByte(CP_UTF8, 0, warg, -1, arg.data(), size, nullptr, nullptr);
+            if (!arg.empty() && arg.back() == '\0') {
+                arg.pop_back();
+            }
+        }
+        argv_utf8_storage.push_back(std::move(arg));
+        argv_utf8.push_back(argv_utf8_storage.back().c_str());
+    }
+
+    LocalFree(wargv);
+    return main_impl(wargc, argv_utf8.data());
+#else
+    return main_impl(argc, argv);
+#endif
 }
