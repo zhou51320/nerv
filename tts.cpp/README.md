@@ -1,76 +1,144 @@
-## TTS.cpp
+# TTS.cpp（中文说明）
 
-[Roadmap](https://github.com/users/mmwillet/projects/1) / [Modified GGML](https://github.com/mmwillet/ggml/tree/support-for-tts)
+TTS.cpp 是一个基于 GGML 的 C/C++ 推理库，用于在本地设备上运行开源文本转语音（TTS）模型，目标是提供类似 `whisper.cpp` / `llama.cpp` 的轻量、可移植推理体验。
 
-### Purpose and Goals
+本仓库在 Kokoro 路线上做了中文增强，重点解决了「中文提示词为空 / 无法发声」的问题，并支持中英文混合输入。
 
-The general purpose of this repository is to support real time generation with open source TTS (_text to speech_) models across common device architectures using the [GGML tensor library](https://github.com/ggerganov/ggml). Rapid STT (_speach to text_), embedding generation, and LLM generation are well supported on GGML (via [whisper.cpp](https://github.com/ggerganov/whisper.cpp) and [llama.cpp](https://github.com/ggerganov/llama.cpp) respectively). As such, this repo seeks to compliment those functionalities with a similarly optimized and portable TTS library.
+- 路线图：`https://github.com/users/mmwillet/projects/1`
+- GGML 分支/补丁背景：`https://github.com/mmwillet/ggml/tree/support-for-tts`
 
-In this endeavor, MacOS and metal support will be treated as the primary platform, and, as such, functionality will initially be developed for MacOS and later extended to other OS.   
+## 中文支持（Kokoro）
 
-### Supported Functionality
+### 1) 不依赖 eSpeak 的中文
 
-**Warning!** *Currently TTS.cpp should be treated as a _proof of concept_ and is subject to further development. Existing functionality has not be tested outside of a MacOS X environment.*
+Kokoro 的部分 GGUF（例如 “no_espeak” 版本）原本会在遇到 CJK 字符时丢弃文本，导致 `Got empty response for prompt`。
 
-#### Model Support
+本仓库已在 Kokoro 前端加入内置普通话处理：
+- 中文输入不再被吞掉
+- 可直接生成中文语音
+- 不需要安装/链接 eSpeak-ng
 
-**Kokoro** is the recommended model. It reliably produces articulate and coherent speech for a variety of prompt sizes. Most of the other models are too large (read: slow), but may support finer-grained voice customization.
+### 2) 中英混合
 
-| Models | CPU | Metal Acceleration | Quantization | GGUF files |
-|--------------------------------------------------------------------------|-------|-------|-------|--------------------------------------------------------|
-| [Parler TTS Mini](https://huggingface.co/parler-tts/parler-tts-mini-v1)  |&check;|&check;|&check;|[here](https://huggingface.co/mmwillet2/Parler_TTS_GGUF)|
-| [Parler TTS Large](https://huggingface.co/parler-tts/parler-tts-large-v1)|&check;|&check;|&check;|[here](https://huggingface.co/mmwillet2/Parler_TTS_GGUF)|
-| [Kokoro](https://huggingface.co/hexgrad/Kokoro-82M)                      |&check;|&cross;|&check;|[here](https://huggingface.co/mmwillet2/Kokoro_GGUF)    |
-| [Dia](https://github.com/nari-labs/dia)                                  |&check;|&check;|&check;|[here](https://huggingface.co/mmwillet2/Dia_GGUF)       |
-| [Orpheus](https://github.com/canopyai/Orpheus-TTS)                       |&check;|&cross;|&cross;|[here](https://huggingface.co/mmwillet2/Orpheus_GGUF)       |
+同一条 prompt 支持混合输入（例如 `你好 hello`、`hello 你好`）。实现思路是按片段拆分：
+- ASCII 段落走现有英文字素化（IPA）
+- 非 ASCII 段落走内置中文前端
 
-Additional Model support will initially be added based on open source model performance in both the [old TTS model arena](https://huggingface.co/spaces/TTS-AGI/TTS-Arena) and [new TTS model arena](https://huggingface.co/spaces/TTS-AGI/TTS-Arena-V2) as well as the availability of said models' architectures and checkpoints.
+### 3) Windows 友好
 
-#### Functionality
+Windows 下 `tts-cli` 已确保命令行参数按 UTF-8 处理，中文参数不会因代码页导致解析失败。
 
-| Planned Functionality | OS X       | Linux | Windows |
-|-----------------------|------------|-------|---------|
-| Basic CPU Generation  | &check;    |&check;| &cross; |
-| Metal Acceleration    | &check;    | _     | _       |
-| CUDA support          | _          |&cross;| &cross; |
-| Quantization          | &check;_*_ |&cross;| &cross; |
-| Layer Offloading      | &cross;    |&cross;| &cross; |
-| Server Support        | &check;    |&check;| &cross; |
-| Vulkan Support        | _          |&cross;| &cross; |
-| Kompute Support       | _          |&cross;| &cross; |
-| Streaming Audio       | &cross;    |&cross;| &cross; |
+## 模型与功能支持概览
 
- _*_ Currently only the generative model supports these.
-### Installation
+### 模型
 
-**WARNING!** This library is only currently supported on OS X
+推荐优先使用 **Kokoro**（体积小、速度快、效果稳定）。
 
-#### Requirements:
+| 模型 | CPU | Metal | 量化/低精度 | 备注 |
+| --- | --- | --- | --- | --- |
+| Kokoro | 支持 | 暂不支持 | 支持（但对体积影响有限，见下文） | 推荐；支持中文/中英混合 |
+| Parler TTS (Mini/Large) | 支持 | 支持 | 支持 | 条件提示词等玩法更丰富但更重 |
+| Dia | 支持 | 支持 | 支持 | 需按推荐采样参数使用 |
+| Orpheus | 支持 | 暂不支持 | 暂不支持 | 依模型而定 |
 
-* Local GGUF format model file (see [py-gguf](./py-ggufs/README.md) for information on how to convert the hugging face models to GGUF).
-* C++17 and C17
-  * XCode Command Line Tools (via `xcode-select --install`) should suffice for OS X
-* CMake (>=3.14) 
-* GGML pulled locally
-  * this can be accomplished via `git clone -b support-for-tts git@github.com:mmwillet/ggml.git`
+### 语音（voice）
 
-#### GGML Patch
+Kokoro 的 voice pack 会被 **直接打包进 GGUF 文件**（转换阶段读取 `voices/*.pt`，运行时不需要再带 `voices/` 目录）。
 
-The local GGML library includes several required patches to the main branch of GGML (making the current TTS ggml branch out of date with modern GGML). Specifically these patches include major modifications to the convolutional transposition operation as well as several new GGML operations which have been implemented for TTS specific purposes; these include `ggml_reciprocal`, `ggml_round`, `ggml_mod`, `ggml_cumsum`, STFT, and iSTFT operations.
+用户可通过 CLI 查询可用 voice：
 
-We are currently [working on upstreaming some of these operations inorder to deprecate this patch requirement going forward](https://github.com/mmwillet/TTS.cpp/issues/66).
+```powershell
+.\tts-cli.exe --model-path D:\EVA_MODELS\text2speech\Kokoro-82M-v1_1-zh_F16.gguf --list-voices
+```
 
-#### Build:
+生成时通过 `--voice` 选择：
 
-Assuming that the above requirements are met the library and basic CLI example can be built by running the following command in the repository's base directory:
-```commandline
-cmake -B build                                           
+```powershell
+.\tts-cli.exe --model-path D:\EVA_MODELS\text2speech\Kokoro-82M-v1_1-zh_F16.gguf --voice zf_001 -p "你好，欢迎使用 EVA" -sp out.wav
+```
+
+## 快速开始（生成中文/中英混合）
+
+### 中文
+
+```powershell
+.\tts-cli.exe --model-path D:\EVA_MODELS\text2speech\Kokoro-82M-v1_1-zh_F16.gguf --voice zf_001 -p "你好"
+```
+
+### 中英混合
+
+```powershell
+.\tts-cli.exe --model-path D:\EVA_MODELS\text2speech\Kokoro-82M-v1_1-zh_F16.gguf --voice zf_001 -p "你好 hello"
+```
+
+## Kokoro 中文模型转换（Torch -> GGUF）
+
+转换脚本位于 `py-gguf/`，核心入口：`py-gguf/convert_kokoro_to_gguf`。
+
+### 1) Python 依赖（仅 Kokoro，CPU 版 torch）
+
+建议用虚拟环境，且使用清华源：
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\activate
+python -m pip install -U pip -i https://pypi.tuna.tsinghua.edu.cn/simple
+python -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple `
+  "numpy<2" sentencepiece `
+  torch==2.4.1 torchaudio==2.4.1 `
+  gguf==0.10.0 kokoro==0.9.4 `
+  huggingface-hub transformers safetensors
+```
+
+说明：`gguf==0.10.0` 目前与 `numpy>=2` 不兼容，因此需要固定 `numpy<2`。
+
+### 2) 从本地目录转换（推荐）
+
+假设本地模型目录结构类似：
+- `config.json`
+- `*.pth`（checkpoint）
+- `voices/*.pt`
+
+```powershell
+python .\py-gguf\convert_kokoro_to_gguf `
+  --repo-id .\Kokoro-82M-v1___1-zh `
+  --save-path D:\EVA_MODELS\text2speech\Kokoro-82M-v1_1-zh.gguf `
+  --tts-phonemizer `
+  --phonemizer-repo D:\EVA_MODELS\text2speech\Kokoro_no_espeak_F16.gguf
+```
+
+`--tts-phonemizer` 表示不使用 eSpeak（避免 GPL 依赖），并把英文字素化所需的键值拷贝进新 GGUF（`--phonemizer-repo` 支持填写本地 `.gguf` 文件或 HF repo id）。
+
+## 量化/低精度（Kokoro）
+
+Kokoro 可用 `examples/quantize` 生成 F16/Q8/Q4 等版本：
+
+```powershell
+.\quantize.exe --model-path D:\EVA_MODELS\text2speech\Kokoro-82M-v1_1-zh.gguf `
+  --quantized-model-path D:\EVA_MODELS\text2speech\Kokoro-82M-v1_1-zh_F16.gguf `
+  --quantized-type F16 --convert-non-quantized-to-f16
+
+.\quantize.exe --model-path D:\EVA_MODELS\text2speech\Kokoro-82M-v1_1-zh.gguf `
+  --quantized-model-path D:\EVA_MODELS\text2speech\Kokoro-82M-v1_1-zh_Q8_0.gguf `
+  --quantized-type Q8_0 --convert-non-quantized-to-f16
+
+.\quantize.exe --model-path D:\EVA_MODELS\text2speech\Kokoro-82M-v1_1-zh.gguf `
+  --quantized-model-path D:\EVA_MODELS\text2speech\Kokoro-82M-v1_1-zh_Q4_0.gguf `
+  --quantized-type Q4_0 --convert-non-quantized-to-f16
+```
+
+注意：Kokoro 当前量化策略只覆盖部分张量，且 `voice_tensors` 不参与量化（会保留 FP32），所以 Q8/Q4 相比 F16 的体积下降幅度有限。
+
+## 构建
+
+如果你只需要使用 CLI，可直接构建项目并得到 `tts-cli`：
+
+```powershell
+cmake -B build
 cmake --build build --config Release
 ```
 
-The CLI executable and other exceutables will be in the `./build` directory (e.g. `./build/cli`) and the compiled library will be in the `./build/src` (currently it is named _parler_ as that is the only supported model).
-
-If you wish to install TTS.cpp with Espeak-ng phonemization support, first [install Espeak-ng](https://github.com/espeak-ng/espeak-ng/blob/master/docs/guide.md). Depending on your installation method the path of the installed library will vary. Upon identifying the installation path to espeak-ng (it should contain `./lib`, `./bin`, `./include`, and `./share` directories), you can compile TTS.cpp with espeak phonemization support by running the follwing in the repositories base directory:
+如需 eSpeak-ng（可选，不推荐给需要避免 GPL 的场景）：
 
 ```bash
 export ESPEAK_INSTALL_DIR=/absolute/path/to/espeak-ng/dir
@@ -78,34 +146,14 @@ cmake -B build
 cmake --build build --config Release
 ```
 
-On Linux, you don't need to manually download or `export` anything. Our build system will automatically detect the development packages installed on your machine:
+## 使用说明
 
-```bash
-# Change `apt` and the package names to match your distro
-sudo apt install build-essential cmake # Minimum requirements
-sudo apt install git libespeak-ng-dev libsdl2-dev pkg-config # Optional requirements
-cmake -B build
-cmake --build build --config Release
-```
+更多 CLI 参数可参考：`examples/cli/README.md`。
 
-### Usage
+## 许可协议
 
-See the [CLI example readme](./examples/cli/README.md) for more details on its general usage.
+默认情况下，本仓库为 `MIT` 许可。
 
-### Quantization and Lower Precision Models
+按模型原实现要求，部分超参数/后处理逻辑可能保留原模型的 `Apache-2.0` 许可约束（不包含 ggml/C++ 移植代码）。
 
-See the [quantization cli readme](./examples/quantize/README.md) for more details on its general usage and behavior. **Please note** Quantization and lower precision conversion is currently only supported for Parler TTS models. 
-
-### Performance
-
- Given that the central goal of this library is to support real time speech generation on OS X, generation speed has only been rigorously tested in that environment with supported models (i.e. Parler Mini version 1.0).
-
- With the introduction of metal acceleration support for the DAC audio decoder model, text to speech generation is nearly possible in real time on a standard Apple M1 Max with ~3GB memory overhead. The best real time factor for accelerated models is currently 1.112033. This means that for every second of generated audio, the accelerated models require approximately 1.112033 seconds of generation time (with Q5_0 quantization applied to the generative model). For the latest stats via the performance battery see the [readme therein](./examples/perf_battery/README.md).
-
-# License
-
-Unless indicated otherwise, this repo is `MIT`-licensed.
-
-To the extent required by law, parts derived from the models' original implementations retain their original `Apache-2.0` license. This may include hyperparameters and post-processing logic, but excludes our port to ggml and C++. This makes the resulting binary `Apache-2.0`-licensed if those models are compiled in.
-
-If eSpeak NG support is enabled, the resulting binary is `GPL-3.0-or-later`-licensed.
+如果启用 eSpeak-ng 支持，最终二进制可能会受到 `GPL-3.0-or-later` 许可影响；如需规避 GPL，请优先使用 `--tts-phonemizer` 方案与本仓库内置中文前端。
