@@ -45,4 +45,4 @@ The GGUF conversion script for Kokorocan be run via the `convert_kokoro_to_gguf`
 python3 ./convert_kokoro_to_gguf --save-path ./kokoro.gguf
 ```
 
-the command accepts _--save-path_ which described where to save the GGUF model file to, _--tts-phonemizer_ which when passed encodes the model to use TTS.cpp native phonemization (currently not recommended), and _--repo-id_ which describes the hugging face repo from which to download the model (defaults to 'hexgrad/Kokoro-82M'). Currently all standard Kokoro voices packs are encoded alongside the model (this is not currently customizable through the CLI).
+the command accepts _--save-path_ which described where to save the GGUF model file to, _--repo-id_ which describes the hugging face repo (or local folder) from which to load the model (defaults to 'hexgrad/Kokoro-82M'), _--voices_ to optionally specify which voice embeddings to embed, and _--phonemizer-repo_ to specify where to copy `phonemizer.*` keys from (HF repo id or a local GGUF file/dir). Currently all standard Kokoro voices packs are encoded alongside the model (this is not currently customizable through the CLI).

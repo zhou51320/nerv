@@ -52,10 +52,8 @@ DURATION_PREDICTOR_PARTS: Dict[str, str] = {
     'duration_proj.linear_layer.bias': "duration_proj_bias"
 }
 
-# The follow are standard enum values for TTS.cpp phonemization settings used on Kokoro
+# 以下为 Kokoro 的音素化相关枚举值（用于写入 GGUF 元数据，供 TTS.cpp 侧读取）
 TTS_PHONEMIZER = 0
-ESPEAK_PHONEMIZER = 1
-ESPEAK = 2
 IPA = 1
 
 # TTS_PHONEMIZATION_KEYS are the keys that the TTS.cpp phonemizer expects and thereby must be transplanted from
@@ -92,21 +90,18 @@ class KokoroEncoder(TTSEncoder):
     ```python
     from tts_encoders import KokoroEncoder, DEFAULT_KOKORO_REPO
 
-    gguf_encoder = KokoroEncoder("some/local/path.gguf", DEFAULT_KOKORO_REPO, use_espeak=True)
+    gguf_encoder = KokoroEncoder("some/local/path.gguf", DEFAULT_KOKORO_REPO)
     gguf_encoder.write()
     ```
     """
     def __init__(self, model_path: Path | str = "./kokoro.gguf", repo_id: Path | str = DEFAULT_KOKORO_REPO,
-                 voices: Optional[List[str]] = None, use_espeak: bool = False,
-                 phonemizer_repo: Path | str = DEFAULT_TTS_PHONEMIZER_REPO):
+                 voices: Optional[List[str]] = None, phonemizer_repo: Path | str = DEFAULT_TTS_PHONEMIZER_REPO):
         """
         :param Path or str model_path: The path to save the generated GGUF file.
         :param Path or str repo_id: The path or repository from which to pull the Kokoro model, its voice embeddings,
             and its configuration.
         :param List[str] voices: the voice names to pull from the repository and include in the generated GGUF file.
-        :param bool use_espeak: Denotes whether to assign espeak as the phonemizer (Otherwise defaults to TTS phonemization)
-        :param Path or str phonemizer_repo: The path or repository to pull the TTS GGUF encoded phonemizer if not using
-            espeak.
+        :param Path or str phonemizer_repo: The path or repository to copy TTS.cpp phonemizer keys from.
         """
         super().__init__(model_path=model_path, architecture=KOKORO_ARCHITECTURE)
         self._model = None
@@ -125,7 +120,6 @@ class KokoroEncoder(TTSEncoder):
                 self.voices = VOICES
         else:
             self.voices = VOICES
-        self.use_espeak = use_espeak
         self.phonemizer_repo = phonemizer_repo
 
     @property
@@ -526,10 +520,9 @@ class KokoroEncoder(TTSEncoder):
             self.gguf_writer.add_uint32(f"{self.gguf_writer.arch}.up_convs.{i}.stride", up.stride[0])
 
         # ---- Phonemizer ----
-        self.gguf_writer.add_uint32("phonemizer.type", ESPEAK_PHONEMIZER if self.use_espeak else TTS_PHONEMIZER)
+        self.gguf_writer.add_uint32("phonemizer.type", TTS_PHONEMIZER)
         self.gguf_writer.add_uint32("phonemizer.phoneme_type", IPA)
-        if (not self.use_espeak):
-            self.encode_tts_phonemizer()
+        self.encode_tts_phonemizer()
 
         self.gguf_writer.arch = "kokoro"
         self.gguf_writer.add_file_type(gguf.LlamaFileType.ALL_F32)

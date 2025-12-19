@@ -111,9 +111,7 @@ static struct ggml_tensor * snac_build_audio_inputs(struct ggml_context * ctx, s
 snac_context * build_new_snac_context(struct snac_model * model, int n_threads, bool use_cpu) {
     snac_context * sctx = new snac_context(model, n_threads);
     if (!use_cpu) {
-#ifdef GGML_USE_METAL
-        sctx->backend = ggml_backend_metal_init();
-#endif
+        sctx->backend = tts_backend_init_accel();
     }
     sctx->backend_cpu = ggml_backend_cpu_init();
     sctx->set_threads();

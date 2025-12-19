@@ -14,20 +14,11 @@ extern const struct kokoro_model_loader final : tts_model_loader {
                                                 bool cpu_only, const generation_configuration & config) const override;
 } kokoro_loader;
 
-// Rather than using ISO 639-2 language codes, Kokoro voice pack specify their corresponding language via their first letter.
-// Below is a map that describes the relationship between those designations and espeak-ng's voice identifiers so that the
-// appropriate phonemization protocol can inferred from the Kokoro voice.
-static std::map<char, const char *> KOKORO_LANG_TO_ESPEAK_ID = {
-	{'a', "gmw/en-US"},
-	{'b', "gmw/en"},
-	{'e', "roa/es"},
-	{'f', "roa/fr"},
-	{'h', "inc/hi"},
-	{'i', "roa/it"},
-	{'j', "jpx/ja"},
-	{'p', "roa/pt-BR"},
-	{'z', "sit/cmn"}
-};
+// 说明：
+// - Kokoro 的 voice id 通常用首字母标记语言类别（例如部分语音包用 'z' 表示中文）。
+// - 本项目当前目标为中/英，音素化侧仅依赖：
+//   - TTS.cpp 内置英文 phonemizer（从 GGUF 中读取规则/词典）
+//   - zh_frontend 中文前端
 
 struct lstm_cell {
 	std::vector<ggml_tensor*> weights;
@@ -142,6 +133,8 @@ struct kokoro_generator {
 	// unfortunately the squared sum of the windows needs to be computed dynamically per run because it is dependent
 	// on the sequence size of the generation and the hop is typically less than half the size of our window.
 	struct ggml_tensor * window;
+	// 说明：CPU 侧缓存的窗函数数据（用于生成 window_sq_sum），避免直接读取 GPU buffer。
+	std::vector<float> window_host;
 
 	struct ggml_tensor * m_source_weight;
 	struct ggml_tensor * m_source_bias;
@@ -336,7 +329,6 @@ struct kokoro_duration_context : runner_context {
 
     struct ggml_tensor * inp_tokens;
     struct ggml_tensor * positions;
-    struct ggml_tensor * attn_mask;
     struct ggml_tensor * token_types = nullptr;
 
     void build_schedule() {
@@ -344,7 +336,6 @@ struct kokoro_duration_context : runner_context {
     }
 };
 
-static struct ggml_tensor * build_albert_attn_mask(ggml_context * ctx, struct kokoro_duration_context *kctx, const kokoro_ubatch & batch);
 static struct ggml_tensor * build_albert_inputs(ggml_context * ctx, kokoro_model * model, ggml_tensor * input_tokens, ggml_tensor * positions, ggml_tensor * token_types);
 static struct ggml_tensor * build_albert_norm(ggml_context * ctx, ggml_tensor * cur, ggml_tensor * weight, ggml_tensor * bias);
 static struct ggml_tensor * build_ada_residual_conv(ggml_context * ctx, struct ggml_tensor * x, ada_residual_conv_block * block, struct ggml_tensor * style, struct ggml_tensor * sqrt_tensor);
@@ -354,7 +345,6 @@ static kokoro_generator_residual_block * build_res_block_from_file(gguf_context 
 static kokoro_noise_residual_block * build_noise_block_from_file(gguf_context * meta, int index);
 static kokoro_generator_upsample_block * kokoro_generator_upsample_block(gguf_context * meta, int index);
 
-const char * get_espeak_id_from_kokoro_voice(std::string voice);
 struct kokoro_duration_context * build_new_duration_kokoro_context(struct kokoro_model * model, int n_threads, bool use_cpu = true);
 
 struct kokoro_duration_response {
@@ -372,9 +362,7 @@ struct kokoro_duration_runner : tts_runner {
         if (ctx) {
             ggml_free(ctx);
         }
-        model->free();
-        delete model;
-        delete kctx;
+        // 说明：model/kctx 由外层 kokoro_runner 统一管理，避免重复释放导致崩溃。
     }
     struct single_pass_tokenizer * tokenizer;
     kokoro_model * model;
@@ -393,16 +381,7 @@ struct kokoro_duration_runner : tts_runner {
 
 struct kokoro_context : runner_context {
     kokoro_context(kokoro_model * model, int n_threads): runner_context(n_threads), model(model) {};
-    ~kokoro_context() {
-        ggml_backend_sched_free(sched);
-        ggml_backend_free(backend_cpu);
-        if (backend) {
-            ggml_backend_free(backend);
-        }
-        if (buf_output) {
-            ggml_backend_buffer_free(buf_output);
-        }
-    }
+    // 说明：资源释放统一交给基类 runner_context，避免重复 free。
 
     std::string voice = "af_alloy";
 
@@ -422,6 +401,16 @@ struct kokoro_context : runner_context {
     }
 };
 
+// Kokoro 的输入准备（噪声、窗函数、mask 等）虽然占比不高，但在短音频/短句场景下会成为固定开销。
+// 该结构用于把这部分开销分段统计出来，方便定位瓶颈与后续优化。
+struct kokoro_gen_input_timings {
+    double noise_ms         = 0.0;
+    double window_sq_sum_ms = 0.0;
+    double tensor_set_ms    = 0.0;
+    double duration_mask_ms = 0.0;
+    double total_ms         = 0.0;
+};
+
 // TODO: now that we are passing the context down to these methods we should clean up their parameters
 static struct ggml_tensor * build_generator(ggml_context * ctx, kokoro_model * model, kokoro_context * kctx, struct ggml_tensor * x, struct ggml_tensor * style, struct ggml_tensor * f0_curve, kokoro_generator* generator, int sequence_length, struct ggml_tensor * window_sq_sum, ggml_cgraph * gf);
 static struct ggml_tensor * build_sin_gen(ggml_context * ctx, kokoro_model * model, kokoro_context * kctx, struct ggml_tensor * x, int harmonic_num, int sequence_length, float voice_threshold, float sin_amp, float noise_std);
@@ -430,7 +419,7 @@ struct kokoro_context * build_new_kokoro_context(struct kokoro_model * model, in
 
 // This manages the graph compilation of computation for the Kokoro model.
 struct kokoro_runner : tts_generation_runner {
-    kokoro_runner(unique_ptr<kokoro_model> model, kokoro_context * context, single_pass_tokenizer * tokenizer, kokoro_duration_runner * drunner, phonemizer * phmzr, const generation_configuration & config): tts_generation_runner{kokoro_loader}, model{move(model)}, kctx(context), tokenizer(tokenizer), drunner(drunner), phmzr(phmzr), voice{config.voice}, espeak_voice_id{config.espeak_voice_id} {
+    kokoro_runner(unique_ptr<kokoro_model> model, kokoro_context * context, single_pass_tokenizer * tokenizer, kokoro_duration_runner * drunner, phonemizer * phmzr, const generation_configuration & config): tts_generation_runner{kokoro_loader}, model{move(model)}, kctx(context), tokenizer(tokenizer), drunner(drunner), phmzr(phmzr), voice{config.voice} {
     	tts_runner::sampling_rate = 24000.0f;
     	tts_runner::supports_voices = true;
     };
@@ -458,12 +447,11 @@ struct kokoro_runner : tts_generation_runner {
     void assign_weight(const char * name, ggml_tensor & tensor) override;
     void prepare_post_load() override;
     kokoro_ubatch build_worst_case_batch();
-    void set_inputs(kokoro_ubatch & batch, uint32_t total_size);
+    kokoro_gen_input_timings set_inputs(kokoro_ubatch & batch, uint32_t total_size);
     struct ggml_cgraph * build_kokoro_graph(kokoro_ubatch & batch);
     void run(kokoro_ubatch & batch, tts_response & outputs);
     void generate(const char * prompt, tts_response & response, const generation_configuration & config) override;
 private:
     string voice{};
-    string espeak_voice_id{};
     void propagate_voice_setting();
 };

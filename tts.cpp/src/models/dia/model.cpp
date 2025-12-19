@@ -260,9 +260,7 @@ void dia_context::reset() {
 struct dia_context * build_new_dia_context(struct dia_model * model, int n_threads, bool use_cpu) {
     dia_context * dctx = new dia_context(model, n_threads);
     if (!use_cpu) {
-#ifdef GGML_USE_METAL
-        dctx->backend = ggml_backend_metal_init();
-#endif
+        dctx->backend = tts_backend_init_accel();
     }
     dctx->backend_cpu = ggml_backend_cpu_init();
     dctx->set_threads();
@@ -273,11 +271,9 @@ struct dia_context * build_new_dia_context(struct dia_model * model, int n_threa
 
 static bool dia_kv_cache_init(struct dia_kv_cache * cache, dia_model * model, dia_context * dctx) {    
     ggml_backend_buffer_type_t buft = nullptr;
-    // this will only really support cpu or metal for the time being;
+    // 说明：KV cache 的 buffer type 需要与推理后端匹配；有 GPU 后端则优先用其默认 buffer type。
     if (dctx->backend != nullptr) {
-#ifdef GGML_USE_METAL
-        buft = ggml_backend_metal_buffer_type();
-#endif
+        buft = ggml_backend_get_default_buffer_type(dctx->backend);
     } else {
         buft = ggml_backend_cpu_buffer_type();
     }

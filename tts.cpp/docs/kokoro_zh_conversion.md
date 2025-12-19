@@ -14,7 +14,7 @@
 $voices = (Get-ChildItem kokoro-zh\voices -Filter *.pt | ForEach-Object { $_.BaseName }) -join ','
 python .\py-gguf\convert_kokoro_to_gguf `
   --repo-id kokoro-zh `
-  --save-path build\kokoro-zh-espeak-f32.gguf `
+  --save-path build\kokoro-zh-f32.gguf `
   --voices $voices
 ```
 
@@ -26,26 +26,26 @@ python .\py-gguf\convert_kokoro_to_gguf `
 
 ```powershell
 .\build\bin\Release\quantize.exe `
-  --model-path build\kokoro-zh-espeak-f32.gguf `
-  --quantized-model-path build\kokoro-zh-espeak-f16.gguf `
+  --model-path build\kokoro-zh-f32.gguf `
+  --quantized-model-path build\kokoro-zh-f16.gguf `
   --quantized-type F16 `
   --convert-non-quantized-to-f16
 
 .\build\bin\Release\quantize.exe `
-  --model-path build\kokoro-zh-espeak-f32.gguf `
-  --quantized-model-path build\kokoro-zh-espeak-q8_0.gguf `
+  --model-path build\kokoro-zh-f32.gguf `
+  --quantized-model-path build\kokoro-zh-q8_0.gguf `
   --quantized-type Q8_0 `
   --convert-non-quantized-to-f16
 
 .\build\bin\Release\quantize.exe `
-  --model-path build\kokoro-zh-espeak-f32.gguf `
-  --quantized-model-path build\kokoro-zh-espeak-q5_0.gguf `
+  --model-path build\kokoro-zh-f32.gguf `
+  --quantized-model-path build\kokoro-zh-q5_0.gguf `
   --quantized-type Q5_0 `
   --convert-non-quantized-to-f16
 
 .\build\bin\Release\quantize.exe `
-  --model-path build\kokoro-zh-espeak-f32.gguf `
-  --quantized-model-path build\kokoro-zh-espeak-q4_0.gguf `
+  --model-path build\kokoro-zh-f32.gguf `
+  --quantized-model-path build\kokoro-zh-q4_0.gguf `
   --quantized-type Q4_0 `
   --convert-non-quantized-to-f16
 ```
@@ -54,10 +54,10 @@ python .\py-gguf\convert_kokoro_to_gguf `
 
 | 文件 | 约尺寸 |
 | --- | --- |
-| `build\kokoro-zh-espeak-f32.gguf` | ~361 MB |
-| `build\kokoro-zh-espeak-f16.gguf` | ~219 MB |
-| `build\kokoro-zh-espeak-q8_0.gguf` | ~204 MB |
-| `build\kokoro-zh-espeak-q5_0.gguf` | ~198 MB |
-| `build\kokoro-zh-espeak-q4_0.gguf` | ~196 MB |
+| `build\kokoro-zh-f32.gguf` | ~361 MB |
+| `build\kokoro-zh-f16.gguf` | ~219 MB |
+| `build\kokoro-zh-q8_0.gguf` | ~204 MB |
+| `build\kokoro-zh-q5_0.gguf` | ~198 MB |
+| `build\kokoro-zh-q4_0.gguf` | ~196 MB |
 
 如需更新模型，只需要用新的 `kokoro-zh` 目录替换原始文件，再重复以上步骤即可。

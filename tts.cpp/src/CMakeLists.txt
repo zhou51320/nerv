@@ -31,15 +31,3 @@ endif ()
 
 add_subdirectory(decoder)
 add_subdirectory(models)
-
-if (ESPEAK_INCLUDE_DIRS)
-    target_include_directories(tts PUBLIC ${ESPEAK_INCLUDE_DIRS})
-endif ()
-
-if (ESPEAK_COMPILE_DEFINITIONS)
-    target_compile_definitions(tts PRIVATE ${ESPEAK_COMPILE_DEFINITIONS})
-endif ()
-
-if (ESPEAK_LIBRARIES)
-    target_link_libraries(tts PUBLIC ${ESPEAK_LIBRARIES})
-endif ()

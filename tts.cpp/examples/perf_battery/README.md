@@ -1,57 +1,39 @@
-### Overview
+# perf_battery（benchmark）
 
-This script runs a series of benchmarks to test the generative throughput of the TTS.cpp implementation. Over 30 sentences, it aggregates the tokens per second for both the generative model and the decoder model, the real time factor (i.e. the generation time per model divided by the time length of the audio output), and the end to end mean generation in in milliseconds.
+## 概述
 
-### Requirements
+`perf_battery` 提供一套固定的基准用例（中文/英文/中英混合），用于测量同一模型在不同推理后端或不同版本下的耗时差异。  
+默认只需指定模型路径，输出会直接给出每个用例的平均耗时与 RTF（Real Time Factor）。
 
-* perf_batter and the parler library must be built 
-* A local GGUF file for parler tts mini
+## 构建
 
-### Usage
-
-In order to get a detailed breakdown the functionality currently available you can call the cli with the `--help` parameter. This will return a breakdown of all parameters:
-```commandline
-./perf_battery --help
-
---n-threads (-nt):
-    The number of cpu threads to run generation with. Defaults to 10.
---use-metal (-m):
-    (OPTIONAL) whether or not to use metal acceleration.
---no-cross-attn (-ca):
-    (OPTIONAL) Whether to not include cross attention
---model-path (-mp):
-    (REQUIRED) The local path of the gguf model file for Parler TTS mini v1.
+```powershell
+cmake -B build
+cmake --build build --config Release
 ```
 
-General usage should follow from these possible parameters. E.G. The following command will save generated speech to the `/tmp/test.wav` file.
+## 使用
 
-```commandline
-./perf_battery --model-path /model/path/to/gguf_file.gguf --use-metal
-```
-the output will look like the following:
-```
-Mean Stats for arch Parler-TTS:
+```powershell
+.\perf_battery.exe --model-path D:\models\Kokoro-82M-v1_1-zh_F16.gguf
 
-  Generation Time (ms):             12439.43255
-  Generation Real Time Factor (ms): 1.15635
+.\perf_battery.exe --model-path D:\models\Kokoro-82M-v1_1-zh_F16.gguf --backend vulkan --vulkan-device 0
 
+.\perf_battery.exe --model-path D:\models\Kokoro-82M-v1_1-zh_F16.gguf --repeat 3 --warmup 1
 ```
 
-### Latest Results
+## 参数说明
 
-*Please note that the results listed below are for Parler TTS mini*
+- `--model-path`：必填，GGUF 模型路径  
+- `--backend`：可选，`cpu/metal/vulkan/auto`，默认 `cpu`  
+- `--vulkan-device`：可选，Vulkan 设备索引，默认 `0`  
+- `--n-threads`：可选，CPU 线程数，默认硬件并发数  
+- `--repeat`：可选，每个用例重复次数，默认 `1`  
+- `--warmup`：可选，预热次数，默认 `1`  
+- `--voice`：可选，语音包模型的 voice id
 
-The currently measured performance breakdown for Parler Mini v1.0 with Q5_0 quantization without cross attention (i.e. the fastest stable generation with the Parler model) and 32bit floating point weights in the audio decoder:
+## 输出说明
 
-```
-Mean Stats:
-
-  Generation Time (ms):             8599.550347
-  Decode Time (ms):                 4228.528055
-  Generation TPS:                   1134.453434
-  Decode TPS:                       1878.693855
-  Generation Real Time Factor (ms): 0.695635
-  Decode Real Time Factor (ms):     0.416398
-```
-
-Please note that while memory overhead improved a small amount, no substantial difference in inference speed was observed when the audio decoder model was converted from 32bit to 16bit floats.
+输出包含两部分：  
+1) 每个用例的平均 `time_ms / audio_s / rtf`  
+2) 总体 `summary`（总耗时、总音频时长、均值/分位数、总体 RTF）

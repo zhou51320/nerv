@@ -15,11 +15,28 @@ using tensor_meta_callback = std::function<void(ggml_tensor*)>*;
 struct runner_context {
     runner_context(int n_threads): n_threads(n_threads) {};
     virtual ~runner_context() {
-        ggml_backend_sched_free(sched);
-        ggml_threadpool_free(threadpool);
-        ggml_backend_free(backend_cpu);
-        ggml_backend_free(backend);
-        ggml_backend_buffer_free(buf_output);
+        // 注意：部分后端/对象在某些配置下可能为 nullptr（例如纯 CPU、或提前退出未完成初始化）。
+        // 为避免析构阶段因为对 nullptr 调用 free 接口而崩溃，这里做防御性判空。
+        if (sched) {
+            ggml_backend_sched_free(sched);
+            sched = nullptr;
+        }
+        if (threadpool) {
+            ggml_threadpool_free(threadpool);
+            threadpool = nullptr;
+        }
+        if (buf_output) {
+            ggml_backend_buffer_free(buf_output);
+            buf_output = nullptr;
+        }
+        if (backend_cpu) {
+            ggml_backend_free(backend_cpu);
+            backend_cpu = nullptr;
+        }
+        if (backend) {
+            ggml_backend_free(backend);
+            backend = nullptr;
+        }
     }
     // TODO: extend the backend and buffer support out to all devices
     ggml_backend_t backend = nullptr;
@@ -62,6 +79,14 @@ struct tts_model {
     
     void prep_buffers_and_context(bool cpu_only, float size_offset, uint32_t dedicated_add_on_size);
     void setup_from_file(gguf_context * meta_ctx, ggml_context * load_context, bool cpu_only, std::string model_prefix, float size_offset = 1.4, uint32_t dedicated_add_on_size = 0);
+
+    // 将 tensor 放入当前模型的 backend buffer 中，并按后端要求做对齐。
+    // 说明：
+    // - Vulkan 的 StorageBuffer offset 需要满足 minStorageBufferOffsetAlignment（通常为 256 字节）；
+    // - Metal/CPU 也有各自的对齐要求；这里统一使用 ggml_backend_buffer_get_alignment() 获取。
+    // - 该函数只负责“分配/定位”tensor 的 data 指针，不做数据拷贝。
+    void alloc_tensor(struct ggml_tensor * tensor, const char * debug_name = nullptr);
+
     void set_tensor(struct ggml_tensor * tensor, struct ggml_tensor * target);
     size_t max_nodes();
     void assign_weight(std::string name, ggml_tensor * tensor);

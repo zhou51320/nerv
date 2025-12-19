@@ -2,6 +2,7 @@
 cmake_minimum_required(VERSION 3.14)
 project("tts.cpp" C CXX)
 include(CheckIncludeFileCXX)
+include(CheckCXXCompilerFlag)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -15,74 +16,6 @@ if (MSVC)
     unset(GGML_WIN_VER CACHE)
 else()
     set(GGML_WIN_VER "0x601" CACHE STRING "ggml: Windows version")
-endif()
-if (DEFINED ENV{ESPEAK_INSTALL_DIR})
-    message(STATUS "Using eSpeak NG from ESPEAK_INSTALL_DIR: $ENV{ESPEAK_INSTALL_DIR}")
-    set(ESPEAK_INCLUDE_DIRS $ENV{ESPEAK_INSTALL_DIR}/include/espeak-ng)
-    if (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
-        set(ESPEAK_LIBRARIES "$ENV{ESPEAK_INSTALL_DIR}/lib/libespeak-ng.dylib")
-    elseif(WIN32)
-        set(ESPEAK_LIBRARIES "$ENV{ESPEAK_INSTALL_DIR}/lib/libespeak-ng.dll")
-    else()
-        set(ESPEAK_LIBRARIES "$ENV{ESPEAK_INSTALL_DIR}/lib/libespeak-ng.o")
-    endif()
-    list(APPEND ESPEAK_COMPILE_DEFINITIONS
-        ESPEAK_INSTALL=1
-        ESPEAK_INSTALL_LOCAL=1
-        ESPEAK_DATA_PATH="$ENV{ESPEAK_INSTALL_DIR}/share"
-    )
-elseif (CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    # Tested with libespeak-ng-dev=1.51+dfsg-12build1
-    find_package(PkgConfig)
-    if (PKG_CONFIG_FOUND)
-        pkg_check_modules(ESPEAK espeak-ng)
-        if (ESPEAK_FOUND)
-            list(APPEND ESPEAK_COMPILE_DEFINITIONS
-                ESPEAK_INSTALL=1
-                ESPEAK_DATA_PATH="${ESPEAK_LIBDIR}/espeak-ng-data"
-            )
-        endif()
-    endif()
-elseif (WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/espeak-ng/CMakeLists.txt")
-    message(STATUS "Using bundled eSpeak NG from ${CMAKE_CURRENT_SOURCE_DIR}/espeak-ng")
-
-    set(_TTS_PREV_BUILD_SHARED_LIBS ${BUILD_SHARED_LIBS})
-    set(BUILD_SHARED_LIBS OFF CACHE BOOL "build shared libraries" FORCE)
-
-    if (NOT DEFINED ENABLE_TESTS)
-        set(ENABLE_TESTS OFF CACHE BOOL "eSpeak NG: enable tests")
-    endif()
-
-    set(_ESPEAK_BUNDLED_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/espeak-ng")
-    set(_ESPEAK_DATA_DIR "${CMAKE_CURRENT_BINARY_DIR}/espeak-ng/espeak-ng-data")
-    set(TTS_BUNDLED_ESPEAK_DATA_DIR "${_ESPEAK_DATA_DIR}")
-    file(TO_CMAKE_PATH "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}" _TTS_RUNTIME_DIR_CMAKE)
-    set(_ESPEAK_DATA_PATH_EXPR "${_TTS_RUNTIME_DIR_CMAKE}/$<CONFIG>/espeak-ng-data")
-    list(APPEND ESPEAK_COMPILE_DEFINITIONS
-        ESPEAK_INSTALL=1
-        ESPEAK_INSTALL_LOCAL=1
-        ESPEAK_DATA_PATH="${_ESPEAK_DATA_PATH_EXPR}"
-    )
-
-    add_subdirectory(espeak-ng)
-    target_compile_definitions(espeak-ng PRIVATE "PATH_ESPEAK_DATA=\"${_ESPEAK_DATA_PATH_EXPR}\"")
-
-    set(ESPEAK_INCLUDE_DIRS
-        "${_ESPEAK_BUNDLED_SOURCE_DIR}/src/include"
-        "${_ESPEAK_BUNDLED_SOURCE_DIR}/src/include/espeak-ng"
-        "${_ESPEAK_BUNDLED_SOURCE_DIR}/src/include/espeak"
-        "${_ESPEAK_BUNDLED_SOURCE_DIR}/src/include/compat"
-        "${CMAKE_CURRENT_BINARY_DIR}/espeak-ng/src/libespeak-ng/include")
-    set(ESPEAK_LIBRARIES espeak-ng)
-
-    set(BUILD_SHARED_LIBS ${_TTS_PREV_BUILD_SHARED_LIBS} CACHE BOOL "build shared libraries" FORCE)
-    set(BUILD_SHARED_LIBS ${_TTS_PREV_BUILD_SHARED_LIBS})
-
-    unset(_TTS_PREV_BUILD_SHARED_LIBS)
-    unset(_ESPEAK_BUNDLED_SOURCE_DIR)
-    unset(_ESPEAK_DATA_DIR)
-    unset(_ESPEAK_DATA_PATH_EXPR)
-    unset(_TTS_RUNTIME_DIR_CMAKE)
 endif()
 
 if (NOT XCODE AND NOT MSVC AND NOT CMAKE_BUILD_TYPE)
@@ -101,6 +34,11 @@ if (WIN32)
     add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
 endif()
 
+# 兼容较长的 GGUF tensor 名称：
+# - ggml 默认 GGML_MAX_NAME=64，最多只能存 63 个字符（还要预留 '\0'）。
+# - 部分 Kokoro GGUF 的 tensor 名称长度会达到 64，导致 gguf_init_from_file_impl 报错并无法加载模型。
+add_compile_definitions(GGML_MAX_NAME=128)
+
 if ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "MSVC")
     add_compile_options("$<$<COMPILE_LANGUAGE:C>:/source-charset:utf-8>")
     add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:/source-charset:utf-8>")
@@ -115,6 +53,45 @@ option(TTS_ALL_WARNINGS_3RD_PARTY "TTS.cpp: enable all compiler warnings in 3rd 
 # build
 option(TTS_FATAL_WARNINGS "TTS.cpp: enable -Werror flag" OFF)
 
+# 运行时静态链接（默认开启：MinGW / Linux）
+# 目标：生成的可执行文件默认不再依赖 libstdc++ / libgomp 等动态库，便于分发。
+set(TTS_STATIC_RUNTIME_DEFAULT OFF)
+if (MINGW OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set(TTS_STATIC_RUNTIME_DEFAULT ON)
+endif()
+option(TTS_STATIC_RUNTIME "TTS.cpp: link libstdc++/libgcc/libgomp statically (GNU only)" ${TTS_STATIC_RUNTIME_DEFAULT})
+
+if (TTS_STATIC_RUNTIME AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    # 让 FindOpenMP 优先选择静态 OpenMP 运行库（例如 libgomp.a），避免生成物依赖 libgomp-1.dll / libgomp.so。
+    # 必须在任何 find_package(OpenMP) 之前设置（ggml-cpu 会调用 find_package(OpenMP)）。
+    set(OpenMP_USE_STATIC_LIBS TRUE)
+    execute_process(
+        COMMAND ${CMAKE_CXX_COMPILER} -print-file-name=libgomp.a
+        OUTPUT_VARIABLE _TTS_LIBGOMP_STATIC
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+    if (NOT _TTS_LIBGOMP_STATIC OR _TTS_LIBGOMP_STATIC STREQUAL "libgomp.a")
+        message(FATAL_ERROR "TTS_STATIC_RUNTIME=ON 但未能定位静态 OpenMP 运行库 libgomp.a（请安装/补全 GCC 的静态运行库）")
+    endif()
+    set(OpenMP_gomp_LIBRARY "${_TTS_LIBGOMP_STATIC}" CACHE FILEPATH "OpenMP gomp (static)" FORCE)
+    unset(_TTS_LIBGOMP_STATIC)
+
+    # 注意：这里使用 check_cxx_compiler_flag 做“编译+链接”探测；如果缺少静态库（.a），探测也会失败。
+    check_cxx_compiler_flag("-static-libstdc++" TTS_HAS_STATIC_LIBSTDCXX)
+    check_cxx_compiler_flag("-static-libgcc"    TTS_HAS_STATIC_LIBGCC)
+
+    if (NOT TTS_HAS_STATIC_LIBSTDCXX)
+        message(FATAL_ERROR "TTS_STATIC_RUNTIME=ON 但当前工具链不支持/缺少静态 libstdc++（尝试安装对应的静态库或关闭 TTS_STATIC_RUNTIME）")
+    endif()
+    if (NOT TTS_HAS_STATIC_LIBGCC)
+        message(FATAL_ERROR "TTS_STATIC_RUNTIME=ON 但当前工具链不支持/缺少静态 libgcc（尝试安装对应的静态库或关闭 TTS_STATIC_RUNTIME）")
+    endif()
+    add_link_options(
+        $<$<LINK_LANGUAGE:CXX>:-static-libstdc++>
+        $<$<LINK_LANGUAGE:CXX>:-static-libgcc>
+    )
+endif()
+
 # extra artifacts
 option(TTS_BUILD_EXAMPLES "TTS.cpp: build examples" ON)
 
@@ -128,6 +105,20 @@ set(GGML_FATAL_WARNINGS     ${TTS_FATAL_WARNINGS})
 
 # build lib
 add_subdirectory(ggml)
+
+# Windows (MinGW) 兼容性说明：
+# ggml 0.9.4 在 Windows 分支中会尝试使用 ThreadPowerThrottling 相关 API/结构体。
+# 某些 MinGW-w64 发行版的头文件并不包含这些较新的定义，导致编译报错。
+# 这里将 ggml 的目标 Windows 版本下限固定到 0x0601（Windows 7），从而跳过该段代码路径。
+if (WIN32 AND NOT MSVC)
+    foreach(_tts_ggml_tgt IN ITEMS ggml-base ggml-cpu ggml)
+        if (TARGET ${_tts_ggml_tgt})
+            target_compile_definitions(${_tts_ggml_tgt} PRIVATE _WIN32_WINNT=0x0601 WINVER=0x0601)
+        endif()
+    endforeach()
+    unset(_tts_ggml_tgt)
+endif()
+
 add_subdirectory(ggml-patches)
 add_subdirectory(src)
 
@@ -196,31 +187,6 @@ install(FILES "${CMAKE_CURRENT_BINARY_DIR}/tts.pc"
 
 if (TTS_BUILD_EXAMPLES)
     add_subdirectory(examples)
-
-    if (DEFINED TTS_BUNDLED_ESPEAK_DATA_DIR)
-        set(_tts_espeak_runtime_target)
-        foreach(_tts_candidate IN ITEMS tts-cli phonemize tts-server)
-            if (TARGET "${_tts_candidate}")
-                set(_tts_espeak_runtime_target "${_tts_candidate}")
-                break()
-            endif()
-        endforeach()
-        if (_tts_espeak_runtime_target)
-            add_custom_target(copy-espeak-data ALL
-                COMMAND ${CMAKE_COMMAND} -E rm -rf "$<TARGET_FILE_DIR:${_tts_espeak_runtime_target}>/espeak-ng-data"
-                COMMAND ${CMAKE_COMMAND} -E copy_directory
-                    "${TTS_BUNDLED_ESPEAK_DATA_DIR}"
-                    "$<TARGET_FILE_DIR:${_tts_espeak_runtime_target}>/espeak-ng-data"
-                COMMENT "Copying eSpeak NG data next to executables"
-                DEPENDS ${_tts_espeak_runtime_target}
-            )
-            if (TARGET data)
-                add_dependencies(copy-espeak-data data)
-            endif()
-        endif()
-        unset(_tts_candidate)
-        unset(_tts_espeak_runtime_target)
-    endif()
 endif()
 
 add_subdirectory(tests)

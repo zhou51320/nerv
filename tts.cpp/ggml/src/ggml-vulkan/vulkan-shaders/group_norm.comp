@@ -1,7 +1,7 @@
 #version 450
 
-#include "generic_head.comp"
-#include "types.comp"
+#include "generic_head.glsl"
+#include "types.glsl"
 
 #extension GL_EXT_control_flow_attributes : enable
 #define BLOCK_SIZE 512
@@ -19,7 +19,7 @@ void main() {
 
     const uint tid = gl_LocalInvocationID.x;
     const uint start = gl_WorkGroupID.x * group_size + tid;
-    const uint end = start + group_size;
+    const uint end = (gl_WorkGroupID.x + 1) * group_size;
 
     tmp[tid] = 0.0f;
 

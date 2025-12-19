@@ -1,10 +1,12 @@
 #ifndef util_h
 #define util_h
 
+#include "common.h"
 #include "numbers_compat.h"
 #include <math.h>
 #include <functional>
 #include <random>
+#include <mutex>
 #include <stdio.h>
 #include <string>
 #include <cstring>
@@ -12,10 +14,12 @@
 #include <stdint.h>
 #include <sys/types.h>
 #include "ggml-metal.h"
+#include "ggml-vulkan.h"
 #include "ggml-backend.h"
 #include "ggml-alloc.h"
 #include "ggml-cpu.h"
 #include "ggml.h"
+#include "gguf.h"
 #include "ggml-impl.h"
 #include "ggml-cpp.h"
 
@@ -58,6 +62,59 @@ void cfg_scale(struct ggml_tensor * dst, const struct ggml_tensor * a, const str
 
 struct ggml_tensor * reciprocal(ggml_context * ctx, struct ggml_tensor * x);
 
+// ---------------------------
+// ggml 后端选择（CPU/Metal/Vulkan）
+// ---------------------------
+//
+// 设计说明：
+// - 历史上项目用 `cpu_only` 这个 bool 来区分 “CPU / Metal” 两种模式；但 Vulkan 加入后，bool 无法表达更多后端。
+// - 为了尽量少改动模型/loader 的函数签名，这里使用 thread_local 保存“当前线程的后端配置”。
+// - 模型加载时（runner_from_file）会在当前线程设置该配置；各模型的 context / tts_model 在初始化加速后端时读取它。
+// - 使用 thread_local 的原因：tts-server 等场景可能多线程并行加载/推理，避免全局变量竞争。
+
+// 设置/获取当前线程的后端配置（仅影响当前线程后续的模型加载/推理上下文创建）。
+void               tts_set_backend_config(const tts_backend_config & cfg);
+tts_backend_config tts_get_backend_config();
+
+// RAII：临时切换后端配置，作用域结束自动恢复。
+struct tts_backend_config_guard {
+    explicit tts_backend_config_guard(const tts_backend_config & cfg);
+    ~tts_backend_config_guard();
+
+    tts_backend_config_guard(const tts_backend_config_guard &)             = delete;
+    tts_backend_config_guard & operator=(const tts_backend_config_guard &) = delete;
+
+  private:
+    tts_backend_config prev_;
+};
+
+// 根据当前线程的后端配置，初始化一个“加速后端”（Metal/Vulkan）。
+// 返回 nullptr 表示当前构建或运行环境不支持所请求的后端。
+ggml_backend_t tts_backend_init_accel();
+
+/**
+ * 转置卷积 1D（兼容旧版 ggml 的扩展签名）。
+ *
+ * 背景：
+ * - 旧版项目使用的 ggml 曾经提供过带 output_padding / groups 的 `ggml_conv_transpose_1d` 扩展签名；
+ * - ggml 0.9.4 将其收敛为仅 (stride, padding, dilation)，且当前实现还限制 `padding == 0 && dilation == 1`。
+ *
+ * 目标：
+ * - 在“不修改 ggml 源码”的前提下，尽量复用 ggml 0.9.4 现有实现；
+ * - 对于 groups==1 的常见场景：调用 ggml 原生转置卷积（padding 固定为 0）后，通过 view + cont 做裁剪，等价实现 padding/output_padding；
+ * - 对于 groups>1（主要是 Kokoro 的 depthwise 转置卷积）：
+ *   在项目侧用 GGML_OP_CUSTOM 补齐一个 CPU 版本实现，保证功能正确。
+ */
+struct ggml_tensor * tts_conv_transpose_1d(
+    ggml_context * ctx,
+    struct ggml_tensor * a,  // kernel
+    struct ggml_tensor * b,  // input
+    int s0,                  // stride
+    int p0,                  // padding
+    int d0,                  // dilation
+    int output_padding = 0,
+    int groups = 1);
+
 bool has_suffix(std::string value, std::string suffix);
 bool has_prefix(std::string value, std::string prefix);
 
@@ -67,5 +124,8 @@ std::string strip(std::string target, std::string vals = " ");
 std::string replace_any(std::string target, std::string to_replace, std::string replacement);
 
 [[noreturn]] void tts_abort(const char * file, int line, const char * fmt, ...);
+
+// 统一初始化 ggml 计时（只做一次），避免多处重复调用 ggml_time_init 导致计时基准被重置。
+void tts_time_init_once();
 
 #endif

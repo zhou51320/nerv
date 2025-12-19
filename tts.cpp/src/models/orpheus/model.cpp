@@ -139,9 +139,7 @@ struct ggml_tensor * build_attn_mask(ggml_context * ctx, orpheus_context * octx,
 orpheus_context * build_new_orpheus_context(orpheus_model * model, int n_threads, bool use_cpu) {
     orpheus_context * octx = new orpheus_context(model, n_threads);
     if (!use_cpu) {
-#ifdef GGML_USE_METAL
-        octx->backend = ggml_backend_metal_init();
-#endif
+        octx->backend = tts_backend_init_accel();
     }
     octx->backend_cpu = ggml_backend_cpu_init();
     octx->set_threads();
@@ -153,9 +151,7 @@ orpheus_context * build_new_orpheus_context(orpheus_model * model, int n_threads
 void orpheus_runner::orpheus_kv_cache_init() {    
     ggml_backend_buffer_type_t buft = nullptr;
     if (octx->backend != nullptr) {
-#ifdef GGML_USE_METAL
-        buft = ggml_backend_metal_buffer_type();
-#endif
+        buft = ggml_backend_get_default_buffer_type(octx->backend);
     } else {
         buft = ggml_backend_cpu_buffer_type();
     }

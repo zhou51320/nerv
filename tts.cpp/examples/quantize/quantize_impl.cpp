@@ -83,16 +83,6 @@ static size_t quantize_tensor(void * new_data, const ggml_tensor * tensor, const
                               uint32_t n_threads) {
     // much of this is form copied from llama.cpp
     int chunk_size_multiplier = 1;
-    if (qtype == GGML_TYPE_Q4_0_4_4 || qtype == GGML_TYPE_Q4_0_4_8 || qtype == GGML_TYPE_Q4_0_8_8) {
-        if ((qtype == GGML_TYPE_Q4_0_8_8) && (tensor->ne[1] % 8 != 0) || tensor->ne[1] % 4 != 0) {
-            qtype = GGML_TYPE_Q4_0;
-        }
-        if (qtype == GGML_TYPE_Q4_0_8_8) {
-            chunk_size_multiplier = 8;
-        } else if (qtype == GGML_TYPE_Q4_0_4_4 || qtype == GGML_TYPE_Q4_0_4_8) {
-            chunk_size_multiplier = 4;
-        }
-    }
     size_t                   out_size       = 0;
     const int32_t            d3_step        = tensor->ne[0] * tensor->ne[1];
     const int32_t            n_per_row      = tensor->ne[0];
@@ -206,7 +196,20 @@ void quantize_gguf(const char * ifile, const char * ofile, const quantization_pa
     gguf_set_val_u32(ctx_out.get(), "general.quantization_type", params.quantize_type);
     for (ggml_tensor * tensor = ggml_get_first_tensor(weight_ctx); tensor;
          tensor               = ggml_get_next_tensor(weight_ctx, tensor)) {
-        if (*ggml_get_name(tensor)) {
+        const char * name = ggml_get_name(tensor);
+        if (name == nullptr || name[0] == '\0') {
+            continue;
+        }
+
+        // 说明：ggml 0.9.4 的 GGUF 读取实现会在 ggml_context 中额外放入一个内部“数据 blob”tensor：
+        // - 名称：GGUF tensor data binary blob
+        // - 类型：通常是 GGML_TYPE_I8
+        // 该 tensor 不是模型权重的一部分，若参与 quantize/convert 会触发类型断言并导致程序退出。
+        if (std::strcmp(name, "GGUF tensor data binary blob") == 0) {
+            continue;
+        }
+
+        if (*name) {
             gguf_add_tensor(ctx_out.get(), tensor);
         }
     }
@@ -240,7 +243,11 @@ void quantize_gguf(const char * ifile, const char * ofile, const quantization_pa
         const char * const     name = ggml_get_name(cur);
         const std::string_view name_sv{ name };
 
-        if (!*name) {
+        if (name == nullptr || name[0] == '\0') {
+            continue;
+        }
+        // 同上：跳过 GGUF 内部的 blob tensor，避免误参与量化/转换流程。
+        if (std::strcmp(name, "GGUF tensor data binary blob") == 0) {
             continue;
         }
 
@@ -283,7 +290,7 @@ void quantize_gguf(const char * ifile, const char * ofile, const quantization_pa
         }
 
         gguf_set_tensor_type(ctx_out.get(), name, new_type);
-        gguf_set_tensor_data(ctx_out.get(), name, new_data, new_size);
+        gguf_set_tensor_data(ctx_out.get(), name, new_data);
         fprintf(stdout, "At tensor: '%s' with new size: %zu bytes\n", name, new_size);
         // write tensor data + padding
         fout.write(static_cast<const char *>(new_data), new_size);

@@ -9,7 +9,6 @@ int main() {
                                     1.0f,   // temperature
                                     1.1f,   // repetition_penalty
                                     false,  // use_cross_attn (disabled to save memory)
-                                    "",     // espeak_voice_id (empty)
                                     256,    // max_tokens (reduced from 512)
                                     0.95f,  // top_p
                                     true    // sample

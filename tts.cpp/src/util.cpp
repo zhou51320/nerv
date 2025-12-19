@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <mutex>
 #include <stdarg.h>
 #ifdef __APPLE__
 #include <sys/sysctl.h>
@@ -10,6 +11,80 @@
 #else
 // windows stuff
 #endif
+
+namespace {
+    // 当前线程的后端配置。
+    //
+    // 说明：
+    // - 选择做成 thread_local，是为了在 tts-server 等多线程场景下，避免并发加载模型时互相覆盖配置。
+    // - 默认使用 AUTO：如果上层只表达“我要用 GPU”，则尽量自动选择可用的 GPU 后端（Metal 优先，其次 Vulkan）。
+    thread_local tts_backend_config g_backend_cfg{tts_compute_backend::AUTO, 0};
+
+    ggml_backend_t tts_try_init_metal() {
+#ifdef GGML_USE_METAL
+        return ggml_backend_metal_init();
+#else
+        return nullptr;
+#endif
+    }
+
+    ggml_backend_t tts_try_init_vulkan(const int device) {
+#ifdef GGML_USE_VULKAN
+        const size_t dev = device >= 0 ? (size_t) device : 0;
+        return ggml_backend_vk_init(dev);
+#else
+        (void) device;
+        return nullptr;
+#endif
+    }
+}  // namespace
+
+void tts_set_backend_config(const tts_backend_config & cfg) {
+    g_backend_cfg = cfg;
+}
+
+tts_backend_config tts_get_backend_config() {
+    return g_backend_cfg;
+}
+
+tts_backend_config_guard::tts_backend_config_guard(const tts_backend_config & cfg) : prev_{tts_get_backend_config()} {
+    tts_set_backend_config(cfg);
+}
+
+tts_backend_config_guard::~tts_backend_config_guard() {
+    tts_set_backend_config(prev_);
+}
+
+ggml_backend_t tts_backend_init_accel() {
+    const tts_backend_config cfg = tts_get_backend_config();
+
+    switch (cfg.backend) {
+        case tts_compute_backend::CPU:
+            return nullptr;
+        case tts_compute_backend::METAL:
+            return tts_try_init_metal();
+        case tts_compute_backend::VULKAN:
+            return tts_try_init_vulkan(cfg.device);
+        case tts_compute_backend::AUTO: {
+            if (ggml_backend_t backend = tts_try_init_metal()) {
+                return backend;
+            }
+            if (ggml_backend_t backend = tts_try_init_vulkan(cfg.device)) {
+                return backend;
+            }
+            return nullptr;
+        }
+    }
+
+    return nullptr;
+}
+
+void tts_time_init_once() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        ggml_time_init();
+    });
+}
 
 void tts_abort(const char * file, int line, const char * fmt, ...) {
     fflush(stdout);
@@ -64,10 +139,46 @@ int search_for_gguf_keys(gguf_context * meta, std::vector<std::string> possible_
 }
 
 void random_uniform_gen(int count, float * tgt, float min, float max) {
-    static std::default_random_engine e;
-    static std::uniform_real_distribution<float> dis(min, max);
+    // 说明（性能相关）：Kokoro 的 uv/noise 输入在每次推理前都会生成大量随机数。
+    // std::uniform_real_distribution + default_random_engine 在这里会带来明显的 CPU 开销，
+    // 同时原实现还存在一个隐患：distribution 是 static 的，后续传入不同的 min/max 并不会生效。
+    //
+    // 这里使用 thread_local 的 xorshift64* 生成器，配合位级转换快速得到 [0, 1) 的 float，
+    // 再线性缩放到 [min, max)。这样在不改变“均匀分布”性质的前提下，显著降低前处理耗时。
+
+    if (count <= 0 || tgt == nullptr) {
+        return;
+    }
+
+    const float range = max - min;
+
+    auto uniform01 = [](uint32_t x) -> float {
+        // 取 23bit 填充 float 的尾数，构造 [1, 2) 的 float，再减 1 得到 [0, 1)。
+        const uint32_t bits = (x >> 9) | 0x3F800000u;
+        float f = 0.0f;
+        std::memcpy(&f, &bits, sizeof(f));
+        return f - 1.0f;
+    };
+
+    auto next_u32 = []() -> uint32_t {
+        // xorshift64*，每线程独立状态；避免加锁也便于未来并行调用。
+        static thread_local uint64_t s = [] {
+            std::random_device rd;
+            uint64_t seed = (uint64_t(rd()) << 32) ^ uint64_t(rd());
+            // 避免 0 种子导致退化。
+            return seed ? seed : 0x9E3779B97F4A7C15ull;
+        }();
+
+        s ^= s >> 12;
+        s ^= s << 25;
+        s ^= s >> 27;
+        const uint64_t v = s * 2685821657736338717ull;
+        return uint32_t(v >> 32);
+    };
+
     for (int i = 0; i < count; i++) {
-        tgt[i] = dis(e);
+        const float u = uniform01(next_u32());
+        tgt[i] = min + range * u;
     }
 }
 
@@ -100,6 +211,142 @@ struct ggml_tensor * snake_1d(ggml_context * ctx, struct ggml_tensor * alpha, st
     return ggml_add(ctx, a, ggml_mul(ctx, ggml_sqr(ctx, ggml_sin(ctx, ggml_mul(ctx, a, alpha))), reciprocal(ctx, alpha)));
 }
 
+namespace {
+// ----------------------------- 说明（重要） -----------------------------
+//
+// ggml 0.9.4 的 `ggml_conv_transpose_1d` 当前实现存在两个限制：
+// 1) padding 必须为 0
+// 2) dilation 必须为 1
+//
+// 但本项目（尤其是 Kokoro / DAC）历史代码中，存在：
+// - padding != 0 的转置卷积（非常常见：用于上采样时对齐输出长度）
+// - 带 output_padding / groups 的旧扩展签名（Kokoro 的 pool 是 depthwise 转置卷积）
+//
+// 为了“侵入性更小”（不去修改 ggml 源码），这里采用兼容封装：
+// - groups == 1：调用 ggml 原生转置卷积（固定 padding=0）得到更长输出，再通过 view 裁剪实现 padding/output_padding。
+// - groups  > 1：使用 GGML_OP_CUSTOM 在项目侧实现一个 CPU 版本的 grouped 转置卷积，补齐 depthwise 场景。
+//
+// 注意：custom 路径目前仅实现为 CPU 计算（与本项目 STFT/ISTFT 自定义算子一致）。
+struct tts_conv_transpose_1d_op_params {
+    ggml_custom_op_params base;
+    int32_t s0;
+    int32_t p0;
+    int32_t d0;
+    int32_t output_padding;
+    int32_t groups;
+};
+
+static inline float tts_read_kernel_val_3d_f32(const ggml_tensor * t, int64_t i0, int64_t i1, int64_t i2) {
+    return *(const float *) ((const char *) t->data + i0 * t->nb[0] + i1 * t->nb[1] + i2 * t->nb[2]);
+}
+
+static inline float tts_read_kernel_val_3d_f16(const ggml_tensor * t, int64_t i0, int64_t i1, int64_t i2) {
+    const ggml_fp16_t v = *(const ggml_fp16_t *) ((const char *) t->data + i0 * t->nb[0] + i1 * t->nb[1] + i2 * t->nb[2]);
+    return ggml_fp16_to_fp32(v);
+}
+
+static void tts_compute_conv_transpose_1d_custom(struct ggml_tensor * dst, int ith, int nth, void *) {
+    tts_conv_transpose_1d_op_params p{};
+    std::memcpy(&p, dst->op_params, sizeof(p));
+
+    const ggml_tensor * kernel = dst->src[0];
+    const ggml_tensor * input  = dst->src[1];
+
+    GGML_ASSERT(kernel != nullptr);
+    GGML_ASSERT(input  != nullptr);
+
+    // 目前只为项目中实际用到的场景兜底：输入为 F32；kernel 为 F16/F32；输出为 F32。
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(input->type == GGML_TYPE_F32);
+    GGML_ASSERT(kernel->type == GGML_TYPE_F16 || kernel->type == GGML_TYPE_F32);
+
+    GGML_ASSERT(dst->nb[0] == sizeof(float));
+    GGML_ASSERT(input->nb[0] == sizeof(float));
+
+    const int32_t s0 = p.s0;
+    const int32_t p0 = p.p0;
+    const int32_t d0 = p.d0;
+    const int32_t output_padding = p.output_padding;
+    const int32_t groups = p.groups;
+
+    GGML_ASSERT(s0 > 0);
+    GGML_ASSERT(d0 > 0);
+    GGML_ASSERT(p0 >= 0);
+    GGML_ASSERT(output_padding >= 0);
+    GGML_ASSERT(groups > 0);
+
+    // 约定 kernel layout 与 ggml 的 conv_transpose_1d 一致：
+    // kernel: [K, OC_per_group, IC_total]
+    // input : [L_in, IC_total, N]
+    // output: [L_out, OC_total, N]，其中 OC_total = OC_per_group * groups
+    const int64_t K = kernel->ne[0];
+    const int64_t OC_per_group = kernel->ne[1];
+    const int64_t IC_total = kernel->ne[2];
+
+    const int64_t L_in  = input->ne[0];
+    const int64_t IC_in = input->ne[1];
+    const int64_t N     = input->ne[2];
+
+    GGML_ASSERT(kernel->ne[3] == 1);
+    GGML_ASSERT(input->ne[3] == 1);
+    GGML_ASSERT(IC_in == IC_total);
+    GGML_ASSERT(IC_total % groups == 0);
+    GGML_ASSERT(OC_per_group > 0);
+
+    const int64_t IC_per_group = IC_total / groups;
+    const int64_t OC_total = OC_per_group * groups;
+
+    const int64_t L_out_expected = (L_in - 1) * (int64_t) s0 - 2 * (int64_t) p0 + (int64_t) d0 * (K - 1) + (int64_t) output_padding + 1;
+    GGML_ASSERT(dst->ne[0] == L_out_expected);
+    GGML_ASSERT(dst->ne[1] == OC_total);
+    GGML_ASSERT(dst->ne[2] == N);
+    GGML_ASSERT(dst->ne[3] == 1);
+
+    // 任务划分：按输出通道（ne1）切片，避免写冲突。
+    const int64_t ocpt = (OC_total + nth - 1) / nth; // out channels per task
+    const int64_t oc0  = ocpt * ith;
+    const int64_t oc1  = std::min(oc0 + ocpt, OC_total);
+
+    for (int64_t n = 0; n < N; ++n) {
+        for (int64_t oc_total = oc0; oc_total < oc1; ++oc_total) {
+            float * out_row = (float *) ((char *) dst->data + oc_total * dst->nb[1] + n * dst->nb[2]);
+            std::memset(out_row, 0, (size_t) dst->ne[0] * sizeof(float));
+
+            const int64_t g = oc_total / OC_per_group;
+            const int64_t oc = oc_total - g * OC_per_group; // oc in group
+
+            const int64_t ic_begin = g * IC_per_group;
+            const int64_t ic_end   = ic_begin + IC_per_group;
+
+            for (int64_t ic = ic_begin; ic < ic_end; ++ic) {
+                const float * in_row = (const float *) ((const char *) input->data + ic * input->nb[1] + n * input->nb[2]);
+
+                for (int64_t x = 0; x < L_in; ++x) {
+                    const float xv = in_row[x];
+                    if (xv == 0.0f) {
+                        continue;
+                    }
+
+                    const int64_t base_y = x * (int64_t) s0 - (int64_t) p0;
+
+                    for (int64_t k = 0; k < K; ++k) {
+                        const int64_t y = base_y + k * (int64_t) d0;
+                        if (y < 0 || y >= dst->ne[0]) {
+                            continue;
+                        }
+
+                        const float w = (kernel->type == GGML_TYPE_F32)
+                                            ? tts_read_kernel_val_3d_f32(kernel, k, oc, ic)
+                                            : tts_read_kernel_val_3d_f16(kernel, k, oc, ic);
+                        out_row[y] += xv * w;
+                    }
+                }
+            }
+        }
+    }
+}
+} // namespace
+
 bool has_suffix(std::string value, std::string suffix) {
     return value.size() >= suffix.size() && value.compare(value.size()-suffix.size(), suffix.size(), suffix) == 0;
 }
@@ -108,25 +355,522 @@ bool has_prefix(std::string value, std::string prefix) {
     return value.size() >= prefix.size() && value.compare(0, prefix.size(), prefix) == 0;
 }
 
-struct ggml_tensor * stft(ggml_context * ctx, struct ggml_tensor * a, struct ggml_tensor * window, size_t n_fft, size_t hop, bool abs_and_angle, bool one_sided) {
-    if (window->ne[0] != n_fft) {
-        TTS_ABORT("For #stft the window_size, %d, must be either equal to n_fft, %d, or, when one sided, n_fft / 2 + 1, %d.\n", a->ne[0], n_fft, n_fft/2+1);
-    }
-    struct ggml_tensor * cur = ggml_stft(ctx, a, window, n_fft, hop, abs_and_angle);
-    if (one_sided) {
-        cur = ggml_cont(ctx, ggml_view_4d(ctx, cur, ((int64_t) n_fft / 2) + 1, cur->ne[1], cur->ne[2], cur->ne[3], cur->nb[1], cur->nb[2], cur->nb[3], 0));
+namespace {
+// ----------------------------- 说明（重要） -----------------------------
+//
+// 现状：
+// - 旧版 ggml 曾内置 ggml_stft / ggml_istft 以及对应 CPU kernel（用于 Kokoro 的声码器部分）。
+// - 你升级到 ggml 0.9.4 后，这组算子已不再存在，因此项目会直接编译失败。
+//
+// 方案（侵入性更小）：
+// - 不去改 ggml 源码；
+// - 在本项目侧用 ggml 的 GGML_OP_CUSTOM 自定义算子实现 STFT / ISTFT，
+//   让 Kokoro 仍能在 ggml 0.9.4 上工作。
+//
+// 注意：
+// - 该实现目前只提供 CPU 计算逻辑（自定义算子由 ggml-cpu 调用回调函数执行）。
+// - 若上层启用多后端调度（如 Metal + CPU），scheduler 会在需要时对 window 等权重做拷贝，
+//   保证自定义算子在 CPU 上可读写数据。
+
+// 2*pi 常量（避免依赖 M_PI 在不同平台的宏开关）。
+static constexpr float TTS_TWO_PI_F = 6.28318530717958647692f;
+
+// 这是一个简单的 O(N^2) DFT 实现：当 n_fft 不是 2 的幂时，用它作为回退。
+static void tts_simple_dft(float * real, float * imag, float * scratch, size_t n_fft, size_t step) {
+    const float base_k = -TTS_TWO_PI_F / (float) n_fft;
+
+    for (size_t i = 0; i < n_fft; ++i) {
+        float acc_r = 0.0f;
+        float acc_i = 0.0f;
+
+        for (size_t j = 0; j < n_fft; ++j) {
+            const float k = base_k * (float) j * (float) i;
+            const float c = cosf(k);
+            const float s = sinf(k);
+
+            const float xr = real[j * step];
+            const float xi = imag[j * step];
+
+            // (xr + i*xi) * (c + i*s)
+            acc_r += xr * c - xi * s;
+            acc_i += xr * s + xi * c;
+        }
+
+        scratch[i * 2 + 0] = acc_r;
+        scratch[i * 2 + 1] = acc_i;
     }
 
-    return cur;
+    // 写回输出（实部/虚部分离存储）
+    for (size_t i = 0; i < n_fft; ++i) {
+        real[i * step] = scratch[i * 2 + 0];
+        imag[i * step] = scratch[i * 2 + 1];
+    }
+}
+
+// Radix-2 FFT（Cooley-Tukey），与旧 ggml 里的实现一致：输入为 real/imag 两个数组。
+static void tts_radix2_fft(float * real, float * imag, float * scratch, size_t n_fft, size_t step) {
+    if (n_fft == 1) {
+        return;
+    }
+
+    if (n_fft % 2 != 0) {
+        // 当长度无法被 2 因子分解时，回退到 O(N^2) 的简单 DFT。
+        tts_simple_dft(real, imag, scratch, n_fft, step);
+        return;
+    }
+
+    // 递归：偶/奇拆分（通过 step*2 达到“跳步访问”的效果，不额外分配数组）
+    tts_radix2_fft(real, imag, scratch, n_fft / 2, step * 2);
+    tts_radix2_fft(
+        (float *) ((char *) real + step * sizeof(float)),
+        (float *) ((char *) imag + step * sizeof(float)),
+        scratch,
+        n_fft / 2,
+        step * 2);
+
+    const float km = -TTS_TWO_PI_F / (float) n_fft;
+
+    // butterfly
+    for (size_t i = 0; 2 * i < n_fft; ++i) {
+        const float k  = km * (float) i;
+        const float c  = cosf(k);
+        const float s  = sinf(k);
+
+        const float pr = real[i * 2 * step];
+        const float pi = imag[i * 2 * step];
+
+        const float qr0 = real[(i * 2 + 1) * step];
+        const float qi0 = imag[(i * 2 + 1) * step];
+
+        // (qr0 + i*qi0) * (c + i*s)
+        const float qr = qr0 * c - qi0 * s;
+        const float qi = qr0 * s + qi0 * c;
+
+        // 结果先写到 scratch，再整体写回（避免覆盖尚未读取的数据）
+        scratch[i + n_fft] = pi + qi;
+        scratch[i]         = pr + qr;
+
+        scratch[i + (n_fft / 2) + n_fft] = pi - qi;
+        scratch[i + (n_fft / 2)]         = pr - qr;
+    }
+
+    for (size_t i = 0; i < n_fft; ++i) {
+        real[i * step] = scratch[i];
+        imag[i * step] = scratch[i + n_fft];
+    }
+}
+
+// STFT 自定义算子的参数（存放在 dst->op_params 里，避免额外堆分配/生命周期管理）。
+struct tts_stft_op_params {
+    ggml_custom_op_params base;
+    int32_t n_fft;
+    int32_t hop;
+    int32_t abs_and_angle; // 0/1：输出为 (real,imag) 或 (magnitude,angle)
+};
+
+// ISTFT 自定义算子的参数（同上）。
+struct tts_istft_op_params {
+    ggml_custom_op_params base;
+    int32_t n_fft;
+    int32_t hop;
+    int32_t from_abs_and_angle; // 0/1：输入为 (real,imag) 或 (magnitude,angle)
+};
+
+static void tts_compute_stft_custom(struct ggml_tensor * dst, int ith, int nth, void *) {
+    tts_stft_op_params p{};
+    std::memcpy(&p, dst->op_params, sizeof(p));
+
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * win  = dst->src[1];
+
+    GGML_ASSERT(src0 != nullptr);
+    GGML_ASSERT(win  != nullptr);
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(win->type  == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+
+    const int32_t n_fft = p.n_fft;
+    const int32_t hop   = p.hop;
+    const int32_t half  = n_fft / 2;
+    const bool abs_and_angle = p.abs_and_angle != 0;
+
+    GGML_ASSERT(n_fft > 0);
+    GGML_ASSERT(hop > 0);
+    GGML_ASSERT(win->ne[0] == n_fft);
+    GGML_ASSERT(dst->ne[0] == n_fft);
+    GGML_ASSERT(dst->ne[3] == 2);
+    GGML_ASSERT(src0->nb[0] == sizeof(float));
+    GGML_ASSERT(win->nb[0]  == sizeof(float));
+    GGML_ASSERT(dst->nb[0]  == sizeof(float));
+
+    const int64_t in_len  = src0->ne[0];
+    const int64_t n_batch = dst->ne[2];
+    const int64_t n_frame = dst->ne[1];
+
+    // 每个任务负责一段 frame 区间，写入互不重叠，天然无竞争。
+    const int64_t fpt = (n_frame + nth - 1) / nth;  // frames per task
+    const int64_t f0  = fpt * ith;
+    const int64_t f1  = std::min(f0 + fpt, n_frame);
+
+    // 每个线程复用一块 FFT scratch（2*n_fft float：前半写实部、后半写虚部）。
+    static thread_local std::vector<float> tls_scratch;
+    if (tls_scratch.size() < (size_t) n_fft * 2) {
+        tls_scratch.assign((size_t) n_fft * 2, 0.0f);
+    }
+    float * scratch = tls_scratch.data();
+
+    const float * w = (const float *) win->data;
+
+    for (int64_t b = 0; b < n_batch; ++b) {
+        const char * src0_b = (const char *) src0->data + b * src0->nb[1];
+
+        for (int64_t fi = f0; fi < f1; ++fi) {
+            const int64_t center = fi * (int64_t) hop;
+
+            float * out_r = (float *) ((char *) dst->data + fi * dst->nb[1] + b * dst->nb[2]);
+            float * out_i = (float *) ((char *) dst->data + fi * dst->nb[1] + b * dst->nb[2] + dst->nb[3]);
+
+            // 1) 取窗口并做“中心对齐”的反射 padding（与旧 ggml 行为一致）
+            // 2) 预先乘上 window（Hann 等）
+            for (int32_t i = 0; i < n_fft; ++i) {
+                const int64_t ai = center - half + i;
+                float sample = 0.0f;
+                if (ai < 0) {
+                    sample = *(const float *) (src0_b + (size_t) (-ai) * src0->nb[0]);
+                } else if (ai >= in_len) {
+                    const int64_t ri = in_len - (ai - in_len + 1);
+                    sample = *(const float *) (src0_b + (size_t) ri * src0->nb[0]);
+                } else {
+                    sample = *(const float *) (src0_b + (size_t) ai * src0->nb[0]);
+                }
+
+                out_r[i] = sample * w[i];
+                out_i[i] = 0.0f;
+            }
+
+            // 3) FFT（就地变换 out_r/out_i）
+            tts_radix2_fft(out_r, out_i, scratch, (size_t) n_fft, 1);
+
+            // 4) 可选：转换为 (magnitude, angle)
+            if (abs_and_angle) {
+                for (int32_t i = 0; i < n_fft; ++i) {
+                    const float r = out_r[i];
+                    const float im = out_i[i];
+                    out_r[i] = sqrtf(r * r + im * im);
+                    out_i[i] = atan2f(im, r);
+                }
+            }
+        }
+    }
+}
+
+static void tts_compute_istft_custom(struct ggml_tensor * dst, int ith, int nth, void *) {
+    tts_istft_op_params p{};
+    std::memcpy(&p, dst->op_params, sizeof(p));
+
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * win  = dst->src[1];
+
+    GGML_ASSERT(src0 != nullptr);
+    GGML_ASSERT(win  != nullptr);
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(win->type  == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+
+    const int32_t n_fft = p.n_fft;
+    const int32_t hop   = p.hop;
+    const int32_t half  = n_fft / 2;
+    const bool from_abs_and_angle = p.from_abs_and_angle != 0;
+
+    GGML_ASSERT(n_fft > 0);
+    GGML_ASSERT(hop > 0);
+    GGML_ASSERT(win->ne[0] == n_fft);
+    GGML_ASSERT(src0->ne[3] == 2);
+    GGML_ASSERT(dst->nb[0] == sizeof(float));
+    GGML_ASSERT(src0->nb[0] == sizeof(float));
+    GGML_ASSERT(win->nb[0] == sizeof(float));
+
+    const int64_t n_frame = src0->ne[1];
+    const int64_t n_batch = src0->ne[2];
+    const int64_t out_len = dst->ne[0];
+
+    // onesided：输入频率维只有 half+1，需要按厄米对称重建完整频谱
+    const bool onesided = (src0->ne[0] == (int64_t) half + 1);
+
+    // 将输出长度按任务划分，每个任务只写自己负责的区间，避免线程间原子/锁/栅栏。
+    const int64_t spt = (out_len + nth - 1) / nth;  // samples per task
+    const int64_t t0  = spt * ith;
+    const int64_t t1  = std::min(t0 + spt, out_len);
+
+    // 先把自己负责的输出区间清零（每个 batch 独立一段）
+    for (int64_t b = 0; b < n_batch; ++b) {
+        float * out = (float *) ((char *) dst->data + b * dst->nb[1]);
+        for (int64_t t = t0; t < t1; ++t) {
+            out[t] = 0.0f;
+        }
+    }
+
+    // FFT scratch：buffer 用于 radix2 过程，spec 用于重建完整复数频谱（real + imag）
+    static thread_local std::vector<float> tls_buffer;
+    static thread_local std::vector<float> tls_spec;
+    if (tls_buffer.size() < (size_t) n_fft * 2) {
+        tls_buffer.assign((size_t) n_fft * 2, 0.0f);
+    }
+    if (tls_spec.size() < (size_t) n_fft * 2) {
+        tls_spec.assign((size_t) n_fft * 2, 0.0f);
+    }
+    float * buffer   = tls_buffer.data();
+    float * spec_r   = tls_spec.data();
+    float * spec_i   = tls_spec.data() + n_fft;
+
+    const float * w = (const float *) win->data;
+
+    // 为了保证每个输出采样点拿到所有会影响它的 frame，这里按旧 ggml 的经验公式取一个“扩展 frame 范围”。
+    const int poa = (half / hop) - 1;
+    const int pob = (half / hop) + 1;
+
+    int ir0 = (ith == 0) ? 0 : (int) (t0 / hop) - poa;
+    if (ir0 < 0) {
+        ir0 = 0;
+    }
+    int ir1 = (int) std::min<int64_t>((t1 / hop) + pob, n_frame);
+    if (ir1 < 0) {
+        ir1 = 0;
+    }
+
+    for (int64_t b = 0; b < n_batch; ++b) {
+        float * out = (float *) ((char *) dst->data + b * dst->nb[1]);
+
+        for (int i1 = ir0; i1 < ir1; ++i1) {
+            const float * src_r = (const float *) ((const char *) src0->data + (int64_t) i1 * src0->nb[1] + b * src0->nb[2]);
+            const float * src_i = (const float *) ((const char *) src0->data + (int64_t) i1 * src0->nb[1] + b * src0->nb[2] + src0->nb[3]);
+
+            // 重建完整频谱（长度 n_fft）
+            for (int32_t i = 0; i < n_fft; ++i) {
+                int32_t idx = i;
+                float mult = 1.0f;
+                if (onesided && i >= half + 1) {
+                    idx = n_fft - i;
+                    mult = -1.0f;
+                }
+
+                if (from_abs_and_angle) {
+                    const float mag   = src_r[idx];
+                    const float phase = src_i[idx];
+                    spec_r[i] = mag * cosf(phase);
+                    spec_i[i] = mult * mag * sinf(phase);
+                } else {
+                    spec_r[i] = src_r[idx];
+                    spec_i[i] = mult * src_i[idx];
+                }
+            }
+
+            // IFFT：利用“FFT(·) + 反向索引”的等价关系得到时域信号，再乘 window 并叠加到目标序列
+            tts_radix2_fft(spec_r, spec_i, buffer, (size_t) n_fft, 1);
+
+            const int64_t center = (int64_t) i1 * hop;
+            for (int32_t i = 0; i < n_fft; ++i) {
+                const int32_t base_index = (n_fft - i) % n_fft;       // 对应时域采样位置（0..n_fft-1）
+                const int64_t location   = center + (base_index - half);
+
+                if (location < t0 || location >= t1) {
+                    continue;
+                }
+                // 归一化 1/n_fft，并在此处乘上 window（后续会再除以 window_squared_sum 去掉窗函数影响）
+                out[location] += (spec_r[i] / (float) n_fft) * w[base_index];
+            }
+        }
+    }
+}
+
+}  // namespace
+
+struct ggml_tensor * stft(ggml_context * ctx, struct ggml_tensor * a, struct ggml_tensor * window, size_t n_fft, size_t hop, bool abs_and_angle, bool one_sided) {
+    if (window->ne[0] != (int64_t) n_fft) {
+        TTS_ABORT("For #stft the window_size, %d, must be equal to n_fft, %d.\n", (int) window->ne[0], (int) n_fft);
+    }
+    if (a->type != GGML_TYPE_F32 || window->type != GGML_TYPE_F32) {
+        TTS_ABORT("For #stft inputs must be GGML_TYPE_F32.\n");
+    }
+
+    // 输出：与旧 ggml 保持一致，shape = [n_fft, n_frames, batch, 2]
+    const int64_t n_frames = (int64_t) (a->ne[0] / (int64_t) hop) + 1;
+    const int64_t ne0 = (int64_t) n_fft;
+    const int64_t ne1 = n_frames;
+    const int64_t ne2 = a->ne[1];
+    const int64_t ne3 = 2;
+
+    ggml_tensor * args[2] = { a, window };
+
+    ggml_tensor * out = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne0, ne1, ne2, ne3);
+    out->op = GGML_OP_CUSTOM;
+    out->src[0] = args[0];
+    out->src[1] = args[1];
+
+    tts_stft_op_params p{};
+    p.base.fun     = tts_compute_stft_custom;
+    p.base.n_tasks = GGML_N_TASKS_MAX;
+    p.base.userdata = nullptr;
+    p.n_fft = (int32_t) n_fft;
+    p.hop   = (int32_t) hop;
+    p.abs_and_angle = abs_and_angle ? 1 : 0;
+    ggml_set_op_params(out, &p, sizeof(p));
+
+    if (one_sided) {
+        // one-sided 视图：只取 [0, n_fft/2] 频率区间（包含 Nyquist）
+        const int64_t half_plus_1 = ((int64_t) n_fft / 2) + 1;
+        out = ggml_cont(ctx, ggml_view_4d(ctx, out,
+                                          half_plus_1, out->ne[1], out->ne[2], out->ne[3],
+                                          out->nb[1], out->nb[2], out->nb[3], 0));
+    }
+
+    return out;
 }
 
 struct ggml_tensor * istft(ggml_context * ctx, struct ggml_tensor * a, struct ggml_tensor * window_squared_sum, struct ggml_tensor * window, size_t n_fft, size_t hop, bool abs_and_angle, bool one_sided) {
-    if ((!one_sided && a->ne[0] != n_fft) || (one_sided && a->ne[0] != n_fft / 2 + 1)) {
-        TTS_ABORT("For #istft the window_size, %d, must be either equal to n_fft, %d, or, when one sided, n_fft / 2 + 1, %d.\n", a->ne[0], n_fft, n_fft/2+1);
+    const int64_t expected_ne0 = one_sided ? ((int64_t) n_fft / 2) + 1 : (int64_t) n_fft;
+    if (a->ne[0] != expected_ne0) {
+        TTS_ABORT("For #istft input ne[0]=%d mismatches expected %d (n_fft=%d, one_sided=%d).\n",
+                  (int) a->ne[0], (int) expected_ne0, (int) n_fft, (int) one_sided);
     }
-    struct ggml_tensor * cur = ggml_istft(ctx, a, window, n_fft, hop, abs_and_angle);
-    cur = ggml_div(ctx, cur, window_squared_sum);
-    return cur;
+    if (window->ne[0] != (int64_t) n_fft) {
+        TTS_ABORT("For #istft the window_size, %d, must be equal to n_fft, %d.\n", (int) window->ne[0], (int) n_fft);
+    }
+    if (a->type != GGML_TYPE_F32 || window->type != GGML_TYPE_F32) {
+        TTS_ABORT("For #istft inputs must be GGML_TYPE_F32.\n");
+    }
+
+    // 输出长度与旧 ggml 一致：(frames - 1) * hop
+    const int64_t n_frames = a->ne[1];
+    const int64_t out_len  = (n_frames - 1) * (int64_t) hop;
+
+    ggml_tensor * args[2] = { a, window };
+
+    ggml_tensor * out = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, out_len, a->ne[2], 1, 1);
+    out->op = GGML_OP_CUSTOM;
+    out->src[0] = args[0];
+    out->src[1] = args[1];
+
+    tts_istft_op_params p{};
+    p.base.fun     = tts_compute_istft_custom;
+    p.base.n_tasks = GGML_N_TASKS_MAX;
+    p.base.userdata = nullptr;
+    p.n_fft = (int32_t) n_fft;
+    p.hop   = (int32_t) hop;
+    p.from_abs_and_angle = abs_and_angle ? 1 : 0;
+    ggml_set_op_params(out, &p, sizeof(p));
+
+    // 去掉窗函数影响（与旧实现一致）
+    out = ggml_div(ctx, out, window_squared_sum);
+    return out;
+}
+
+struct ggml_tensor * tts_conv_transpose_1d(
+    ggml_context * ctx,
+    struct ggml_tensor * a,
+    struct ggml_tensor * b,
+    int s0,
+    int p0,
+    int d0,
+    int output_padding,
+    int groups) {
+    if (groups <= 0) {
+        TTS_ABORT("For #tts_conv_transpose_1d groups must be > 0.\n");
+    }
+    if (s0 <= 0) {
+        TTS_ABORT("For #tts_conv_transpose_1d stride must be > 0.\n");
+    }
+    if (d0 <= 0) {
+        TTS_ABORT("For #tts_conv_transpose_1d dilation must be > 0.\n");
+    }
+    if (p0 < 0 || output_padding < 0) {
+        TTS_ABORT("For #tts_conv_transpose_1d padding/output_padding must be >= 0.\n");
+    }
+
+    // groups==1：尽量复用 ggml 内置实现（其目前只支持 p0==0 且 d0==1）
+    if (groups == 1) {
+        if (d0 != 1) {
+            TTS_ABORT("For #tts_conv_transpose_1d (groups==1) ggml 0.9.4 only supports dilation==1.\n");
+        }
+        if (output_padding > 0 && p0 == 0) {
+            // ggml 0.9.4 的 conv_transpose_1d 本身无法“变长”；当 padding==0 且需要 output_padding>0 时，
+            // 仅靠 view 裁剪无法补齐尾部新增元素（可能是 0，也可能包含贡献，取决于框架语义）。
+            // 当前仓库模型未用到该组合，先显式报错，避免 silent wrong。
+            TTS_ABORT("For #tts_conv_transpose_1d output_padding>0 with padding==0 is not supported in ggml 0.9.4 compat path.\n");
+        }
+
+        // 先用 ggml 的实现算一个“padding=0”的更长结果，再裁剪实现 padding/output_padding。
+        ggml_tensor * raw = ggml_conv_transpose_1d(ctx, a, b, s0, 0 /*p0*/, 1 /*d0*/);
+
+        if (p0 == 0 && output_padding == 0) {
+            return raw;
+        }
+
+        // 等价裁剪规则：
+        // - 对 padding：从左侧裁 p0 个样本、从右侧裁 p0 个样本
+        // - 对 output_padding：相比 output_padding==0 的情况，右侧少裁 output_padding 个样本（即让输出更长）
+        const int64_t start = (int64_t) p0;
+        const int64_t end_crop = (int64_t) p0 - (int64_t) output_padding;
+        if (end_crop < 0) {
+            TTS_ABORT("For #tts_conv_transpose_1d output_padding must be <= padding in current compat path.\n");
+        }
+        if (raw->ne[0] < start + end_crop) {
+            TTS_ABORT("For #tts_conv_transpose_1d invalid crop: raw_len=%d, start=%d, end_crop=%d.\n",
+                      (int) raw->ne[0], (int) start, (int) end_crop);
+        }
+
+        const int64_t new_ne0 = raw->ne[0] - start - end_crop;
+        ggml_tensor * view = ggml_view_4d(ctx, raw,
+                                          /*ne0=*/new_ne0, /*ne1=*/raw->ne[1], /*ne2=*/raw->ne[2], /*ne3=*/raw->ne[3],
+                                          /*nb1=*/raw->nb[1], /*nb2=*/raw->nb[2], /*nb3=*/raw->nb[3],
+                                          /*offset=*/(size_t) (start * raw->nb[0]));
+        return ggml_cont(ctx, view);
+    }
+
+    // groups>1：项目侧 CPU 自定义实现（用于 Kokoro depthwise 转置卷积）。
+    if (b->type != GGML_TYPE_F32) {
+        TTS_ABORT("For #tts_conv_transpose_1d (groups>1) input must be GGML_TYPE_F32.\n");
+    }
+    if (a->type != GGML_TYPE_F16 && a->type != GGML_TYPE_F32) {
+        TTS_ABORT("For #tts_conv_transpose_1d (groups>1) kernel must be GGML_TYPE_F16 or GGML_TYPE_F32.\n");
+    }
+    if (a->ne[3] != 1 || b->ne[3] != 1) {
+        TTS_ABORT("For #tts_conv_transpose_1d only ne[3]==1 tensors are supported.\n");
+    }
+    if (a->ne[2] != b->ne[1]) {
+        TTS_ABORT("For #tts_conv_transpose_1d kernel ne[2](%d) must equal input ne[1](%d).\n", (int) a->ne[2], (int) b->ne[1]);
+    }
+    if (a->ne[2] % groups != 0) {
+        TTS_ABORT("For #tts_conv_transpose_1d input channels (%d) must be divisible by groups (%d).\n", (int) a->ne[2], groups);
+    }
+
+    const int64_t out_len = (b->ne[0] - 1) * (int64_t) s0 - 2 * (int64_t) p0 + (int64_t) d0 * (a->ne[0] - 1) + (int64_t) output_padding + 1;
+    if (out_len <= 0) {
+        TTS_ABORT("For #tts_conv_transpose_1d invalid output length: %d.\n", (int) out_len);
+    }
+
+    const int64_t out_channels = a->ne[1] * (int64_t) groups;
+    if (out_channels <= 0) {
+        TTS_ABORT("For #tts_conv_transpose_1d invalid output channels: %d.\n", (int) out_channels);
+    }
+
+    ggml_tensor * out = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, out_len, out_channels, b->ne[2]);
+    out->op = GGML_OP_CUSTOM;
+    out->src[0] = a;
+    out->src[1] = b;
+
+    tts_conv_transpose_1d_op_params p{};
+    p.base.fun = tts_compute_conv_transpose_1d_custom;
+    p.base.n_tasks = GGML_N_TASKS_MAX;
+    p.base.userdata = nullptr;
+    p.s0 = (int32_t) s0;
+    p.p0 = (int32_t) p0;
+    p.d0 = (int32_t) d0;
+    p.output_padding = (int32_t) output_padding;
+    p.groups = (int32_t) groups;
+    ggml_set_op_params(out, &p, sizeof(p));
+
+    return out;
 }
 
 void hann_window(size_t n_fft, std::vector<float> & tgt) {
@@ -211,7 +955,9 @@ void compute_window_squared_sum(size_t n_fft, size_t hop, size_t n_frames, float
             if (index < 0 || index >= cutoff) {
                 continue;
             }
-            tgt[index] += powf(window[ii], 2);
+            // powf(x, 2) 的开销远高于 x*x，这里直接平方即可。
+            const float w = window[ii];
+            tgt[index] += w * w;
         }
     }
 }

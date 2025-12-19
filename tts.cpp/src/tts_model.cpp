@@ -38,8 +38,10 @@ void runner_context::get_ggml_node_data(struct ggml_tensor * output_node, float 
 void runner_context::set_threads() {
     if (backend != nullptr) {
 #ifdef GGML_USE_METAL
-        // this is form copied from llama.cpp, but has since been removed. I don't know if this should be tuned.
-        ggml_backend_metal_set_n_cb(backend, 1);
+        // 说明：
+        // 旧版 ggml 曾暴露过 ggml_backend_metal_set_n_cb() 用于设置 Metal 命令缓冲数量，
+        // 但在新版 ggml 中该接口已不再对外提供（仅在 ggml 内部使用）。
+        // 这里不再做该项设置，保持使用 ggml 默认策略。
 #endif
     }
     if (backend_cpu != nullptr) {
@@ -53,20 +55,57 @@ void runner_context::set_threads() {
 void runner_context::build_schedule(size_t max_nodes) {
     backend_cpu_buffer = ggml_backend_cpu_buffer_type();
     if (backend != nullptr) {
-#ifdef GGML_USE_METAL
-        backend_buffer = ggml_backend_metal_buffer_type();
-#endif
+        // 说明：无论是 Metal 还是 Vulkan（以及未来更多后端），都通过通用接口获取默认 buffer type。
+        backend_buffer = ggml_backend_get_default_buffer_type(backend);
+        if (!backend_buffer) {
+            TTS_ABORT("无法从 ggml backend 获取默认 buffer type。");
+        }
         std::vector<ggml_backend_buffer_type_t> bufs = {backend_buffer, backend_cpu_buffer};
         std::vector<ggml_backend_t> backs = {backend, backend_cpu};
-        sched = ggml_backend_sched_new(backs.data(), bufs.data(), 2, max_nodes, false);
+        // 说明：ggml 0.9.4 起 ggml_backend_sched_new 增加了 op_offload 参数；此处保持与旧行为一致（关闭）。
+        sched = ggml_backend_sched_new(backs.data(), bufs.data(), 2, max_nodes, false, false);
     } else {
         std::vector<ggml_backend_buffer_type_t> bufs = {backend_cpu_buffer};
         std::vector<ggml_backend_t> backs = {backend_cpu};
-        sched = ggml_backend_sched_new(backs.data(), bufs.data(), 1, max_nodes, false);
+        sched = ggml_backend_sched_new(backs.data(), bufs.data(), 1, max_nodes, false, false);
     }
 }
 
 bool runner_context::prep_schedule(struct ggml_cgraph * gf) {
+    if (!sched) {
+        return false;
+    }
+
+    // 说明：Vulkan/Metal 的“最坏图”预分配可能远超显存，启动阶段直接触发 OOM。
+    // 先做不分配的尺寸测量，若需求明显超出显存则跳过预分配，
+    // 让运行时按实际输入图再分配，避免无意义的大额申请。
+    if (backend != nullptr && backend_buffer != nullptr) {
+        size_t sizes[2] = {0, 0};
+        ggml_backend_sched_reserve_size(sched, gf, sizes);
+
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        ggml_backend_dev_props props{};
+        if (dev != nullptr) {
+            ggml_backend_dev_get_props(dev, &props);
+        }
+
+        const size_t backend_need = sizes[0];
+        const size_t mem_total = props.memory_total;
+        const size_t mem_free = props.memory_free;
+        const bool exceed_total = mem_total > 0 && backend_need > mem_total;
+        const bool exceed_free = !exceed_total && mem_free > 0 && backend_need > mem_free;
+
+        if (exceed_total || exceed_free) {
+            const double gib = 1024.0 * 1024.0 * 1024.0;
+            fprintf(stderr,
+                    "[tts] 加速后端预分配需求 %.2f GiB 超过设备显存(可用 %.2f / 总量 %.2f GiB)，跳过预分配并在运行时按实际图分配。\n",
+                    backend_need / gib,
+                    mem_free / gib,
+                    mem_total / gib);
+            return true;
+        }
+    }
+
     return ggml_backend_sched_reserve(sched, gf);
 }
 
@@ -131,13 +170,23 @@ void tts_model::prep_buffers_and_context(bool cpu_only, float size_offset, uint3
         backend = ggml_backend_cpu_init();
         buffer = ggml_backend_cpu_buffer_type();
     } else {
-#ifdef GGML_USE_METAL
-        backend = ggml_backend_metal_init();
-        buffer = ggml_backend_metal_buffer_type();
-#endif
-        // if use metal is not installed then we need to warn here
+        // 说明：根据当前线程的后端配置，初始化加速后端（Metal/Vulkan）。
+        backend = tts_backend_init_accel();
+        buffer = backend ? ggml_backend_get_default_buffer_type(backend) : nullptr;
+
         if (!backend || !buffer) {
-            TTS_ABORT("'GGML_USE_METAL' is not defined either set the model to use CPU only or install ggml with metal support.");
+            const tts_backend_config cfg = tts_get_backend_config();
+            const char * backend_name = "unknown";
+            switch (cfg.backend) {
+                case tts_compute_backend::CPU:    backend_name = "cpu";    break;
+                case tts_compute_backend::METAL:  backend_name = "metal";  break;
+                case tts_compute_backend::VULKAN: backend_name = "vulkan"; break;
+                case tts_compute_backend::AUTO:   backend_name = "auto";   break;
+            }
+
+            TTS_ABORT("初始化 GPU 后端失败（backend=%s device=%d）。请确认编译时启用了对应后端（GGML_METAL/GGML_VULKAN），或使用 CPU 推理。",
+                      backend_name,
+                      cfg.device);
         }
     }
     size_t ctx_size = ggml_tensor_overhead() * (tensor_meta.n_tensors * size_offset);
@@ -147,20 +196,78 @@ void tts_model::prep_buffers_and_context(bool cpu_only, float size_offset, uint3
         /*.no_alloc   =*/ true,
     };
     ctx = ggml_init(params);
-    buf = ggml_backend_buft_alloc_buffer(buffer, tensor_meta.n_bytes + dedicated_add_on_size);
+
+    // 说明：不同后端对 buffer 内部的 tensor 起始地址有不同的对齐要求：
+    // - CPU：通常是 32 字节对齐；
+    // - Vulkan：要求满足 VkPhysicalDeviceLimits::minStorageBufferOffsetAlignment（常见为 256）。
+    //
+    // 这里的权重加载逻辑属于“手动打包到单一大 buffer”，因此必须预留对齐 padding 的额外空间，
+    // 否则 Vulkan 后端在绑定 storage buffer 时会因为 offset 未对齐而触发断言/崩溃。
+    const size_t alignment = ggml_backend_buft_get_alignment(buffer);
+    const size_t extra_pad = alignment > 1 ? alignment * (size_t) tensor_meta.n_tensors : 0;
+    const size_t buf_bytes = tensor_meta.n_bytes + (size_t) dedicated_add_on_size + extra_pad;
+
+    buf = ggml_backend_buft_alloc_buffer(buffer, buf_bytes);
+    if (!buf) {
+        TTS_ABORT("分配模型权重 buffer 失败：requested=%zu bytes (weights=%zu + dedicated=%u + pad=%zu)",
+                  buf_bytes,
+                  (size_t) tensor_meta.n_bytes,
+                  dedicated_add_on_size,
+                  extra_pad);
+    }
 }
 
 void tts_model::assign_weight(std::string name, ggml_tensor * tensor) {
 	TTS_ABORT("%s received name, %s, tensor without being defined. %s must be defined for all implementations of tts_model. \n", __func__, name.c_str(), __func__);
 }
 
-void tts_model::set_tensor(struct ggml_tensor * tensor, struct ggml_tensor * target) {
+static inline size_t tts_align_up(size_t v, size_t alignment) {
+    if (alignment <= 1) {
+        return v;
+    }
+    const size_t mask = alignment - 1;
+    return (v + mask) & ~mask;
+}
+
+void tts_model::alloc_tensor(struct ggml_tensor * tensor, const char * debug_name) {
+    if (!tensor) {
+        TTS_ABORT("%s: tensor 为空", __func__);
+    }
+    if (!buf) {
+        TTS_ABORT("%s: buf 未初始化（请先调用 prep_buffers_and_context）", __func__);
+    }
+
+    // 统一使用当前 buffer type 的对齐要求，避免 Vulkan/Metal 的 offset 对齐问题。
+    const size_t alignment = ggml_backend_buffer_get_alignment(buf);
+    offset = tts_align_up(offset, alignment);
+
+    const size_t size = ggml_nbytes(tensor);
+    const size_t cap  = ggml_backend_buffer_get_size(buf);
+    if (offset + size > cap) {
+        TTS_ABORT("%s: buffer 溢出：need=%zu cap=%zu (tensor=%s)",
+                  __func__,
+                  offset + size,
+                  cap,
+                  debug_name ? debug_name : "(unnamed)");
+    }
+
     tensor->buffer = buf;
-    tensor->data = (void *)((uint8_t *) ggml_backend_buffer_get_base(buf) + offset);
-    size_t size = ggml_nbytes(target);
-    ggml_backend_tensor_set(tensor, target->data, 0, size);
-    ggml_set_name(tensor, target->name);
+    tensor->data   = (void *) ((uint8_t *) ggml_backend_buffer_get_base(buf) + offset);
+    if (debug_name && *debug_name) {
+        ggml_set_name(tensor, debug_name);
+    }
     offset += size;
+}
+
+void tts_model::set_tensor(struct ggml_tensor * tensor, struct ggml_tensor * target) {
+    // 说明：这是项目侧“手动将权重打包进单一大 buffer”的关键路径。
+    // 必须保证每个 tensor 的起始地址满足后端对齐要求，否则 Vulkan 会在绑定 storage buffer 时崩溃。
+    alloc_tensor(tensor, target ? target->name : nullptr);
+
+    const size_t size = target ? ggml_nbytes(target) : ggml_nbytes(tensor);
+    if (target) {
+        ggml_backend_tensor_set(tensor, target->data, 0, size);
+    }
 }
 
 void tts_model::setup_from_file(gguf_context * meta_ctx, ggml_context * load_context, bool cpu_only, std::string model_prefix, float size_offset, uint32_t dedicated_add_on_size) {

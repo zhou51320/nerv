@@ -18,3 +18,9 @@ struct tts_model_loader {
 
 unique_ptr<tts_generation_runner> runner_from_file(const char * fname, int n_threads,
                                                    const generation_configuration & config, bool cpu_only = true);
+
+// 指定推理后端（CPU / Metal / Vulkan / Auto）。
+// 说明：该接口会在当前线程内临时设置后端配置，保证同一线程内加载出的子模型（如 Parler 的 T5 encoder）使用一致的后端选择。
+unique_ptr<tts_generation_runner> runner_from_file(const char * fname, int n_threads,
+                                                   const generation_configuration & config,
+                                                   const tts_backend_config & backend);

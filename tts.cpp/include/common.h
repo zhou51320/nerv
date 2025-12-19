@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstddef>
 #include <string>
 #include <map>
 #include <memory>
@@ -21,6 +22,27 @@ enum tts_arch {
 	KOKORO_ARCH = 1,
 	DIA_ARCH = 2,
 	ORPHEUS_ARCH = 3,
+};
+
+// 推理后端类型（用于选择 ggml 的设备后端）。
+// 说明：
+// - CPU：纯 CPU 推理。
+// - Metal：Apple 设备上的 Metal 后端（需要编译启用 GGML_METAL）。
+// - Vulkan：跨平台 Vulkan 后端（需要编译启用 GGML_VULKAN）。
+// - Auto：自动选择可用的 GPU 后端（优先 Metal，其次 Vulkan），若都不可用则回退到 CPU（由上层决定是否允许回退）。
+enum class tts_compute_backend {
+    CPU = 0,
+    METAL,
+    VULKAN,
+    AUTO,
+};
+
+// 推理后端配置。
+// 说明：目前主要用于 Vulkan 的设备选择（device=0 表示第 0 个 Vulkan 设备）。
+// 未来如需扩展到 CUDA/OpenCL 等后端，也可复用该结构体。
+struct tts_backend_config {
+    tts_compute_backend backend = tts_compute_backend::CPU;
+    int device = 0;
 };
 
 const std::map<std::string, tts_arch> SUPPORTED_ARCHITECTURES = {
@@ -49,10 +71,9 @@ struct generation_configuration {
     	float temperature = 1.0,
     	float repetition_penalty = 1.0,
     	bool use_cross_attn = true,
-    	std::string espeak_voice_id = "",
     	int max_tokens = 0,
     	float top_p = 1.0,
-    	bool sample = true): top_k(top_k), temperature(temperature), repetition_penalty(repetition_penalty), use_cross_attn(use_cross_attn), sample(sample), voice(voice), espeak_voice_id(espeak_voice_id), max_tokens(max_tokens), top_p(top_p) {};
+    	bool sample = true): top_k(top_k), temperature(temperature), repetition_penalty(repetition_penalty), use_cross_attn(use_cross_attn), sample(sample), voice(voice), max_tokens(max_tokens), top_p(top_p) {};
 
     bool use_cross_attn;
     float temperature;
@@ -62,7 +83,6 @@ struct generation_configuration {
     int max_tokens;
     std::string voice = "";
     bool sample = true;
-    std::string espeak_voice_id = "";
 };
 
 struct tts_runner {

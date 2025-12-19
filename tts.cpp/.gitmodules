@@ -1,4 +1,0 @@
-[submodule "ggml"]
-	path = ggml
-	url = https://github.com/mmwillet/ggml.git
-	branch = support-for-tts

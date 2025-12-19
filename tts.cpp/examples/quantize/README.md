@@ -11,14 +11,14 @@ This script converts a 32bit floating point TTS.cpp GGUF model file to a quantiz
 
 ### Usage
 
-**Please note** Quantization and lower precision conversion is currently only supported for Parler TTS models. 
+**Please note** Quantization expects the input GGUF to contain FP32 tensors (typically the non-`*_F16.gguf` models). 
 
 In order to get a detailed breakdown of the functionality currently available you can call the cli with the `--help` parameter. This will return a breakdown of all parameters:
 ```bash
 ./quantize --help
 
 --quantized-type (-qt):
-    (OPTIONAL) The ggml enum of the quantized type to convert compatible model tensors to. For more information see readme. Defaults to Q4_0 quantization (2).
+    (OPTIONAL) The quantized type to convert compatible model tensors to. Valid values: F16, Q4_0, Q5_0, Q8_0. Defaults to Q4_0.
 --n-threads (-nt):
     (OPTIONAL) The number of cpu threads to run the quantization process with. Defaults to known hardware concurrency.
 --convert-dac-to-f16 (-df):
@@ -40,41 +40,9 @@ In order to get a detailed breakdown of the functionality currently available yo
 General usage should follow from these possible parameters. E.G. The following command will save a quantized version of the model using Q4_0 quantization to `/model/path/to/new/gguf_file_q.gguf`:
 
 ```bash
-./quantize --model-path /model/path/to/gguf_file.gguf --quantized-model-path /model/path/to/new/gguf_file_q.gguf --quantized-type 2 
+./quantize --model-path /model/path/to/gguf_file.gguf --quantized-model-path /model/path/to/new/gguf_file_q.gguf --quantized-type Q4_0 
 ```
-Valid types passed to `--quantized-type` are described by the `ggml_type` enum in GGML:
-
-```cpp
-        GGML_TYPE_F16     = 1,
-        GGML_TYPE_Q4_0    = 2,
-        GGML_TYPE_Q4_1    = 3,
-        // GGML_TYPE_Q4_2 = 4, support has been removed
-        // GGML_TYPE_Q4_3 = 5, support has been removed
-        GGML_TYPE_Q5_0    = 6,
-        GGML_TYPE_Q5_1    = 7,
-        GGML_TYPE_Q8_0    = 8,
-        GGML_TYPE_Q8_1    = 9,
-        GGML_TYPE_Q2_K    = 10,
-        GGML_TYPE_Q3_K    = 11,
-        GGML_TYPE_Q4_K    = 12,
-        GGML_TYPE_Q5_K    = 13,
-        GGML_TYPE_Q6_K    = 14,
-        GGML_TYPE_Q8_K    = 15,
-        GGML_TYPE_IQ2_XXS = 16,
-        GGML_TYPE_IQ2_XS  = 17,
-        GGML_TYPE_IQ3_XXS = 18,
-        GGML_TYPE_IQ1_S   = 19,
-        GGML_TYPE_IQ4_NL  = 20,
-        GGML_TYPE_IQ3_S   = 21,
-        GGML_TYPE_IQ2_S   = 22,
-        GGML_TYPE_IQ4_XS  = 23,
-        GGML_TYPE_I8      = 24,
-        GGML_TYPE_Q4_0_4_4 = 31,
-        GGML_TYPE_Q4_0_4_8 = 32,
-        GGML_TYPE_Q4_0_8_8 = 33,
-        GGML_TYPE_TQ1_0   = 34,
-        GGML_TYPE_TQ2_0   = 35,
-```
+Valid types passed to `--quantized-type` are: `F16`, `Q4_0`, `Q5_0`, `Q8_0`.
 
 ### Findings
 

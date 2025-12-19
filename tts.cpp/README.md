@@ -1,32 +1,8 @@
-# TTS.cpp（中文说明）
+# tts.cpp
 
-TTS.cpp 是一个基于 GGML 的 C/C++ 推理库，用于在本地设备上运行开源文本转语音（TTS）模型，目标是提供类似 `whisper.cpp` / `llama.cpp` 的轻量、可移植推理体验。
+tts.cpp 是一个基于 GGML 的 C/C++ 推理库，用于在本地设备上运行开源文本转语音（TTS）模型，目标是提供类似 `whisper.cpp` / `llama.cpp` 的轻量、可移植推理体验。
 
 本仓库在 Kokoro 路线上做了中文增强，重点解决了「中文提示词为空 / 无法发声」的问题，并支持中英文混合输入。
-
-- 路线图：`https://github.com/users/mmwillet/projects/1`
-- GGML 分支/补丁背景：`https://github.com/mmwillet/ggml/tree/support-for-tts`
-
-## 中文支持（Kokoro）
-
-### 1) 不依赖 eSpeak 的中文
-
-Kokoro 的部分 GGUF（例如 “no_espeak” 版本）原本会在遇到 CJK 字符时丢弃文本，导致 `Got empty response for prompt`。
-
-本仓库已在 Kokoro 前端加入内置普通话处理：
-- 中文输入不再被吞掉
-- 可直接生成中文语音
-- 不需要安装/链接 eSpeak-ng
-
-### 2) 中英混合
-
-同一条 prompt 支持混合输入（例如 `你好 hello`、`hello 你好`）。实现思路是按片段拆分：
-- ASCII 段落走现有英文字素化（IPA）
-- 非 ASCII 段落走内置中文前端
-
-### 3) Windows 友好
-
-Windows 下 `tts-cli` 已确保命令行参数按 UTF-8 处理，中文参数不会因代码页导致解析失败。
 
 ## 模型与功能支持概览
 
@@ -103,11 +79,10 @@ python -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple `
 python .\py-gguf\convert_kokoro_to_gguf `
   --repo-id .\Kokoro-82M-v1___1-zh `
   --save-path D:\EVA_MODELS\text2speech\Kokoro-82M-v1_1-zh.gguf `
-  --tts-phonemizer `
-  --phonemizer-repo D:\EVA_MODELS\text2speech\Kokoro_no_espeak_F16.gguf
+  --phonemizer-repo D:\EVA_MODELS\text2speech\TTS_ipa_en_us_phonemizer_F16.gguf
 ```
 
-`--tts-phonemizer` 表示不使用 eSpeak（避免 GPL 依赖），并把英文字素化所需的键值拷贝进新 GGUF（`--phonemizer-repo` 支持填写本地 `.gguf` 文件或 HF repo id）。
+`--phonemizer-repo` 用于指定 phonemizer 配置来源（本地 `.gguf` 文件/目录或 HF repo id），转换脚本会将 `phonemizer.*` 相关键值拷贝进新 GGUF，运行时无需额外 phonemizer 依赖。
 
 ## 量化/低精度（Kokoro）
 
@@ -138,22 +113,12 @@ cmake -B build
 cmake --build build --config Release
 ```
 
-如需 eSpeak-ng（可选，不推荐给需要避免 GPL 的场景）：
-
-```bash
-export ESPEAK_INSTALL_DIR=/absolute/path/to/espeak-ng/dir
-cmake -B build
-cmake --build build --config Release
-```
-
 ## 使用说明
 
 更多 CLI 参数可参考：`examples/cli/README.md`。
 
-## 许可协议
+## 鸣谢
 
-默认情况下，本仓库为 `MIT` 许可。
-
-按模型原实现要求，部分超参数/后处理逻辑可能保留原模型的 `Apache-2.0` 许可约束（不包含 ggml/C++ 移植代码）。
-
-如果启用 eSpeak-ng 支持，最终二进制可能会受到 `GPL-3.0-or-later` 许可影响；如需规避 GPL，请优先使用 `--tts-phonemizer` 方案与本仓库内置中文前端。
+- [kokoro](https://github.com/hexgrad/kokoro)
+- [TTS.cpp](https://github.com/mmwillet/TTS.cpp)
+- [ggml](https://github.com/ggml-org/ggml)

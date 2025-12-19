@@ -81,8 +81,8 @@ struct gpt2_model {
     struct ggml_tensor * ln_f_g;
     struct ggml_tensor * ln_f_b;
 
-    struct ggml_tensor * wte;     // position embedding
-    struct ggml_tensor * wpe;     //    token embedding
+    struct ggml_tensor * wte;     //    tkoen embedding
+    struct ggml_tensor * wpe;     // position embedding
     struct ggml_tensor * lm_head; // language model head
 
     std::vector<gpt2_layer> layers;
@@ -947,7 +947,7 @@ int main(int argc, char ** argv) {
     ggml_backend_sched_t sched;
     {
         // initialize the scheduler
-        sched = ggml_backend_sched_new(model.backends.data(), NULL, model.backends.size(), GPT2_MAX_NODES, false);
+        sched = ggml_backend_sched_new(model.backends.data(), NULL, model.backends.size(), GPT2_MAX_NODES, false, true);
 
         // create the worst case graph for memory usage estimation
         int n_tokens = std::min(model.hparams.n_ctx, params.n_batch);

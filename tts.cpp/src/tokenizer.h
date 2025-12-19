@@ -7,6 +7,7 @@
 #include <unordered_set>
 #include <regex>
 #include <queue>
+#include <string_view>
 #include "util.h"
 
 struct token_trie {
@@ -64,11 +65,20 @@ struct single_pass_tokenizer {
                 max_size = token.size();
             }
         }
+        // 说明（性能相关）：
+        // 原实现每次 tokenization 都会对 tokens 做线性查找（std::find），并频繁 substr 复制字符串，
+        // 对较长 prompt（尤其中文拼音/多语言 phoneme 串更长）会带来明显的固定开销。
+        // 这里预先构建 string_view -> id 的哈希表，tokenize 时只做 O(1) 查表并避免拷贝。
+        token_to_id.reserve(tokens.size());
+        for (uint32_t i = 0; i < (uint32_t) tokens.size(); ++i) {
+            token_to_id.emplace(std::string_view(tokens[i]), i);
+        }
     }
     size_t max_size;
     uint32_t unknown_id = 0;
     std::vector<std::string> tokens;
     std::unordered_set<std::string> token_vocab;
+    std::unordered_map<std::string_view, uint32_t> token_to_id;
     void tokenize(const std::string & text, std::vector<uint32_t> & token_ids);
     void token_split(const std::string & text, std::vector<std::string> & tokens);
 };

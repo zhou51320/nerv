@@ -14,7 +14,7 @@ This note documents the exact commands used to turn the locally prepared `kokoro
 $voices = (Get-ChildItem kokoro-en\voices -Filter *.pt | ForEach-Object { $_.BaseName }) -join ','
 python .\py-gguf\convert_kokoro_to_gguf `
   --repo-id kokoro-en `
-  --save-path build\kokoro-en-espeak-f32.gguf `
+  --save-path build\kokoro-en-f32.gguf `
   --voices $voices
 ```
 
@@ -26,26 +26,26 @@ The bundled `quantize.exe` supports Kokoro with the `--convert-non-quantized-to-
 
 ```powershell
 .\build\bin\Release\quantize.exe `
-  --model-path build\kokoro-en-espeak-f32.gguf `
-  --quantized-model-path build\kokoro-en-espeak-f16.gguf `
+  --model-path build\kokoro-en-f32.gguf `
+  --quantized-model-path build\kokoro-en-f16.gguf `
   --quantized-type F16 `
   --convert-non-quantized-to-f16
 
 .\build\bin\Release\quantize.exe `
-  --model-path build\kokoro-en-espeak-f32.gguf `
-  --quantized-model-path build\kokoro-en-espeak-q8_0.gguf `
+  --model-path build\kokoro-en-f32.gguf `
+  --quantized-model-path build\kokoro-en-q8_0.gguf `
   --quantized-type Q8_0 `
   --convert-non-quantized-to-f16
 
 .\build\bin\Release\quantize.exe `
-  --model-path build\kokoro-en-espeak-f32.gguf `
-  --quantized-model-path build\kokoro-en-espeak-q5_0.gguf `
+  --model-path build\kokoro-en-f32.gguf `
+  --quantized-model-path build\kokoro-en-q5_0.gguf `
   --quantized-type Q5_0 `
   --convert-non-quantized-to-f16
 
 .\build\bin\Release\quantize.exe `
-  --model-path build\kokoro-en-espeak-f32.gguf `
-  --quantized-model-path build\kokoro-en-espeak-q4_0.gguf `
+  --model-path build\kokoro-en-f32.gguf `
+  --quantized-model-path build\kokoro-en-q4_0.gguf `
   --quantized-type Q4_0 `
   --convert-non-quantized-to-f16
 ```
@@ -54,10 +54,10 @@ The bundled `quantize.exe` supports Kokoro with the `--convert-non-quantized-to-
 
 | File | Approx. Size |
 | --- | --- |
-| `build\kokoro-en-espeak-f32.gguf` | ~336 MB |
-| `build\kokoro-en-espeak-f16.gguf` | ~194 MB |
-| `build\kokoro-en-espeak-q8_0.gguf` | ~180 MB |
-| `build\kokoro-en-espeak-q5_0.gguf` | ~174 MB |
-| `build\kokoro-en-espeak-q4_0.gguf` | ~172 MB |
+| `build\kokoro-en-f32.gguf` | ~336 MB |
+| `build\kokoro-en-f16.gguf` | ~194 MB |
+| `build\kokoro-en-q8_0.gguf` | ~180 MB |
+| `build\kokoro-en-q5_0.gguf` | ~174 MB |
+| `build\kokoro-en-q4_0.gguf` | ~172 MB |
 
 Keep this sheet with the repository; future refreshes only need to replace the source files under `kokoro-en\` and rerun the same commands.

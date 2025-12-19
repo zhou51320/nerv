@@ -114,7 +114,8 @@ void parler_tts_model::prep_cross_key_values(int n_threads, struct tts_response 
     ggml_backend_cpu_set_n_threads(backend_cpu, n_threads);
     std::vector<ggml_backend_buffer_type_t> bufs = {backend_cpu_buffer};
     std::vector<ggml_backend_t> backs = {backend_cpu};
-    ggml_backend_sched_t sched = ggml_backend_sched_new(backs.data(), bufs.data(), 1, max_cross_nodes*n_layers, false);
+    // 说明：ggml 0.9.4 起 ggml_backend_sched_new 增加了 op_offload 参数；此处保持与旧行为一致（关闭）。
+    ggml_backend_sched_t sched = ggml_backend_sched_new(backs.data(), bufs.data(), 1, max_cross_nodes*n_layers, false, false);
     
     std::vector<uint8_t> buf_compute_meta;
     buf_compute_meta.resize(max_cross_nodes*n_layers*ggml_tensor_overhead() + ggml_graph_overhead_custom(max_cross_nodes*n_layers, false));
@@ -324,9 +325,7 @@ void parler_context::reset(int32_t n_output_heads) {
 struct parler_context * build_new_parler_context(struct parler_tts_model * model, int n_threads, bool use_cpu) {
     parler_context * pctx = new parler_context(model, n_threads);
     if (!use_cpu) {
-#ifdef GGML_USE_METAL
-        pctx->backend = ggml_backend_metal_init();
-#endif
+        pctx->backend = tts_backend_init_accel();
     }
     pctx->eos_seen.reserve(model->n_output_heads);
     pctx->backend_cpu = ggml_backend_cpu_init();
@@ -340,11 +339,9 @@ static bool parler_kv_cache_init(struct parler_kv_cache * cache, parler_tts_mode
     const int64_t n_layer = (int64_t) model->layers.size();
 
     ggml_backend_buffer_type_t buft = nullptr;
-    // this will only really support cpu or metal for the time being;
+    // 说明：KV cache 的 buffer type 需要与推理后端匹配；有 GPU 后端则优先用其默认 buffer type。
     if (pctx->backend != nullptr) {
-#ifdef GGML_USE_METAL
-        buft = ggml_backend_metal_buffer_type();
-#endif
+        buft = ggml_backend_get_default_buffer_type(pctx->backend);
     } else {
         buft = ggml_backend_cpu_buffer_type();
     }

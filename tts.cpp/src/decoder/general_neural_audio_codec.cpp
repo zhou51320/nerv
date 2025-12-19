@@ -150,7 +150,10 @@ namespace general_neural_audio_codec {
 
     struct ggml_tensor * build_layer(ggml_context * ctx, struct ggml_tensor * cur, layer & l, struct ggml_tensor * noise) {
         cur = snake_1d(ctx, l.in_alpha, cur);
-        cur = ggml_conv_transpose_1d(ctx, l.in_conv_kernel, cur, l.stride, l.padding, 1, 0, 1);
+        // 说明：旧版 ggml 的转置卷积签名包含 output_padding/groups；ggml 0.9.4 收敛后还限制 padding==0。
+        // 为了不修改 ggml 源码，这里统一走项目侧兼容封装：groups==1 时用“先算 padding=0，再裁剪”的方式等价实现。
+        cur = tts_conv_transpose_1d(ctx, l.in_conv_kernel, cur, (int) l.stride, (int) l.padding, /*dilation=*/1,
+                                   /*output_padding=*/0, /*groups=*/1);
         cur = ggml_add(ctx, cur, l.in_conv_bias);
         if (l.noise_conv_kernel && noise) {
             struct ggml_tensor * x = ggml_conv_1d(ctx, l.noise_conv_kernel, cur, 1, 0, 1);

@@ -14,13 +14,8 @@ unique_ptr<tts_generation_runner> kokoro_model_loader::from_file(
     kokoro_duration_context * kdctx           = build_new_duration_kokoro_context(&*model, n_threads, cpu_only);
     auto *                    duration_runner = new kokoro_duration_runner(&*model, kdctx, spt);
     kokoro_context *          kctx            = build_new_kokoro_context(&*model, n_threads, cpu_only);
-    // if an espeak voice id wasn't specifically set infer it from the kokoro voice,
-    // if it was override it, otherwise fallback to American English.
-    const char *              espeak_voice_id{ config.espeak_voice_id.c_str() };
-    if (!*espeak_voice_id) {
-        espeak_voice_id = get_espeak_id_from_kokoro_voice(config.voice);
-    }
-    phonemizer * phmzr = phonemizer_from_gguf(meta_ctx, espeak_voice_id);
+    // 说明：当前项目不再依赖外部音素化库，仅使用 GGUF 内置的 TTS.cpp phonemizer（英文）与 zh_frontend（中文）。
+    phonemizer * phmzr = phonemizer_from_gguf(meta_ctx);
     return make_unique<kokoro_runner>(move(model), kctx, spt, duration_runner, phmzr, config.voice);
 }
 

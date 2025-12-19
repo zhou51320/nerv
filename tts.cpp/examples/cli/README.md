@@ -27,6 +27,10 @@ In order to get a detailed breakdown the functionality currently available you c
     (OPTIONAL) The max audio tokens or token batches to generate where each represents approximates 11 ms of audio. Only applied to Dia generation. If set to zero as is its default then the default max generation size. Warning values under 15 are not supported.
 --use-metal (-m):
     (OPTIONAL) Whether to use metal acceleration
+--use-vulkan (-vk):
+    (OPTIONAL) Whether to use Vulkan acceleration
+--vulkan-device (-vd):
+    (OPTIONAL) Vulkan device index (default: 0).
 --no-cross-attn (-ca):
     (OPTIONAL) Whether to not include cross attention
 --vad (-va):
@@ -45,8 +49,6 @@ In order to get a detailed breakdown the functionality currently available you c
     (OPTIONAL) The local path of the text encoder gguf model for conditional generaiton.
 --voice (-v):
     (OPTIONAL) The voice to use to generate the audio. This is only used for models with voice packs.
---espeak-voice-id (-eid):
-    (OPTIONAL) The espeak voice id to use for phonemization. This should only be specified when the correct espeak voice cannot be inferred from the kokoro voice ( see MultiLanguage Configuration in the README for more info).
 ```
 
 General usage should follow from these possible parameters. E.G. The following command will save generated speech to the `/tmp/test.wav` file.
@@ -117,9 +119,10 @@ Each voice has a language assigned and gender assigned to it where the first let
 # 🇨🇳 'z' => Mandarin Chinese: pip install misaki[zh]
 ```
 
-By default when a voice of a specific language is used, phonemization for that language will be automatically detected. However, when multiple phonetic alphabets exist for a single language the default phonemization language might not be appropriate (e.g. Mandarin latin as english is standard for Mandarin, but Pinyin might be preferred). In such cases it is necessary to specify the specific espeak-ng voice file id via the `--espeak-voice-id` argument. A comprehensive list of viable voice ids for this field can be found under the `file` column via the following espeak command:
+This fork does not rely on external phonemization libraries. Phonemization is handled as follows:
 
-```bash
-espeak-ng --voices
-```
+- CJK text (and `z*` voices) uses the built-in Chinese frontend (`zh_frontend`).
+- Other text uses the built-in TTS.cpp phonemizer embedded in the GGUF.
+
+Non zh/en languages are currently best-effort.
 

@@ -157,39 +157,63 @@ unigram_tokenizer * unigram_tokenizer_from_gguf(gguf_context * meta) {
 }
 
 void single_pass_tokenizer::tokenize(const std::string & text, std::vector<uint32_t> & token_ids) {
-    std::string remaining = text;
-    while (remaining.size() > 0) {
+    // 说明：这里保持与原实现一致的“从短到长尝试匹配”的策略；
+    // 但避免 remaining/substr 造成的 O(n^2) 拷贝，并用哈希表替换线性查找。
+    if (text.empty()) {
+        return;
+    }
+
+    size_t pos = 0;
+    token_ids.reserve(token_ids.size() + text.size());
+
+    while (pos < text.size()) {
         uint32_t token_id = unknown_id;
-        for (int i = 1; i < std::min(remaining.size()+1, max_size+1); i++) {
-            std::string part = remaining.substr(0, i);
-            ptrdiff_t pos = std::distance(tokens.begin(), std::find(tokens.begin(), tokens.end(), part));
-            if (pos < tokens.size()) {
-                token_id = (uint32_t) pos;
-                remaining = remaining.substr(part.size(), remaining.size() - part.size());
+        size_t   matched_len = 1;
+
+        const size_t remaining = text.size() - pos;
+        const size_t limit = std::min(remaining, max_size);
+
+        for (size_t len = 1; len <= limit; ++len) {
+            const std::string_view part{ text.data() + pos, len };
+            const auto it = token_to_id.find(part);
+            if (it != token_to_id.end()) {
+                token_id = it->second;
+                matched_len = len;
                 break;
             }
         }
-        if (token_id == unknown_id) {
-            remaining = remaining.substr(1, remaining.size() - 1);
-        }
+
+        // 与原逻辑保持一致：unknown_id 时只推进 1 字节（哪怕恰好匹配到了 tokens[unknown_id]）。
+        pos += (token_id == unknown_id) ? 1 : matched_len;
         token_ids.push_back(token_id);
     }
 }
 
 void single_pass_tokenizer::token_split(const std::string & text, std::vector<std::string> & tokens) {
-    std::string remaining = text;
-    while (remaining.size() > 0) {
-        // String copying is much slower than using a std::string_view, but the former is simpler to implement for now.
-        std::string token = remaining.substr(0, 1);
-        for (int i = 1; i < remaining.size(); i++) {
-            std::string part = remaining.substr(0, i+1);
-            if (token_vocab.find(part) == token_vocab.end()) {
+    if (text.empty()) {
+        return;
+    }
+
+    size_t pos = 0;
+    tokens.reserve(tokens.size() + text.size());
+
+    while (pos < text.size()) {
+        const size_t remaining = text.size() - pos;
+        const size_t limit = std::min(remaining, max_size);
+
+        size_t matched_len = 1;
+
+        // 这里采用“最长匹配”（与旧实现一致）。
+        for (size_t len = limit; len > 0; --len) {
+            const std::string_view part{ text.data() + pos, len };
+            if (token_to_id.find(part) != token_to_id.end()) {
+                matched_len = len;
                 break;
             }
-            token = part;
         }
-        tokens.push_back(token);
-        remaining = remaining.substr(token.size(), remaining.size() - token.size());
+
+        tokens.emplace_back(text.substr(pos, matched_len));
+        pos += matched_len;
     }
 }
 

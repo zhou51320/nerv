@@ -1,20 +1,11 @@
 #ifndef phonemizer_h
 #define phonemizer_h
 
-#ifdef ESPEAK_INSTALL
-# ifdef ESPEAK_INSTALL_LOCAL
-#  include "speak_lib.h"
-# else
-#  include <espeak-ng/speak_lib.h>
-# endif
-#endif
-
 #include <unordered_map>
 #include <map>
 #include <unordered_set>
 #include "tokenizer.h"
 #include <algorithm>
-#include <mutex>
 
 // TODO per ODR, these should not be in an .h
 
@@ -289,60 +280,12 @@ static const std::map<std::string, std::string> CONTRACTION_PHONEMES = {
 	{"t", "t"},
 };
 
-// characters that Espeak-ng treats as stopping tokens.
-static std::string STOPPING_TOKENS = ".,:;!?";
-
-#ifdef ESPEAK_INSTALL
-/**
- * espeak-ng uses globals to persist and manage its state so it is not compatible with 
- * threaded parallelism (https://github.com/espeak-ng/espeak-ng/issues/1527).
- * This singleton acts as a mutex wrapped provider for all espeak phonemization methods such
- * that multiple instances of the kokoro_runner can be initialized and called in parallel.
- */
-class espeak_wrapper {
-private:
-    static espeak_wrapper * instance;
-    static std::mutex mutex;
-
-protected:
-    espeak_wrapper() {};
-    ~espeak_wrapper() {};
-    bool espeak_initialized = false;
-
-public:
-	// singletons aren't copyable
-    espeak_wrapper(espeak_wrapper &other) = delete;
-
-    // singletons aren't assignable
-    void operator=(const espeak_wrapper &) = delete;
-
-    static espeak_wrapper * get_instance();
-    const espeak_VOICE ** list_voices();
-    espeak_ERROR set_voice(const char * voice_code);
-    const char * text_to_phonemes(const void ** textptr, int textmode, int phonememode);
-    void initialize(espeak_AUDIO_OUTPUT output, int buflength, const char * path, int options);
-};
-#endif
-
 enum lookup_code {
 	SUCCESS = 100,
 	SUCCESS_PARTIAL = 101,
 	FAILURE_UNFOUND = 200,
 	FAILURE_PHONETIC = 201,
 };
-
-enum phoneme_type {
-	IPA = 1,
-	ESPEAK_PHONEMES = 2,
-};
-
-enum phonemizer_type {
-	TTS_PHONEMIZER = 0,
-	ESPEAK = 1,
-};
-
-std::string parse_voice_code(std::string voice_code);
-void update_voice(std::string voice_code);
 const std::unordered_set<std::string> inline_combine_sets(const std::vector<std::unordered_set<std::string>> sets);
 int upper_count(std::string word);
 bool is_all_upper(std::string word);
@@ -438,14 +381,12 @@ private:
 
 struct word_phonemizer * word_phonemizer_from_gguf(gguf_context * meta);
 
-/* 
- * The general translation approach that espeak uses is to lookup words in the dictionary and return a list of possible matches per lookup.
- * Each match contains flags which describe the match's conditions and limitations and optionally a pronunciation. When a pronunciation is not returned,
- * it usually means that the word needs to be pronounced phonetically, the word belongs to another language, or that the original content is a 
- * token representation of a different word (e.g. with numbers).
- *
- * Since it does not make sense to have the core lexer reperform this lookup operation with represented words or via distinct languages, those behaviors
- * are managed by the lookup operation itself and thus the lookup operation will only fail when phonetic or acronym content should be produced.
+/*
+ * 词典查找的基本思路：
+ * - 先按词典做匹配，并返回一组候选结果（包含匹配条件/限制信息，必要时也包含发音结果）。
+ * - 当没有直接返回发音时，通常意味着需要走“按字母规则拼读/回退”的路径，或需要结合上下文决定（例如数字、缩写等）。
+ * - 为了避免在核心 lexer 中重复实现这些策略，查找逻辑会尽量在 lookup 中完成：
+ *   只有在确实需要走“拼读/缩写”路径时，lookup 才会返回失败码。
  */
 struct dictionary_response {
 	dictionary_response(lookup_code code, std::string value = ""): code(code), value(value) {}
@@ -472,17 +413,16 @@ struct phoneme_dictionary {
 
 struct phoneme_dictionary * phoneme_dictionary_from_gguf(gguf_context * meta);
 
-/* 
- * In general, I would like to avoid requiring the installation of otherwise broad and technically complicated libraries,
- * like espeak, especially when they are only being used for a small portion of their overall functionality. While avoiding these
- * requirements will keep the default installation cost of TTS.cpp down, it is also unlikely that TTS.cpp will support
- * the level of variability in phonemization that espeak currently does. In this regard, I have chosen to optionally support usage of
- * espeak. As such, the phonemizer struct described below will support simple text to IPA phoneme functionality out of the box,
- * while also optionally acting as an interface for espeak phonemization.
+/*
+ * phonemizer 负责把 UTF-8 文本转换为“音素序列字符串”。
  *
- * Phonemization seems to use a pattern close to the common lexer, such that at each index or chunk of text forward and backward context 
- * views are used to support single pass translation. As such, the TTS.cpp phonemization pattern I've decided to implement behaves 
- * effecively like a simple router lexer. It will only support utf-8 encoded text and english IPA conversion.
+ * 当前实现为 TTS.cpp 内置 phonemizer：
+ * - 规则/词典从 GGUF 中读取（见 word_phonemizer_from_gguf / phoneme_dictionary_from_gguf）。
+ * - 主要面向英文文本的音素化；中文由 Kokoro 的 zh_frontend 另行处理（见 multilingual.cpp / zh_frontend.*）。
+ *
+ * 实现上类似一个“路由型 lexer”：
+ * - 逐字符前进，根据上下文判断当前应该走单词、数字、缩写、标点等分支。
+ * - 通过单次扫描（single pass）生成输出，尽量避免回溯带来的复杂度与性能成本。
  */
 struct phonemizer {
 	phonemizer(struct phoneme_dictionary * dict, struct word_phonemizer * phonetic_phonemizer, bool preserve_punctuation = true): dict(dict), phonetic_phonemizer(phonetic_phonemizer), preserve_punctuation(preserve_punctuation) {};
@@ -492,8 +432,6 @@ struct phonemizer {
 	}
 	const std::unordered_set<std::string> small_english_words = inline_combine_sets({THREE_LETTER_WORDS, TWO_LETTER_WORDS, ONE_LETTER_WORDS});
 	std::string separator = " ";
-	phoneme_type phoneme_mode = IPA;
-	phonemizer_type mode = TTS_PHONEMIZER;
 	bool preserve_punctuation = true;
 
 	struct phoneme_dictionary * dict;
@@ -504,10 +442,6 @@ struct phonemizer {
 	void text_to_phonemes(const char * text, size_t size, std::string* output);
 	std::string text_to_phonemes(std::string text);
 	std::string text_to_phonemes(const char * text, size_t size);
-
-#ifdef ESPEAK_INSTALL
-	std::string espeak_text_to_phonemes(const char * text);
-#endif
 
 	bool process_word(corpus* text, std::string* output, std::string word, conditions * flags, bool has_accent = false);
 	void append_numeric_series(std::string series, std::string* output, conditions * flags);
@@ -528,8 +462,7 @@ struct phonemizer {
 	bool handle_unknown(corpus* text);
 };
 
-struct phonemizer * phonemizer_from_gguf(gguf_context * meta, const std::string espeak_voice_code = "gmw/en-US");
-struct phonemizer * phonemizer_from_file(const std::string fname, const std::string espeak_voice_code = "gmw/en-US");
-struct phonemizer * espeak_phonemizer(bool use_espeak_phonemes = false, std::string espeak_voice_code = "gmw/en-US");
+struct phonemizer * phonemizer_from_gguf(gguf_context * meta);
+struct phonemizer * phonemizer_from_file(const std::string & fname);
 
 #endif

@@ -1,3 +1,0 @@
-python-espeak==0.6.3
-nltk>=3.9.0
-gguf==0.10.0
