@@ -38,6 +38,34 @@ static bool tts_env_truthy(const char * name) {
     return std::strcmp(v, "0") != 0 && std::strcmp(v, "off") != 0 && std::strcmp(v, "false") != 0;
 }
 
+static int tts_env_int_default(const char * name, int default_value) {
+    const char * v = std::getenv(name);
+    if (v == nullptr || v[0] == '\0') {
+        return default_value;
+    }
+    char * end = nullptr;
+    const long x = std::strtol(v, &end, 10);
+    if (end == v) {
+        return default_value;
+    }
+    if (x <= 0) {
+        return default_value;
+    }
+    // 说明：避免输入超大值导致不必要的调度开销；上限取一个足够大的安全值。
+    const long capped = std::min<long>(x, 256);
+    return (int) capped;
+}
+
+static int kokoro_duration_threads(const runner_context * kctx) {
+    const int max_threads = (kctx && kctx->n_threads > 0) ? kctx->n_threads : 1;
+    // 说明：时长图以小矩阵/多分支算子为主，线程数过多容易被调度开销淹没；
+    // 默认限制到 4（经验值），如需调整可设置环境变量：
+    // - TTS_CPU_THREADS_DURATION=1..N
+    const int def = std::min(max_threads, 4);
+    const int v = tts_env_int_default("TTS_CPU_THREADS_DURATION", def);
+    return std::max(1, std::min(v, max_threads));
+}
+
 // 说明：仅在 Vulkan 后端时才需要准备额外的权重版本（如 F32 拷贝/展开后的 depthwise kernel）。
 static bool kokoro_use_vk_weights(const kokoro_model * model) {
     return model && tts_backend_is_vulkan(model->backend);
@@ -768,8 +796,9 @@ static struct ggml_tensor * build_generator(ggml_context * ctx, kokoro_model * m
 	// stft returns a vector of shape [nfft, frames, batch, 2] where the final shape (2) separates the magnitude and the phase
 	// kokoro concatenates the n_fft from the magnitude and the phase together so we have to split them up and concatenate
 	// along the n_fft axis
-	struct ggml_tensor * mhar  = ggml_cont(ctx, ggml_view_3d(ctx, har, har->ne[0], har->ne[1], har->ne[2], har->nb[1], har->nb[2], 0));
-	struct ggml_tensor * phhar = ggml_cont(ctx, ggml_view_3d(ctx, har, har->ne[0], har->ne[1], har->ne[2], har->nb[1], har->nb[2], har->nb[3]));
+	// 说明：view 本身不会产生拷贝；concat 支持非连续输入，因此这里不需要额外 ggml_cont。
+	struct ggml_tensor * mhar  = ggml_view_3d(ctx, har, har->ne[0], har->ne[1], har->ne[2], har->nb[1], har->nb[2], 0);
+	struct ggml_tensor * phhar = ggml_view_3d(ctx, har, har->ne[0], har->ne[1], har->ne[2], har->nb[1], har->nb[2], har->nb[3]);
 	struct ggml_tensor * combined_har = ggml_cont(ctx, ggml_transpose(ctx, ggml_concat(ctx, mhar, phhar, 0)));
 
 	struct ggml_tensor * cur = x;
@@ -791,7 +820,8 @@ static struct ggml_tensor * build_generator(ggml_context * ctx, kokoro_model * m
 			struct ggml_tensor * temp = ggml_cont(ctx, ggml_view_3d(ctx, cur, 1, cur->ne[1], cur->ne[2], cur->nb[1], cur->nb[2], cur->nb[0]));
 			cur = ggml_concat(ctx, temp, cur, 0);
 		}
-		struct ggml_tensor * x_source = build_noise_block(ctx, generator->noise_blocks[i], ggml_cont(ctx, combined_har), style, const_inputs);
+		// 说明：combined_har 已是 cont 输出，避免在循环里重复 ggml_cont 触发大块拷贝。
+		struct ggml_tensor * x_source = build_noise_block(ctx, generator->noise_blocks[i], combined_har, style, const_inputs);
 		cur = ggml_add(ctx, cur, x_source);
 		struct ggml_tensor * x = cur;
 		for (int ii = 0; ii < model->n_kernels; ii++) {
@@ -1758,6 +1788,12 @@ void kokoro_duration_runner::run(kokoro_ubatch & batch) {
 
     const int64_t t_after_set_inputs_us = timings ? tts_time_us() : 0;
 
+    // 说明：CPU-only 模式下，时长图以小算子为主，过多线程常常会被调度/同步开销抵消。
+    // 这里对时长阶段单独设置一个较小的线程数上限（默认 4，可通过 TTS_CPU_THREADS_DURATION 覆盖）。
+    if (kctx->backend == nullptr && kctx->backend_cpu != nullptr) {
+        ggml_backend_cpu_set_n_threads(kctx->backend_cpu, kokoro_duration_threads(kctx));
+    }
+
     const enum ggml_status duration_status = ggml_backend_sched_graph_compute_async(kctx->sched, gf);
     if (duration_status != GGML_STATUS_SUCCESS) {
         TTS_ABORT("Kokoro 时长计算失败：status=%d。\n", (int) duration_status);
@@ -2183,6 +2219,12 @@ void kokoro_runner::run(kokoro_ubatch & batch, tts_response & outputs) {
     int64_t t_before_set_inputs_us = timings ? tts_time_us() : 0;
     kokoro_gen_input_timings input_timings = set_inputs(batch, total_length);
     int64_t t_after_set_inputs_us = timings ? tts_time_us() : 0;
+
+    // 说明：duration 阶段可能把 CPU 线程数调小；进入 generator 前恢复为用户指定线程数，
+    // 以充分利用多核加速卷积/矩阵运算。
+    if (kctx->backend == nullptr && kctx->backend_cpu != nullptr) {
+        ggml_backend_cpu_set_n_threads(kctx->backend_cpu, kctx->n_threads);
+    }
 
     enum ggml_status gen_status = ggml_backend_sched_graph_compute_async(kctx->sched, gf);
     if (gen_status != GGML_STATUS_SUCCESS && tts_backend_is_vulkan(kctx->backend) && kctx->backend_cpu) {

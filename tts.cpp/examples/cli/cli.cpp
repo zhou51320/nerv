@@ -70,6 +70,88 @@ static std::string tts_cli_to_lower(std::string v) {
     return v;
 }
 
+static bool tts_cli_try_parse_int(const std::string & text, int & out) {
+    // 说明：CLI 参数里会出现类似 "vulkan:0" 的形式，这里提供一个不抛异常的 int 解析工具。
+    // - 返回 true：成功解析出一个完整的十进制整数（允许前导空格与正负号）。
+    // - 返回 false：格式非法（例如包含非数字字符）。
+    int  v = 0;
+    char extra = 0;
+    if (std::sscanf(text.c_str(), "%d%c", &v, &extra) == 1) {
+        out = v;
+        return true;
+    }
+    return false;
+}
+
+static bool tts_cli_parse_device_arg(const std::string & value, int default_vulkan_device, tts_backend_config & out) {
+    // 说明：`--device` 仅用于测试/对比，常见用户不需要关心该参数。
+    // 支持的写法：
+    // - cpu
+    // - metal
+    // - vulkan / vk
+    // - vulkan:0 / vk:0（同时指定 Vulkan 设备索引）
+    // - auto（交给库侧按可用后端自动选择：优先 Metal，其次 Vulkan）
+    const std::string lower = tts_cli_to_lower(value);
+
+    out = {};
+    out.device = default_vulkan_device;
+
+    if (lower == "cpu") {
+        out.backend = tts_compute_backend::CPU;
+        return true;
+    }
+    if (lower == "metal") {
+        out.backend = tts_compute_backend::METAL;
+        return true;
+    }
+    if (lower == "auto") {
+        out.backend = tts_compute_backend::AUTO;
+        return true;
+    }
+
+    // 处理 vulkan[:N] / vk[:N]
+    std::string name = lower;
+    int device_index = default_vulkan_device;
+    const size_t colon = lower.find(':');
+    if (colon != std::string::npos) {
+        name = lower.substr(0, colon);
+        const std::string idx = lower.substr(colon + 1);
+        if (idx.empty()) {
+            return false;
+        }
+        if (!tts_cli_try_parse_int(idx, device_index) || device_index < 0) {
+            return false;
+        }
+    }
+
+    if (name == "vulkan" || name == "vk") {
+        out.backend = tts_compute_backend::VULKAN;
+        out.device = device_index;
+        return true;
+    }
+
+    return false;
+}
+
+static tts_backend_config tts_cli_default_backend_config(int default_vulkan_device) {
+    // 说明：默认设备跟随“编译时启用的后端”。
+    // - 编译启用 Metal：默认 Metal
+    // - 否则编译启用 Vulkan：默认 Vulkan
+    // - 都没启用：默认 CPU
+    tts_backend_config out{};
+    out.device = default_vulkan_device;
+
+#if defined(GGML_USE_METAL)
+    out.backend = tts_compute_backend::METAL;
+#elif defined(GGML_USE_VULKAN)
+    out.backend = tts_compute_backend::VULKAN;
+#else
+    out.backend = tts_compute_backend::CPU;
+#endif
+
+    return out;
+}
+
 static bool tts_cli_parse_language(const std::string & value, tts_language & out) {
     const std::string lower = tts_cli_to_lower(value);
     if (lower.empty() || lower == "zh" || lower == "cn" || lower == "chinese") {
@@ -134,8 +216,14 @@ static int main_impl(int argc, const char ** argv) {
     args.add_argument(int_arg("--n-threads", "The number of cpu threads to run generation with. Defaults to half of hardware concurrency (min 1). If hardware concurrency cannot be determined then it defaults to 1.", "-nt", false, &default_n_threads));
     args.add_argument(int_arg("--topk", "(OPTIONAL) When set to an integer value greater than 0 generation uses nucleus sampling over topk nucleaus size. Defaults to 50.", "-tk", false, &default_top_k));
     args.add_argument(float_arg("--repetition-penalty", "The by channel repetition penalty to be applied the sampled output of the model. defaults to 1.0.", "-r", false, &default_repetition_penalty));
-    args.add_argument(bool_arg("--use-metal", "(OPTIONAL) Whether to use metal acceleration", "-m"));
-    args.add_argument(bool_arg("--use-vulkan", "(OPTIONAL) Whether to use Vulkan acceleration", "-vk"));
+    args.add_argument(string_arg("--device",
+                                 "(OPTIONAL) Compute device/backend for testing: cpu/metal/vulkan[:N]/auto. Empty=build default.",
+                                 "-d",
+                                 false,
+                                 ""));
+    // 兼容旧参数（已弃用）：建议统一使用 --device
+    args.add_argument(bool_arg("--use-metal", "(DEPRECATED) Use '--device metal' instead.", "-m"));
+    args.add_argument(bool_arg("--use-vulkan", "(DEPRECATED) Use '--device vulkan' instead.", "-vk"));
     args.add_argument(int_arg("--vulkan-device", "(OPTIONAL) Vulkan device index (default: 0).", "-vd", false, &default_vulkan_device));
     args.add_argument(bool_arg("--no-cross-attn", "(OPTIONAL) Whether to not include cross attention", "-ca"));
     args.add_argument(string_arg("--conditional-prompt", "(OPTIONAL) A distinct conditional prompt to use for generating. If none is provided the preencoded prompt is used. '--text-encoder-path' must be set to use conditional generation.", "-cp", false));
@@ -200,29 +288,47 @@ static int main_impl(int argc, const char ** argv) {
         language,
         args.get_string_param("--zh-dict-dir")};
 
-    {
-        const bool        list_voices = args.get_bool_param("--list-voices");
-        const std::string model_path  = args.get_string_param("--model-path");
-        const std::string save_path   = args.get_string_param("--save-path");
-        const bool        use_metal   = args.get_bool_param("--use-metal");
-        const bool        use_vulkan  = args.get_bool_param("--use-vulkan");
+    // ----------------------------
+    // 选择推理后端（CPU / Metal / Vulkan）
+    // ----------------------------
+    // 说明：
+    // - `--device` 仅用于测试/对比，日常用户无需关注；
+    // - 未指定时，默认值跟随“编译时启用的后端”（编译启用 Vulkan 则默认 Vulkan，启用 Metal 则默认 Metal）；
+    // - 兼容旧参数：--use-metal / --use-vulkan（已弃用）。
+    tts_backend_config backend{};
+    backend.device = *args.get_int_param("--vulkan-device");
 
+    const std::string device_arg = args.get_string_param("--device");
+    const bool        use_metal  = args.get_bool_param("--use-metal");
+    const bool        use_vulkan = args.get_bool_param("--use-vulkan");
+
+    if (!device_arg.empty()) {
+        if (use_metal || use_vulkan) {
+            fprintf(stderr, "参数冲突：--device 与 --use-metal/--use-vulkan 不能同时使用。\n");
+            exit(1);
+        }
+        if (!tts_cli_parse_device_arg(device_arg, backend.device, backend)) {
+            fprintf(stderr, "argument '--device' must be one of: cpu/metal/vulkan[:N]/auto.\n");
+            exit(1);
+        }
+    } else {
         if (use_metal && use_vulkan) {
             fprintf(stderr, "参数冲突：--use-metal 与 --use-vulkan 不能同时使用。\n");
             exit(1);
         }
-
-        tts_backend_config backend{};
-        backend.device = *args.get_int_param("--vulkan-device");
         if (use_metal) {
             backend.backend = tts_compute_backend::METAL;
         } else if (use_vulkan) {
             backend.backend = tts_compute_backend::VULKAN;
         } else {
-            backend.backend = tts_compute_backend::CPU;
+            backend = tts_cli_default_backend_config(backend.device);
         }
+    }
 
-        const bool cpu_only = backend.backend == tts_compute_backend::CPU;
+    {
+        const bool        list_voices = args.get_bool_param("--list-voices");
+        const std::string model_path  = args.get_string_param("--model-path");
+        const std::string save_path   = args.get_string_param("--save-path");
         std::string device_name;
         switch (backend.backend) {
             case tts_compute_backend::CPU:    device_name = "cpu"; break;
@@ -265,15 +371,6 @@ static int main_impl(int argc, const char ** argv) {
 
     const int64_t t_load_start_us = ggml_time_us();
     tts_cli_log("开始加载模型（GGUF）...");
-    tts_backend_config backend{};
-    backend.device = *args.get_int_param("--vulkan-device");
-    if (args.get_bool_param("--use-metal")) {
-        backend.backend = tts_compute_backend::METAL;
-    } else if (args.get_bool_param("--use-vulkan")) {
-        backend.backend = tts_compute_backend::VULKAN;
-    } else {
-        backend.backend = tts_compute_backend::CPU;
-    }
 
     unique_ptr<tts_generation_runner> runner{runner_from_file(args.get_string_param("--model-path").c_str(),
                                                               *args.get_int_param("--n-threads"),

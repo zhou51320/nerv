@@ -25,10 +25,12 @@ In order to get a detailed breakdown the functionality currently available you c
     (OPTIONAL) When set to an integer value greater than 0 generation uses nucleus sampling over topk nucleaus size. Defaults to 50.
 --max-tokens (-mt):
     (OPTIONAL) The max audio tokens or token batches to generate where each represents approximates 11 ms of audio. Only applied to Dia generation. If set to zero as is its default then the default max generation size. Warning values under 15 are not supported.
+--device (-d):
+    (OPTIONAL) Compute device/backend for testing: cpu/metal/vulkan[:N]/auto. Empty=build default.
 --use-metal (-m):
-    (OPTIONAL) Whether to use metal acceleration
+    (DEPRECATED) Use '--device metal' instead.
 --use-vulkan (-vk):
-    (OPTIONAL) Whether to use Vulkan acceleration
+    (DEPRECATED) Use '--device vulkan' instead.
 --vulkan-device (-vd):
     (OPTIONAL) Vulkan device index (default: 0).
 --no-cross-attn (-ca):

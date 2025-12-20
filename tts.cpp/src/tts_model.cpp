@@ -17,6 +17,27 @@ static bool tts_env_truthy_local(const char * name) {
     return std::strcmp(v, "0") != 0 && std::strcmp(v, "off") != 0 && std::strcmp(v, "false") != 0;
 }
 
+static bool tts_env_truthy_default_local(const char * name, bool default_value) {
+    const char * v = std::getenv(name);
+    if (v == nullptr || v[0] == '\0') {
+        return default_value;
+    }
+    return std::strcmp(v, "0") != 0 && std::strcmp(v, "off") != 0 && std::strcmp(v, "false") != 0;
+}
+
+static double tts_env_double_default_local(const char * name, double default_value) {
+    const char * v = std::getenv(name);
+    if (v == nullptr || v[0] == '\0') {
+        return default_value;
+    }
+    char * end = nullptr;
+    const double x = std::strtod(v, &end);
+    if (end == v) {
+        return default_value;
+    }
+    return x;
+}
+
 static bool tts_backend_is_vulkan_local(ggml_backend_t backend) {
     if (backend == nullptr) {
         return false;
@@ -101,6 +122,39 @@ void runner_context::build_schedule(size_t max_nodes) {
 bool runner_context::prep_schedule(struct ggml_cgraph * gf) {
     if (!sched) {
         return false;
+    }
+
+    // ------------------------- CPU-only 预分配保护 -------------------------
+    // 说明：
+    // - ggml_backend_sched_reserve() 会尝试为“当前图（可能是 worst-case 图）”一次性预分配一大块连续内存；
+    // - 在 CPU-only 模式下，这可能触发数 GiB 级别的申请（甚至失败），导致启动变慢、系统内存压力增大，
+    //   极端情况下还可能引发后续 ggml_init 内部分配失败（ctx->mem_buffer == NULL）。
+    // - 因此这里给 CPU-only 的预分配增加一个“软上限”：超过阈值则跳过预分配，让运行时按实际输入图分配。
+    // - 兼容开关：
+    //   - TTS_CPU_PREALLOC=0 彻底关闭 CPU 预分配；
+    //   - TTS_CPU_PREALLOC_MAX_GIB=xxx 设置阈值（默认 2 GiB；设为 0 表示不设上限）。
+    if (backend == nullptr && backend_cpu != nullptr) {
+        const bool cpu_prealloc = tts_env_truthy_default_local("TTS_CPU_PREALLOC", /*default_value=*/true);
+        if (!cpu_prealloc) {
+            return true;
+        }
+
+        size_t sizes[2] = {0, 0};
+        ggml_backend_sched_reserve_size(sched, gf, sizes);
+        const size_t cpu_need = sizes[0];
+
+        const double max_gib = tts_env_double_default_local("TTS_CPU_PREALLOC_MAX_GIB", 2.0);
+        if (max_gib > 0.0) {
+            const double gib = 1024.0 * 1024.0 * 1024.0;
+            const size_t limit = (size_t) (max_gib * gib);
+            if (cpu_need > limit) {
+                fprintf(stderr,
+                        "[tts] CPU 预分配需求 %.2f GiB 超过阈值 %.2f GiB，跳过预分配并在运行时按实际图分配。\n",
+                        cpu_need / gib,
+                        max_gib);
+                return true;
+            }
+        }
     }
 
     // 说明：Vulkan/Metal 的“最坏图”预分配可能远超显存，启动阶段直接触发 OOM。

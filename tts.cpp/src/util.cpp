@@ -424,8 +424,84 @@ static void tts_simple_dft(float * real, float * imag, float * scratch, size_t n
     }
 }
 
-// Radix-2 FFT（Cooley-Tukey），与旧 ggml 里的实现一致：输入为 real/imag 两个数组。
-static void tts_radix2_fft(float * real, float * imag, float * scratch, size_t n_fft, size_t step) {
+// ----------------------------- FFT（CPU 热点） -----------------------------
+// 说明：
+// - Kokoro 的声码器需要做 STFT/ISTFT，推理时会反复调用 FFT。
+// - 旧版递归 FFT 每个 butterfly 都会调用一次 cosf/sinf（twiddle），CPU 上 trig 成本非常高，
+//   这会显著拖慢纯 CPU 推理速度。
+// - 这里对“2 的幂长度 FFT”预计算 twiddle 表（cos/sin），推理时只查表不再计算 trig，
+//   在不引入第三方库（如 FFTW）的前提下获得明显提速。
+
+// 若 n 是 2 的幂，返回 log2(n)，否则返回 -1。
+static int tts_log2_exact_pow2(size_t n) {
+    if (n == 0) {
+        return -1;
+    }
+    if ((n & (n - 1)) != 0) {
+        return -1;
+    }
+    int e = 0;
+    while (n > 1) {
+        n >>= 1;
+        ++e;
+    }
+    return e;
+}
+
+struct tts_fft_twiddles {
+    // 当前缓存对应的 FFT 长度（必须是 2 的幂）
+    size_t n_fft = 0;
+    int    log2_n = 0;
+
+    // twiddle 表：level 表示 FFT 子问题规模 n=2^level
+    // - cos[level][i] = cos(-2π*i/n)
+    // - sin[level][i] = sin(-2π*i/n)
+    std::vector<std::vector<float>> cos;
+    std::vector<std::vector<float>> sin;
+};
+
+static const tts_fft_twiddles & tts_get_fft_twiddles(size_t n_fft) {
+    static thread_local tts_fft_twiddles cache{};
+    if (cache.n_fft == n_fft) {
+        return cache;
+    }
+
+    const int log2_n = tts_log2_exact_pow2(n_fft);
+    if (log2_n < 0) {
+        // 非 2 的幂：不构建 twiddle 表（调用方会走慢路径）
+        cache = {};
+        cache.n_fft  = n_fft;
+        cache.log2_n = -1;
+        return cache;
+    }
+
+    cache = {};
+    cache.n_fft  = n_fft;
+    cache.log2_n = log2_n;
+    cache.cos.resize((size_t) log2_n + 1);
+    cache.sin.resize((size_t) log2_n + 1);
+
+    // level=1 => n=2，...，level=log2_n => n=n_fft
+    for (int level = 1; level <= log2_n; ++level) {
+        const size_t n = (size_t) 1u << (unsigned) level;
+        const size_t half = n / 2;
+
+        cache.cos[level].resize(half);
+        cache.sin[level].resize(half);
+
+        const float km = -TTS_TWO_PI_F / (float) n;
+        for (size_t i = 0; i < half; ++i) {
+            const float k = km * (float) i;
+            cache.cos[level][i] = cosf(k);
+            cache.sin[level][i] = sinf(k);
+        }
+    }
+
+    return cache;
+}
+
+// 慢路径：递归 Radix-2 FFT（会调用 trig），用于非 2 的幂长度（或极端兼容场景）。
+static void tts_radix2_fft_slow(float * real, float * imag, float * scratch, size_t n_fft, size_t step) {
     if (n_fft == 1) {
         return;
     }
@@ -437,8 +513,8 @@ static void tts_radix2_fft(float * real, float * imag, float * scratch, size_t n
     }
 
     // 递归：偶/奇拆分（通过 step*2 达到“跳步访问”的效果，不额外分配数组）
-    tts_radix2_fft(real, imag, scratch, n_fft / 2, step * 2);
-    tts_radix2_fft(
+    tts_radix2_fft_slow(real, imag, scratch, n_fft / 2, step * 2);
+    tts_radix2_fft_slow(
         (float *) ((char *) real + step * sizeof(float)),
         (float *) ((char *) imag + step * sizeof(float)),
         scratch,
@@ -477,12 +553,92 @@ static void tts_radix2_fft(float * real, float * imag, float * scratch, size_t n
     }
 }
 
+// 快路径：仅用于 n_fft 是 2 的幂（level=log2(n_fft)）。
+static void tts_radix2_fft_twiddled(
+    float * real,
+    float * imag,
+    float * scratch,
+    size_t  step,
+    int     level,
+    const tts_fft_twiddles & tw) {
+    if (level <= 0) {
+        return;
+    }
+    const size_t n = (size_t) 1u << (unsigned) level;
+
+    // 递归：偶/奇拆分（通过 step*2 达到“跳步访问”的效果，不额外分配数组）
+    tts_radix2_fft_twiddled(real, imag, scratch, step * 2, level - 1, tw);
+    tts_radix2_fft_twiddled(
+        (float *) ((char *) real + step * sizeof(float)),
+        (float *) ((char *) imag + step * sizeof(float)),
+        scratch,
+        step * 2,
+        level - 1,
+        tw);
+
+    const float * cos_tbl = tw.cos[level].data();
+    const float * sin_tbl = tw.sin[level].data();
+
+    // butterfly（查表代替 trig）
+    for (size_t i = 0; i < n / 2; ++i) {
+        const float c  = cos_tbl[i];
+        const float s  = sin_tbl[i];
+
+        const float pr = real[i * 2 * step];
+        const float pi = imag[i * 2 * step];
+
+        const float qr0 = real[(i * 2 + 1) * step];
+        const float qi0 = imag[(i * 2 + 1) * step];
+
+        // (qr0 + i*qi0) * (c + i*s)
+        const float qr = qr0 * c - qi0 * s;
+        const float qi = qr0 * s + qi0 * c;
+
+        scratch[i + n] = pi + qi;
+        scratch[i]     = pr + qr;
+
+        scratch[i + (n / 2) + n] = pi - qi;
+        scratch[i + (n / 2)]     = pr - qr;
+    }
+
+    for (size_t i = 0; i < n; ++i) {
+        real[i * step] = scratch[i];
+        imag[i * step] = scratch[i + n];
+    }
+}
+
+// Radix-2 FFT（Cooley-Tukey）：输入为 real/imag 两个数组。
+static void tts_radix2_fft(float * real, float * imag, float * scratch, size_t n_fft, size_t step) {
+    if (n_fft == 1) {
+        return;
+    }
+
+    // 非偶数长度：无法继续二分，回退到 DFT
+    if (n_fft % 2 != 0) {
+        tts_simple_dft(real, imag, scratch, n_fft, step);
+        return;
+    }
+
+    const int level = tts_log2_exact_pow2(n_fft);
+    if (level >= 0) {
+        const tts_fft_twiddles & tw = tts_get_fft_twiddles(n_fft);
+        if (tw.log2_n == level) {
+            tts_radix2_fft_twiddled(real, imag, scratch, step, level, tw);
+            return;
+        }
+    }
+
+    // 非 2 的幂但仍可继续二分：走慢路径（内部同样会在必要时回退 DFT）。
+    tts_radix2_fft_slow(real, imag, scratch, n_fft, step);
+}
+
 // STFT 自定义算子的参数（存放在 dst->op_params 里，避免额外堆分配/生命周期管理）。
 struct tts_stft_op_params {
     ggml_custom_op_params base;
     int32_t n_fft;
     int32_t hop;
     int32_t abs_and_angle; // 0/1：输出为 (real,imag) 或 (magnitude,angle)
+    int32_t one_sided;     // 0/1：是否输出 one-sided（ne0 = n_fft/2+1）
 };
 
 // ISTFT 自定义算子的参数（同上）。
@@ -491,6 +647,7 @@ struct tts_istft_op_params {
     int32_t n_fft;
     int32_t hop;
     int32_t from_abs_and_angle; // 0/1：输入为 (real,imag) 或 (magnitude,angle)
+    int32_t one_sided;          // 0/1：输入是否为 one-sided（ne0 = n_fft/2+1）
 };
 
 static void tts_compute_stft_custom(struct ggml_tensor * dst, int ith, int nth, void *) {
@@ -510,11 +667,15 @@ static void tts_compute_stft_custom(struct ggml_tensor * dst, int ith, int nth, 
     const int32_t hop   = p.hop;
     const int32_t half  = n_fft / 2;
     const bool abs_and_angle = p.abs_and_angle != 0;
+    const bool one_sided = p.one_sided != 0;
 
     GGML_ASSERT(n_fft > 0);
     GGML_ASSERT(hop > 0);
     GGML_ASSERT(win->ne[0] == n_fft);
-    GGML_ASSERT(dst->ne[0] == n_fft);
+    // 说明：默认 Kokoro 使用 one-sided（只保留 [0, n_fft/2] 频率区间），可以少一半输出元素，
+    // 同时避免“view + cont”的额外拷贝。
+    const int32_t out_ne0 = one_sided ? (half + 1) : n_fft;
+    GGML_ASSERT(dst->ne[0] == out_ne0);
     GGML_ASSERT(dst->ne[3] == 2);
     GGML_ASSERT(src0->nb[0] == sizeof(float));
     GGML_ASSERT(win->nb[0]  == sizeof(float));
@@ -529,17 +690,28 @@ static void tts_compute_stft_custom(struct ggml_tensor * dst, int ith, int nth, 
     const int64_t f0  = fpt * ith;
     const int64_t f1  = std::min(f0 + fpt, n_frame);
 
-    // 每个线程复用一块 FFT scratch（2*n_fft float：前半写实部、后半写虚部）。
+    // 每个线程复用两块 buffer：
+    // - fft_buf：长度 2*n_fft（前半 real，后半 imag），作为 FFT 的工作区；
+    // - scratch：长度 2*n_fft，作为 radix2 过程的临时存储。
+    // 说明：过去实现直接在 dst 输出缓冲上就地 FFT，但当输出改为 one-sided 后 dst->ne0 < n_fft，
+    // 无法直接作为 FFT 工作区，因此改为线程本地缓冲。
+    static thread_local std::vector<float> tls_fft_buf;
     static thread_local std::vector<float> tls_scratch;
-    if (tls_scratch.size() < (size_t) n_fft * 2) {
-        tls_scratch.assign((size_t) n_fft * 2, 0.0f);
+    if (tls_fft_buf.size() < (size_t) n_fft * 2) {
+        tls_fft_buf.resize((size_t) n_fft * 2);
     }
+    if (tls_scratch.size() < (size_t) n_fft * 2) {
+        tls_scratch.resize((size_t) n_fft * 2);
+    }
+    float * fft_r  = tls_fft_buf.data();
+    float * fft_i  = tls_fft_buf.data() + n_fft;
     float * scratch = tls_scratch.data();
 
     const float * w = (const float *) win->data;
 
     for (int64_t b = 0; b < n_batch; ++b) {
         const char * src0_b = (const char *) src0->data + b * src0->nb[1];
+        const float * src = (const float *) src0_b;
 
         for (int64_t fi = f0; fi < f1; ++fi) {
             const int64_t center = fi * (int64_t) hop;
@@ -553,29 +725,33 @@ static void tts_compute_stft_custom(struct ggml_tensor * dst, int ith, int nth, 
                 const int64_t ai = center - half + i;
                 float sample = 0.0f;
                 if (ai < 0) {
-                    sample = *(const float *) (src0_b + (size_t) (-ai) * src0->nb[0]);
+                    sample = src[(size_t) (-ai)];
                 } else if (ai >= in_len) {
                     const int64_t ri = in_len - (ai - in_len + 1);
-                    sample = *(const float *) (src0_b + (size_t) ri * src0->nb[0]);
+                    sample = src[(size_t) ri];
                 } else {
-                    sample = *(const float *) (src0_b + (size_t) ai * src0->nb[0]);
+                    sample = src[(size_t) ai];
                 }
 
-                out_r[i] = sample * w[i];
-                out_i[i] = 0.0f;
+                fft_r[i] = sample * w[i];
+                fft_i[i] = 0.0f;
             }
 
-            // 3) FFT（就地变换 out_r/out_i）
-            tts_radix2_fft(out_r, out_i, scratch, (size_t) n_fft, 1);
+            // 3) FFT（就地变换 fft_r/fft_i）
+            tts_radix2_fft(fft_r, fft_i, scratch, (size_t) n_fft, 1);
 
             // 4) 可选：转换为 (magnitude, angle)
             if (abs_and_angle) {
-                for (int32_t i = 0; i < n_fft; ++i) {
-                    const float r = out_r[i];
-                    const float im = out_i[i];
+                for (int32_t i = 0; i < out_ne0; ++i) {
+                    const float r  = fft_r[i];
+                    const float im = fft_i[i];
                     out_r[i] = sqrtf(r * r + im * im);
                     out_i[i] = atan2f(im, r);
                 }
+            } else {
+                // 非 abs/angle：直接输出 real/imag
+                std::memcpy(out_r, fft_r, (size_t) out_ne0 * sizeof(float));
+                std::memcpy(out_i, fft_i, (size_t) out_ne0 * sizeof(float));
             }
         }
     }
@@ -598,6 +774,7 @@ static void tts_compute_istft_custom(struct ggml_tensor * dst, int ith, int nth,
     const int32_t hop   = p.hop;
     const int32_t half  = n_fft / 2;
     const bool from_abs_and_angle = p.from_abs_and_angle != 0;
+    const bool onesided_param = p.one_sided != 0;
 
     GGML_ASSERT(n_fft > 0);
     GGML_ASSERT(hop > 0);
@@ -612,7 +789,12 @@ static void tts_compute_istft_custom(struct ggml_tensor * dst, int ith, int nth,
     const int64_t out_len = dst->ne[0];
 
     // onesided：输入频率维只有 half+1，需要按厄米对称重建完整频谱
-    const bool onesided = (src0->ne[0] == (int64_t) half + 1);
+    const bool onesided = onesided_param;
+    if (onesided) {
+        GGML_ASSERT(src0->ne[0] == (int64_t) half + 1);
+    } else {
+        GGML_ASSERT(src0->ne[0] == (int64_t) n_fft);
+    }
 
     // 将输出长度按任务划分，每个任务只写自己负责的区间，避免线程间原子/锁/栅栏。
     const int64_t spt = (out_len + nth - 1) / nth;  // samples per task
@@ -631,16 +813,17 @@ static void tts_compute_istft_custom(struct ggml_tensor * dst, int ith, int nth,
     static thread_local std::vector<float> tls_buffer;
     static thread_local std::vector<float> tls_spec;
     if (tls_buffer.size() < (size_t) n_fft * 2) {
-        tls_buffer.assign((size_t) n_fft * 2, 0.0f);
+        tls_buffer.resize((size_t) n_fft * 2);
     }
     if (tls_spec.size() < (size_t) n_fft * 2) {
-        tls_spec.assign((size_t) n_fft * 2, 0.0f);
+        tls_spec.resize((size_t) n_fft * 2);
     }
     float * buffer   = tls_buffer.data();
     float * spec_r   = tls_spec.data();
     float * spec_i   = tls_spec.data() + n_fft;
 
     const float * w = (const float *) win->data;
+    const float inv_n_fft = 1.0f / (float) n_fft;
 
     // 为了保证每个输出采样点拿到所有会影响它的 frame，这里按旧 ggml 的经验公式取一个“扩展 frame 范围”。
     const int poa = (half / hop) - 1;
@@ -663,22 +846,40 @@ static void tts_compute_istft_custom(struct ggml_tensor * dst, int ith, int nth,
             const float * src_i = (const float *) ((const char *) src0->data + (int64_t) i1 * src0->nb[1] + b * src0->nb[2] + src0->nb[3]);
 
             // 重建完整频谱（长度 n_fft）
-            for (int32_t i = 0; i < n_fft; ++i) {
-                int32_t idx = i;
-                float mult = 1.0f;
-                if (onesided && i >= half + 1) {
-                    idx = n_fft - i;
-                    mult = -1.0f;
+            if (onesided) {
+                // 说明：one-sided 情况只需要计算 [0..half]，其余频点通过厄米对称补齐，
+                // 可以把 cosf/sinf 的调用量减少约一半。
+                if (from_abs_and_angle) {
+                    for (int32_t idx = 0; idx <= half; ++idx) {
+                        const float mag   = src_r[idx];
+                        const float phase = src_i[idx];
+                        const float c = cosf(phase);
+                        const float s = sinf(phase);
+                        spec_r[idx] = mag * c;
+                        spec_i[idx] = mag * s;
+                    }
+                } else {
+                    // real/imag 输入：直接拷贝 one-sided 区间
+                    std::memcpy(spec_r, src_r, (size_t) (half + 1) * sizeof(float));
+                    std::memcpy(spec_i, src_i, (size_t) (half + 1) * sizeof(float));
                 }
 
+                // 补齐镜像频点：X[n-k] = conj(X[k])
+                for (int32_t idx = 1; idx < half; ++idx) {
+                    spec_r[n_fft - idx] = spec_r[idx];
+                    spec_i[n_fft - idx] = -spec_i[idx];
+                }
+            } else {
                 if (from_abs_and_angle) {
-                    const float mag   = src_r[idx];
-                    const float phase = src_i[idx];
-                    spec_r[i] = mag * cosf(phase);
-                    spec_i[i] = mult * mag * sinf(phase);
+                    for (int32_t i = 0; i < n_fft; ++i) {
+                        const float mag   = src_r[i];
+                        const float phase = src_i[i];
+                        spec_r[i] = mag * cosf(phase);
+                        spec_i[i] = mag * sinf(phase);
+                    }
                 } else {
-                    spec_r[i] = src_r[idx];
-                    spec_i[i] = mult * src_i[idx];
+                    std::memcpy(spec_r, src_r, (size_t) n_fft * sizeof(float));
+                    std::memcpy(spec_i, src_i, (size_t) n_fft * sizeof(float));
                 }
             }
 
@@ -694,7 +895,7 @@ static void tts_compute_istft_custom(struct ggml_tensor * dst, int ith, int nth,
                     continue;
                 }
                 // 归一化 1/n_fft，并在此处乘上 window（后续会再除以 window_squared_sum 去掉窗函数影响）
-                out[location] += (spec_r[i] / (float) n_fft) * w[base_index];
+                out[location] += (spec_r[i] * inv_n_fft) * w[base_index];
             }
         }
     }
@@ -797,9 +998,11 @@ struct ggml_tensor * stft(ggml_context * ctx, struct ggml_tensor * a, struct ggm
         TTS_ABORT("For #stft inputs must be GGML_TYPE_F32.\n");
     }
 
-    // 输出：与旧 ggml 保持一致，shape = [n_fft, n_frames, batch, 2]
+    // 输出：shape = [ne0, n_frames, batch, 2]
+    // - one_sided=false：ne0=n_fft（完整频谱）
+    // - one_sided=true： ne0=n_fft/2+1（只保留 [0..Nyquist]，减少约一半输出与后续拷贝）
     const int64_t n_frames = (int64_t) (a->ne[0] / (int64_t) hop) + 1;
-    const int64_t ne0 = (int64_t) n_fft;
+    const int64_t ne0 = one_sided ? (((int64_t) n_fft / 2) + 1) : (int64_t) n_fft;
     const int64_t ne1 = n_frames;
     const int64_t ne2 = a->ne[1];
     const int64_t ne3 = 2;
@@ -818,15 +1021,8 @@ struct ggml_tensor * stft(ggml_context * ctx, struct ggml_tensor * a, struct ggm
     p.n_fft = (int32_t) n_fft;
     p.hop   = (int32_t) hop;
     p.abs_and_angle = abs_and_angle ? 1 : 0;
+    p.one_sided = one_sided ? 1 : 0;
     ggml_set_op_params(out, &p, sizeof(p));
-
-    if (one_sided) {
-        // one-sided 视图：只取 [0, n_fft/2] 频率区间（包含 Nyquist）
-        const int64_t half_plus_1 = ((int64_t) n_fft / 2) + 1;
-        out = ggml_cont(ctx, ggml_view_4d(ctx, out,
-                                          half_plus_1, out->ne[1], out->ne[2], out->ne[3],
-                                          out->nb[1], out->nb[2], out->nb[3], 0));
-    }
 
     return out;
 }
@@ -862,6 +1058,7 @@ struct ggml_tensor * istft(ggml_context * ctx, struct ggml_tensor * a, struct gg
     p.n_fft = (int32_t) n_fft;
     p.hop   = (int32_t) hop;
     p.from_abs_and_angle = abs_and_angle ? 1 : 0;
+    p.one_sided = one_sided ? 1 : 0;
     ggml_set_op_params(out, &p, sizeof(p));
 
     // 去掉窗函数影响（与旧实现一致）
