@@ -38,6 +38,18 @@ static bool tts_env_truthy(const char * name) {
     return std::strcmp(v, "0") != 0 && std::strcmp(v, "off") != 0 && std::strcmp(v, "false") != 0;
 }
 
+// 说明：带默认值的布尔环境变量读取。
+// - 未设置：返回 default_value
+// - 设置为 0/off/false：返回 false
+// - 其他非空值：返回 true
+static bool tts_env_truthy_default(const char * name, bool default_value) {
+    const char * v = std::getenv(name);
+    if (v == nullptr || v[0] == '\0') {
+        return default_value;
+    }
+    return std::strcmp(v, "0") != 0 && std::strcmp(v, "off") != 0 && std::strcmp(v, "false") != 0;
+}
+
 static int tts_env_int_default(const char * name, int default_value) {
     const char * v = std::getenv(name);
     if (v == nullptr || v[0] == '\0') {
@@ -71,6 +83,21 @@ static bool kokoro_use_vk_weights(const kokoro_model * model) {
     return model && tts_backend_is_vulkan(model->backend);
 }
 
+// 说明：前向声明（下面的 LSTM 融合工具函数需要用到）。
+static void kokoro_copy_to_f32(const ggml_tensor * src, float * dst, size_t n);
+
+// 说明：判断某个张量是否位于 Vulkan buffer 中。
+// - build_lstm_run() 属于“图构建期”工具函数，拿不到 runner_context/backend，因此只能从权重 tensor 的 buffer 类型推断。
+// - ggml-vulkan 当前不支持 GGML_OP_SET（但支持 SET_ROWS），因此 LSTM 的“set 输出预分配”只能在 CPU 下启用。
+static bool kokoro_tensor_on_vulkan(const ggml_tensor * t) {
+    if (!t || !t->buffer) {
+        return false;
+    }
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(t->buffer);
+    const char * name = ggml_backend_buft_name(buft);
+    return name && std::strncmp(name, "Vulkan", 6) == 0;
+}
+
 // 说明：为 Vulkan 额外权重分配独立 buffer，避免挤占主权重 buffer 的预留空间。
 static ggml_backend_buffer_t kokoro_alloc_extra_buffer(kokoro_model * model, size_t size, const char * tag) {
     if (!model || !model->buffer) {
@@ -82,6 +109,205 @@ static ggml_backend_buffer_t kokoro_alloc_extra_buffer(kokoro_model * model, siz
     }
     model->extra_buffers.push_back(buf);
     return buf;
+}
+
+// --------------------------- LSTM gate 融合（CPU） ---------------------------
+// 说明：
+// - Kokoro 的多处 LSTM 在 CPU 推理中占据可观时间；原实现每个 gate 做一次 mul_mat，并逐步 concat 输出，
+//   会产生大量 GEMM 重复与 O(T^2) 的拷贝。
+// - 这里在“模型加载后”把 I/F/G/O 四个 gate 的权重按输出维拼接成一个大矩阵，从而：
+//   - 输入投影：4 次 mul_mat -> 1 次 mul_mat
+//   - 隐状态投影：每步 4 次 mul_mat -> 每步 1 次 mul_mat
+//   - bias：预先做 b_x + b_h，推理时少一次 add
+// - 默认仅在 CPU 后端启用（Vulkan 下避免额外 buffer/拷贝与潜在不支持的算子组合）。
+static bool kokoro_env_cpu_lstm_fuse() {
+    // 默认开启；如需回退可设置：TTS_CPU_LSTM_FUSE=0
+    return tts_env_truthy_default("TTS_CPU_LSTM_FUSE", true);
+}
+
+static bool kokoro_env_cpu_lstm_set_output() {
+    // 默认开启；如需回退可设置：TTS_CPU_LSTM_SET_OUTPUT=0
+    return tts_env_truthy_default("TTS_CPU_LSTM_SET_OUTPUT", true);
+}
+
+static void kokoro_tensor_get_bytes(const ggml_tensor * t, void * dst, size_t bytes) {
+    if (!t || !dst || bytes == 0) {
+        return;
+    }
+    if (t->buffer) {
+        ggml_backend_tensor_get(t, dst, 0, bytes);
+    } else {
+        std::memcpy(dst, t->data, bytes);
+    }
+}
+
+static ggml_tensor * kokoro_alloc_and_set_extra_tensor(kokoro_model * model, ggml_tensor * t, const void * data, size_t bytes, const char * name) {
+    if (!model || !t) {
+        return nullptr;
+    }
+    if (name && *name) {
+        ggml_set_name(t, name);
+    }
+    ggml_backend_buffer_t buf = kokoro_alloc_extra_buffer(model, ggml_nbytes(t), name ? name : "kokoro.extra");
+    t->buffer = buf;
+    t->data = ggml_backend_buffer_get_base(buf);
+    if (data && bytes > 0) {
+        ggml_backend_tensor_set(t, data, 0, bytes);
+    }
+    return t;
+}
+
+static bool kokoro_is_f16_or_f32(ggml_type t) {
+    return t == GGML_TYPE_F16 || t == GGML_TYPE_F32;
+}
+
+static ggml_tensor * kokoro_fuse_mat4_outdim(kokoro_model * model,
+                                             const ggml_tensor * w0,
+                                             const ggml_tensor * w1,
+                                             const ggml_tensor * w2,
+                                             const ggml_tensor * w3,
+                                             const char * name) {
+    if (!model || !w0 || !w1 || !w2 || !w3) {
+        return nullptr;
+    }
+    if (ggml_n_dims(w0) != 2 || ggml_n_dims(w1) != 2 || ggml_n_dims(w2) != 2 || ggml_n_dims(w3) != 2) {
+        return nullptr;
+    }
+    if (w0->type != w1->type || w0->type != w2->type || w0->type != w3->type) {
+        return nullptr;
+    }
+    if (!kokoro_is_f16_or_f32(w0->type)) {
+        return nullptr;
+    }
+    if (w0->ne[0] != w1->ne[0] || w0->ne[0] != w2->ne[0] || w0->ne[0] != w3->ne[0]) {
+        return nullptr;
+    }
+    if (w0->ne[1] != w1->ne[1] || w0->ne[1] != w2->ne[1] || w0->ne[1] != w3->ne[1]) {
+        return nullptr;
+    }
+    // 权重张量应为连续内存；若不是连续，直接跳过融合（避免错误拼接）。
+    if (!ggml_is_contiguous(w0) || !ggml_is_contiguous(w1) || !ggml_is_contiguous(w2) || !ggml_is_contiguous(w3)) {
+        return nullptr;
+    }
+
+    const size_t part_bytes = ggml_nbytes(w0);
+    std::vector<uint8_t> p0(part_bytes);
+    std::vector<uint8_t> p1(part_bytes);
+    std::vector<uint8_t> p2(part_bytes);
+    std::vector<uint8_t> p3(part_bytes);
+    kokoro_tensor_get_bytes(w0, p0.data(), part_bytes);
+    kokoro_tensor_get_bytes(w1, p1.data(), part_bytes);
+    kokoro_tensor_get_bytes(w2, p2.data(), part_bytes);
+    kokoro_tensor_get_bytes(w3, p3.data(), part_bytes);
+
+    ggml_tensor * dst = ggml_new_tensor_2d(model->ctx, w0->type, w0->ne[0], w0->ne[1] * 4);
+    std::vector<uint8_t> out(part_bytes * 4);
+    std::memcpy(out.data() + part_bytes * 0, p0.data(), part_bytes);
+    std::memcpy(out.data() + part_bytes * 1, p1.data(), part_bytes);
+    std::memcpy(out.data() + part_bytes * 2, p2.data(), part_bytes);
+    std::memcpy(out.data() + part_bytes * 3, p3.data(), part_bytes);
+
+    return kokoro_alloc_and_set_extra_tensor(model, dst, out.data(), out.size(), name);
+}
+
+static ggml_tensor * kokoro_fuse_lstm_bias4_sum(kokoro_model * model,
+                                                const ggml_tensor * bx0, const ggml_tensor * bh0,
+                                                const ggml_tensor * bx1, const ggml_tensor * bh1,
+                                                const ggml_tensor * bx2, const ggml_tensor * bh2,
+                                                const ggml_tensor * bx3, const ggml_tensor * bh3,
+                                                const char * name) {
+    if (!model || !bx0 || !bh0 || !bx1 || !bh1 || !bx2 || !bh2 || !bx3 || !bh3) {
+        return nullptr;
+    }
+    const size_t n0 = ggml_nelements(bx0);
+    if (n0 == 0 ||
+        ggml_nelements(bh0) != n0 ||
+        ggml_nelements(bx1) != n0 || ggml_nelements(bh1) != n0 ||
+        ggml_nelements(bx2) != n0 || ggml_nelements(bh2) != n0 ||
+        ggml_nelements(bx3) != n0 || ggml_nelements(bh3) != n0) {
+        return nullptr;
+    }
+
+    std::vector<float> out(n0 * 4, 0.0f);
+    std::vector<float> bx(n0);
+    std::vector<float> bh(n0);
+
+    kokoro_copy_to_f32(bx0, bx.data(), n0);
+    kokoro_copy_to_f32(bh0, bh.data(), n0);
+    for (size_t i = 0; i < n0; ++i) {
+        out[i] = bx[i] + bh[i];
+    }
+
+    kokoro_copy_to_f32(bx1, bx.data(), n0);
+    kokoro_copy_to_f32(bh1, bh.data(), n0);
+    for (size_t i = 0; i < n0; ++i) {
+        out[n0 + i] = bx[i] + bh[i];
+    }
+
+    kokoro_copy_to_f32(bx2, bx.data(), n0);
+    kokoro_copy_to_f32(bh2, bh.data(), n0);
+    for (size_t i = 0; i < n0; ++i) {
+        out[n0 * 2 + i] = bx[i] + bh[i];
+    }
+
+    kokoro_copy_to_f32(bx3, bx.data(), n0);
+    kokoro_copy_to_f32(bh3, bh.data(), n0);
+    for (size_t i = 0; i < n0; ++i) {
+        out[n0 * 3 + i] = bx[i] + bh[i];
+    }
+
+    ggml_tensor * dst = ggml_new_tensor_1d(model->ctx, GGML_TYPE_F32, (int64_t) (n0 * 4));
+    return kokoro_alloc_and_set_extra_tensor(model, dst, out.data(), out.size() * sizeof(float), name);
+}
+
+static void kokoro_try_fuse_lstm_cell(kokoro_model * model, int lstm_index, int cell_index, lstm_cell * cell, bool reversed) {
+    if (!model || !cell) {
+        return;
+    }
+    // 仅在 CPU 后端启用：避免 Vulkan 额外 buffer/拷贝与不支持的算子（GGML_OP_SET）组合风险。
+    if (!kokoro_env_cpu_lstm_fuse() || kokoro_use_vk_weights(model)) {
+        return;
+    }
+
+    std::vector<ggml_tensor *> & w = reversed ? cell->reverse_weights : cell->weights;
+    std::vector<ggml_tensor *> & b = reversed ? cell->reverse_biases : cell->biases;
+    if (w.size() < 8 || b.size() < 8) {
+        return;
+    }
+    for (int i = 0; i < 8; ++i) {
+        if (!w[i] || !b[i]) {
+            return;
+        }
+    }
+
+    // 如果权重已经位于 Vulkan buffer，说明当前模型不是 CPU 后端，直接跳过。
+    if (kokoro_tensor_on_vulkan(w[0])) {
+        return;
+    }
+
+    char name_wx[128];
+    char name_wh[128];
+    char name_b[128];
+    std::snprintf(name_wx, sizeof(name_wx), "kokoro.lstm%d.cell%d.%s_fused_wx", lstm_index, cell_index, reversed ? "rev" : "fwd");
+    std::snprintf(name_wh, sizeof(name_wh), "kokoro.lstm%d.cell%d.%s_fused_wh", lstm_index, cell_index, reversed ? "rev" : "fwd");
+    std::snprintf(name_b,  sizeof(name_b),  "kokoro.lstm%d.cell%d.%s_fused_b",  lstm_index, cell_index, reversed ? "rev" : "fwd");
+
+    ggml_tensor * fused_wx = kokoro_fuse_mat4_outdim(model, w[0], w[2], w[4], w[6], name_wx);
+    ggml_tensor * fused_wh = kokoro_fuse_mat4_outdim(model, w[1], w[3], w[5], w[7], name_wh);
+    ggml_tensor * fused_b  = kokoro_fuse_lstm_bias4_sum(model,
+                                                       /*I=*/b[0], b[1],
+                                                       /*F=*/b[2], b[3],
+                                                       /*G=*/b[4], b[5],
+                                                       /*O=*/b[6], b[7],
+                                                       name_b);
+    if (!fused_wx || !fused_wh || !fused_b) {
+        return;
+    }
+
+    lstm_cell::fused_gates & dst = reversed ? cell->fused_reverse : cell->fused;
+    dst.w_x = fused_wx;
+    dst.w_h = fused_wh;
+    dst.b   = fused_b;
 }
 
 static ggml_tensor * kokoro_new_tensor_like(ggml_context * ctx, ggml_type type, const ggml_tensor * src) {
@@ -546,7 +772,7 @@ static struct ggml_tensor * build_albert_norm(ggml_context * ctx, ggml_tensor * 
     return cur;
 }
 
-static struct ggml_tensor * build_lstm_run(ggml_context * ctx, ggml_cgraph * gf, ggml_tensor * input, ggml_tensor * h_0, ggml_tensor * c_0, std::vector<ggml_tensor*> weights, std::vector<ggml_tensor*> biases, uint32_t sequence_length, bool reversed = false);
+static struct ggml_tensor * build_lstm_run(ggml_context * ctx, ggml_cgraph * gf, ggml_tensor * input, ggml_tensor * h_0, ggml_tensor * c_0, const lstm_cell * cell, uint32_t sequence_length, bool reversed = false);
 
 static struct ggml_tensor * build_lstm(ggml_context * ctx, ggml_tensor * input, lstm* rnn, uint32_t sequence_length, ggml_cgraph * gf) {
 	struct ggml_tensor * resp = input;
@@ -555,9 +781,9 @@ static struct ggml_tensor * build_lstm(ggml_context * ctx, ggml_tensor * input, 
 	// iterate over cells first so that at each pass to the next cell we have a fully formed vector (this improves performance as well as allocation for stacked lstms)
 	for (int c = 0; c < rnn->cells.size(); c++) {
 		ggml_build_forward_expand(gf, resp);
-		resp = build_lstm_run(ctx, gf, resp, rnn->hidden[c], rnn->states[c], rnn->cells[c]->weights, rnn->cells[c]->biases, sequence_length);
+		resp = build_lstm_run(ctx, gf, resp, rnn->hidden[c], rnn->states[c], rnn->cells[c], sequence_length);
 		if (rnn->bidirectional) {
-			reverse_resp = build_lstm_run(ctx, gf, reverse_resp, rnn->hidden[c], rnn->states[c], rnn->cells[c]->reverse_weights, rnn->cells[c]->reverse_biases, sequence_length, true);
+			reverse_resp = build_lstm_run(ctx, gf, reverse_resp, rnn->hidden[c], rnn->states[c], rnn->cells[c], sequence_length, true);
 		}
 	}
 	if (rnn->bidirectional) {
@@ -566,36 +792,106 @@ static struct ggml_tensor * build_lstm(ggml_context * ctx, ggml_tensor * input, 
 	return resp;
 }
 
-static struct ggml_tensor * build_lstm_run(ggml_context * ctx, ggml_cgraph * gf, ggml_tensor * input, ggml_tensor * h_0, ggml_tensor * c_0, std::vector<ggml_tensor*> weights, std::vector<ggml_tensor*> biases, uint32_t sequence_length, bool reversed) {
+static struct ggml_tensor * build_lstm_run(ggml_context * ctx, ggml_cgraph * gf, ggml_tensor * input, ggml_tensor * h_0, ggml_tensor * c_0, const lstm_cell * cell, uint32_t sequence_length, bool reversed) {
+	const std::vector<ggml_tensor*> & weights = reversed ? cell->reverse_weights : cell->weights;
+	const std::vector<ggml_tensor*> & biases  = reversed ? cell->reverse_biases  : cell->biases;
+
+	const lstm_cell::fused_gates & fused = reversed ? cell->fused_reverse : cell->fused;
+	const bool is_vulkan = !weights.empty() && kokoro_tensor_on_vulkan(weights[0]);
+
+	// 说明：逐步 concat 会产生 O(T^2) 的拷贝；CPU 下用 ggml_set_2d_inplace 直接写入预分配输出，可显著降低开销。
+	const bool use_set_output = !is_vulkan && kokoro_env_cpu_lstm_set_output();
+
+	// 说明：若存在 fused gate 权重（仅 CPU 后端预处理生成），优先使用以减少 mul_mat 次数。
+	const bool use_fused = !is_vulkan && fused.w_x && fused.w_h && fused.b;
+
+	struct ggml_tensor * outputs = nullptr;
+	if (use_set_output) {
+		// 输出张量形状：[hidden, T, batch]；batch 一般为 1，但保持与输入一致。
+		const int64_t hidden = weights.empty() ? 0 : weights[0]->ne[1];
+		const int64_t batch  = input ? input->ne[2] : 1;
+		outputs = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hidden, sequence_length, batch);
+	}
+
+	if (use_fused) {
+		// gates_x: [4*hidden, T, batch]，已包含 (b_x + b_h) 的合并 bias。
+		struct ggml_tensor * gates_x = ggml_add(ctx, ggml_mul_mat(ctx, fused.w_x, input), fused.b);
+		const int64_t hidden = fused.w_h->ne[0];
+
+		for (int index = 0; index < (int) sequence_length; ++index) {
+			const int t = reversed ? (int) sequence_length - 1 - index : index;
+
+			struct ggml_tensor * gates_x_t = ggml_view_3d(ctx, gates_x, gates_x->ne[0], 1, gates_x->ne[2],
+			                                             gates_x->nb[0], gates_x->nb[1], gates_x->nb[1] * t);
+			// gates_h: [4*hidden, 1, batch]（不再单独加 b_h，bias 已合并进 gates_x）
+			struct ggml_tensor * gates_h = ggml_mul_mat(ctx, fused.w_h, h_0);
+			struct ggml_tensor * gates   = ggml_add(ctx, gates_x_t, gates_h);
+
+			const size_t gate_off = (size_t) hidden * gates->nb[0];
+			struct ggml_tensor * I_cur = ggml_sigmoid(ctx, ggml_view_3d(ctx, gates, hidden, 1, gates->ne[2], gates->nb[0], gates->nb[1], gate_off * 0));
+			struct ggml_tensor * F_cur = ggml_sigmoid(ctx, ggml_view_3d(ctx, gates, hidden, 1, gates->ne[2], gates->nb[0], gates->nb[1], gate_off * 1));
+			struct ggml_tensor * G_cur = ggml_tanh   (ctx, ggml_view_3d(ctx, gates, hidden, 1, gates->ne[2], gates->nb[0], gates->nb[1], gate_off * 2));
+			struct ggml_tensor * O_cur = ggml_sigmoid(ctx, ggml_view_3d(ctx, gates, hidden, 1, gates->ne[2], gates->nb[0], gates->nb[1], gate_off * 3));
+
+			c_0 = ggml_add(ctx, ggml_mul(ctx, F_cur, c_0), ggml_mul(ctx, I_cur, G_cur));
+			h_0 = ggml_mul(ctx, ggml_tanh(ctx, c_0), O_cur);
+
+			if (use_set_output) {
+				// 说明：写入 outputs[:, t]，保证即便 reversed 扫描也能得到“时间正序”的输出。
+				struct ggml_tensor * h_cont = tts_cont_if_needed(ctx, h_0);
+				const size_t off = (size_t) outputs->nb[1] * (size_t) t;
+				outputs = ggml_set_2d_inplace(ctx, outputs, h_cont, outputs->nb[1], off);
+			} else {
+				// Vulkan / 兼容回退：保持旧的 concat 实现。
+				if (index == 0) {
+					outputs = h_0;
+				} else {
+					outputs = reversed ? ggml_concat(ctx, h_0, outputs, 1) : ggml_concat(ctx, outputs, h_0, 1);
+				}
+			}
+
+			ggml_build_forward_expand(gf, outputs);
+		}
+
+		return outputs;
+	}
+
+	// --------------------------- 未融合：保留原始实现（并在 CPU 下可选使用 set 输出） ---------------------------
 	struct ggml_tensor * I = ggml_add(ctx, ggml_mul_mat(ctx, weights[0], input), biases[0]);
 	struct ggml_tensor * F = ggml_add(ctx, ggml_mul_mat(ctx, weights[2], input), biases[2]);
 	struct ggml_tensor * G = ggml_add(ctx, ggml_mul_mat(ctx, weights[4], input), biases[4]);
 	struct ggml_tensor * O = ggml_add(ctx, ggml_mul_mat(ctx, weights[6], input), biases[6]);
 
-	struct ggml_tensor * outputs;
+	for (int index = 0; index < (int) sequence_length; index++) {
+		const int t = reversed ? (int) sequence_length - 1 - index : index;
 
-	for (int index = 0; index < sequence_length; index++) {
-		int i = reversed ? sequence_length - 1 - index : index;
-		struct ggml_tensor * I_cur = ggml_view_3d(ctx, I, I->ne[0], 1, I->ne[2], I->nb[0], I->nb[1], I->nb[1]*i);
+		struct ggml_tensor * I_cur = ggml_view_3d(ctx, I, I->ne[0], 1, I->ne[2], I->nb[0], I->nb[1], I->nb[1] * t);
 		I_cur = ggml_sigmoid(ctx, ggml_add(ctx, I_cur, ggml_add(ctx, ggml_mul_mat(ctx, weights[1], h_0), biases[1])));
 
-		struct ggml_tensor * F_cur = ggml_view_3d(ctx, F, F->ne[0], 1, F->ne[2], F->nb[0], F->nb[1], F->nb[1]*i);
+		struct ggml_tensor * F_cur = ggml_view_3d(ctx, F, F->ne[0], 1, F->ne[2], F->nb[0], F->nb[1], F->nb[1] * t);
 		F_cur = ggml_sigmoid(ctx, ggml_add(ctx, F_cur, ggml_add(ctx, ggml_mul_mat(ctx, weights[3], h_0), biases[3])));
 
-		struct ggml_tensor * G_cur = ggml_view_3d(ctx, G, G->ne[0], 1, G->ne[2], G->nb[0], G->nb[1], G->nb[1]*i);
+		struct ggml_tensor * G_cur = ggml_view_3d(ctx, G, G->ne[0], 1, G->ne[2], G->nb[0], G->nb[1], G->nb[1] * t);
 		G_cur = ggml_tanh(ctx, ggml_add(ctx, G_cur, ggml_add(ctx, ggml_mul_mat(ctx, weights[5], h_0), biases[5])));
 
-		struct ggml_tensor * O_cur = ggml_view_3d(ctx, O, O->ne[0], 1, O->ne[2], O->nb[0], O->nb[1], O->nb[1]*i);
+		struct ggml_tensor * O_cur = ggml_view_3d(ctx, O, O->ne[0], 1, O->ne[2], O->nb[0], O->nb[1], O->nb[1] * t);
 		O_cur = ggml_sigmoid(ctx, ggml_add(ctx, O_cur, ggml_add(ctx, ggml_mul_mat(ctx, weights[7], h_0), biases[7])));
 
 		c_0 = ggml_add(ctx, ggml_mul(ctx, F_cur, c_0), ggml_mul(ctx, I_cur, G_cur));
 		h_0 = ggml_mul(ctx, ggml_tanh(ctx, c_0), O_cur);
 
-		if (index == 0) {
-			outputs = h_0;
+		if (use_set_output) {
+			struct ggml_tensor * h_cont = tts_cont_if_needed(ctx, h_0);
+			const size_t off = (size_t) outputs->nb[1] * (size_t) t;
+			outputs = ggml_set_2d_inplace(ctx, outputs, h_cont, outputs->nb[1], off);
 		} else {
-			outputs = reversed ? ggml_concat(ctx, h_0, outputs, 1) : ggml_concat(ctx, outputs, h_0, 1);
+			if (index == 0) {
+				outputs = h_0;
+			} else {
+				outputs = reversed ? ggml_concat(ctx, h_0, outputs, 1) : ggml_concat(ctx, outputs, h_0, 1);
+			}
 		}
+
 		ggml_build_forward_expand(gf, outputs);
 	}
 	return outputs;
@@ -937,10 +1233,10 @@ void kokoro_model::post_load_assign() {
 	ggml_backend_tensor_set(sqrt_tensor, &sqrt2, 0, size);
 
 	std::vector<float> data{};
-	for (int l = 0; l < lstms.size(); l++) {
-		lstm * rnn = lstms[l];
-		const int32_t hidden_size = rnn->cells[0]->biases[0]->ne[0];
-		data.resize(hidden_size);
+ 	for (int l = 0; l < lstms.size(); l++) {
+ 		lstm * rnn = lstms[l];
+ 		const int32_t hidden_size = rnn->cells[0]->biases[0]->ne[0];
+ 		data.resize(hidden_size);
  
  		for (int i = 0; i < rnn->cells.size(); i++) {
  			struct ggml_tensor * h = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hidden_size);
@@ -955,12 +1251,31 @@ void kokoro_model::post_load_assign() {
      		rnn->hidden.push_back(h);
      		rnn->states.push_back(s);
  		}
- 		data.clear();
-	}
+  		data.clear();
+ 	}
 
- 	if (window == "hann") {
-		// 说明：保留一份 CPU 侧窗函数缓存，用于输入准备时计算 window_sq_sum。
-		decoder->generator->window_host.clear();
+    // 说明：CPU LSTM gate 融合权重的预处理（一次性）。
+    // - 通过把 I/F/G/O 四个 gate 的权重拼接为一个大矩阵，减少 mul_mat 次数；
+    // - 同时把 b_x + b_h 提前合并，减少每步 add。
+    // - 仅在 CPU 后端启用（Vulkan 默认关闭）。
+    if (!kokoro_use_vk_weights(this) && kokoro_env_cpu_lstm_fuse()) {
+        for (int l = 0; l < (int) lstms.size(); ++l) {
+            lstm * rnn = lstms[l];
+            if (!rnn) {
+                continue;
+            }
+            for (int c = 0; c < (int) rnn->cells.size(); ++c) {
+                kokoro_try_fuse_lstm_cell(this, l, c, rnn->cells[c], /*reversed=*/false);
+                if (rnn->bidirectional) {
+                    kokoro_try_fuse_lstm_cell(this, l, c, rnn->cells[c], /*reversed=*/true);
+                }
+            }
+        }
+    }
+
+  	if (window == "hann") {
+ 		// 说明：保留一份 CPU 侧窗函数缓存，用于输入准备时计算 window_sq_sum。
+ 		decoder->generator->window_host.clear();
 		decoder->generator->window_host.reserve(true_n_fft);
  		hann_window(true_n_fft, decoder->generator->window_host);
  		decoder->generator->window = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, true_n_fft);
@@ -1766,8 +2081,23 @@ void kokoro_duration_runner::run(kokoro_ubatch & batch) {
 
     // the output is always the last tensor in the graph
     struct ggml_tensor * lens = gf->nodes[gf->n_nodes - 1];
-    // the reused duration hidden states are computed before a node chunk which has a size that is sequence length dependent
-    struct ggml_tensor * hidden_states = gf->nodes[gf->n_nodes - 22 - 52 * batch.n_tokens];
+
+    // 说明：duration 阶段需要把 token 级隐藏状态导出给 generator 使用。
+    // 旧实现通过“固定偏移”从 gf->nodes 里取 hidden_states 指针；但图结构一旦微调（例如 LSTM 优化/算子替换），
+    // 节点数量与顺序就会变化，导致取到错误节点并引发输出尺寸不匹配。
+    // 这里改为按名称查找（build_kokoro_duration_graph 内已将其命名为 "duration_hidden_states"），更稳健。
+    struct ggml_tensor * hidden_states = nullptr;
+    for (int i = gf->n_nodes - 1; i >= 0; --i) {
+        ggml_tensor * node = gf->nodes[i];
+        const char * n = node ? ggml_get_name(node) : nullptr;
+        if (n && std::strcmp(n, "duration_hidden_states") == 0) {
+            hidden_states = node;
+            break;
+        }
+    }
+    if (!hidden_states) {
+        TTS_ABORT("Kokoro 时长图未找到节点 'duration_hidden_states'，无法导出隐藏状态。\n");
+    }
     kokoro_force_inputs_backend(kctx, gf);
     kokoro_force_custom_views_cpu(kctx, gf);
     bool alloc_ok = ggml_backend_sched_alloc_graph(kctx->sched, gf);

@@ -16,7 +16,14 @@ target_sources(tts PRIVATE
 )
 
 # 内置中文词典（默认开启）：把 dict/pinyin_phrase.txt / dict/pinyin.txt 编译进二进制，便于移植。
-option(TTS_KOKORO_ZH_DICT_BUILTIN "TTS.cpp: embed Kokoro zh pinyin dictionaries into binary" ON)
+# 但在 MSVC 下，单个字符串常量长度存在上限：pinyin_phrase.txt 约 10MB，会触发编译错误 C2026（字符串太大）。
+# 因此：MSVC 默认关闭；其他工具链保持默认开启（可通过 -DTTS_KOKORO_ZH_DICT_BUILTIN=ON/OFF 显式覆盖）。
+set(_TTS_KOKORO_ZH_DICT_BUILTIN_DEFAULT ON)
+if (MSVC)
+    set(_TTS_KOKORO_ZH_DICT_BUILTIN_DEFAULT OFF)
+endif()
+option(TTS_KOKORO_ZH_DICT_BUILTIN "TTS.cpp: embed Kokoro zh pinyin dictionaries into binary" ${_TTS_KOKORO_ZH_DICT_BUILTIN_DEFAULT})
+unset(_TTS_KOKORO_ZH_DICT_BUILTIN_DEFAULT)
 if (TTS_KOKORO_ZH_DICT_BUILTIN)
     set(_TTS_ZH_PHRASE_DICT "${CMAKE_SOURCE_DIR}/dict/pinyin_phrase.txt")
     set(_TTS_ZH_SINGLE_DICT "${CMAKE_SOURCE_DIR}/dict/pinyin.txt")

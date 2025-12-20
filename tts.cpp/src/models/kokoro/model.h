@@ -21,10 +21,27 @@ extern const struct kokoro_model_loader final : tts_model_loader {
 //   - zh_frontend 中文前端
 
 struct lstm_cell {
+	// 说明：LSTM 的 gate 融合权重（CPU 优化）。
+	// - 原实现每个 gate 都做一次 mul_mat（共 8 次：4 个输入投影 + 4 个隐状态投影），并逐步 concat 输出，CPU 上开销很大。
+	// - 这里将 I/F/G/O 四个 gate 在输出维拼成一个大矩阵：
+	//   - fused_w_x: [in_dim, 4*hidden]   （输入投影，按 I/F/G/O 顺序拼接）
+	//   - fused_w_h: [hidden, 4*hidden]   （隐状态投影，按 I/F/G/O 顺序拼接）
+	//   - fused_b  : [4*hidden]           （bias 直接预先做 b_x + b_h，推理时少一次 add）
+	// - Vulkan 路径默认不启用该融合（避免额外拷贝/兼容性风险）。
+	struct fused_gates {
+		ggml_tensor * w_x = nullptr;
+		ggml_tensor * w_h = nullptr;
+		ggml_tensor * b   = nullptr;
+	};
+
 	std::vector<ggml_tensor*> weights;
 	std::vector<ggml_tensor*> biases;
 	std::vector<ggml_tensor*> reverse_weights;
 	std::vector<ggml_tensor*> reverse_biases;
+
+	// 正向/反向（bidirectional）各一份融合后的 gate 权重。
+	fused_gates fused;
+	fused_gates fused_reverse;
 };
 
 struct lstm {

@@ -380,6 +380,17 @@ function Build-TTS([string]$device,[string]$arch) {
   $project = 'tts.cpp'
   $binaryName = 'tts-cli.exe'
   $cpuLikeDevices = @('cpu','cpu-noavx')
+  $needExternalZhDict = ($script:CompilerMode -in @('msvc','ninja'))
+  $src = Resolve-Src 'tts.cpp' $TTSSrc 'TTS_SRC' @((Join-Path $ROOT 'tts.cpp'), (Join-Path $EXTERN 'tts.cpp'))
+  if (-not $src) { throw "tts.cpp source not found. Provide -TTSSrc or set TTS_SRC or place repo at .\tts.cpp or .\external\tts.cpp." }
+
+  function Copy-TtsZhDict([string]$srcRoot,[string]$outDir) {
+    $dictSrc = Join-Path $srcRoot 'dict'
+    if (-not (Test-Path $dictSrc)) { return }
+    $dictDst = Join-Path $outDir 'dict'
+    New-Item -ItemType Directory -Force -Path $dictDst | Out-Null
+    Copy-Item -Path (Join-Path $dictSrc '*') -Destination $dictDst -Recurse -Force
+  }
 
   # For now, ship Vulkan build in CUDA folder as a drop-in replacement.
   if ($device -eq 'cuda') {
@@ -402,6 +413,7 @@ function Build-TTS([string]$device,[string]$arch) {
     New-Item -ItemType Directory -Force -Path $targetDir | Out-Null
     Copy-Item $cpuBinary -Destination $targetDir -Force
     Write-Host "Copied $(Split-Path $cpuBinary -Leaf) -> $targetDir"
+    if ($needExternalZhDict) { Copy-TtsZhDict $src $targetDir }
     return
   }
 
@@ -421,12 +433,11 @@ function Build-TTS([string]$device,[string]$arch) {
     New-Item -ItemType Directory -Force -Path $targetDir | Out-Null
     Copy-Item $cpuBinary -Destination $targetDir -Force
     Write-Host "Copied $(Split-Path $cpuBinary -Leaf) -> $targetDir"
+    if ($needExternalZhDict) { Copy-TtsZhDict $src $targetDir }
     return
   }
 
   $targetOutDir = Get-ProjectOutDir $arch $device $project
-  $src = Resolve-Src 'tts.cpp' $TTSSrc 'TTS_SRC' @((Join-Path $ROOT 'tts.cpp'), (Join-Path $EXTERN 'tts.cpp'))
-  if (-not $src) { throw "tts.cpp source not found. Provide -TTSSrc or set TTS_SRC or place repo at .\tts.cpp or .\external\tts.cpp." }
   Show-Version 'tts.cpp' $src $TTS_EXPECT_REF ''
   $bdir = Join-Path (Join-Path $BUILD 'tts.cpp') $device
   if ($Clean) { Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $bdir }
@@ -435,12 +446,17 @@ function Build-TTS([string]$device,[string]$arch) {
     'vulkan' {  $defs += @('-D','GGML_VULKAN=ON','-D','GGML_CUDA=OFF','-D','GGML_OPENCL=OFF') }
     default  { $defs += @('-D','GGML_VULKAN=OFF','-D','GGML_CUDA=OFF','-D','GGML_OPENCL=OFF') }
   }
+  if ($needExternalZhDict) {
+    # MSVC: disable builtin zh dict (string literal too large, C2026).
+    $defs += @('-D','TTS_KOKORO_ZH_DICT_BUILTIN=OFF')
+  }
   $defs = Add-MingwCpuAccelGuards -defs $defs -device $device
   $gen = $GeneratorSpec
   Invoke-CMakeConfigure $src $bdir $gen $defs
   if ($device -eq 'vulkan') { Assert-BackendEnabled $bdir $device 'tts.cpp' }
   Invoke-CMakeBuild $bdir @('tts-cli')
   Copy-Binary $bdir 'tts-cli' $targetOutDir
+  if ($needExternalZhDict) { Copy-TtsZhDict $src $targetOutDir }
 
   if ($device -eq 'vulkan') {
     $vkBinary = Join-Path $targetOutDir $binaryName
@@ -449,6 +465,7 @@ function Build-TTS([string]$device,[string]$arch) {
       New-Item -ItemType Directory -Force -Path $cudaOutDir | Out-Null
       Copy-Item $vkBinary -Destination $cudaOutDir -Force
       Write-Host "Copied $(Split-Path $vkBinary -Leaf) -> $cudaOutDir"
+      if ($needExternalZhDict) { Copy-TtsZhDict $src $cudaOutDir }
     } else {
       Write-Warning "tts.cpp: Vulkan binary missing after build; cannot populate CUDA dir"
     }
