@@ -379,61 +379,78 @@ function Build-SD([string]$device,[string]$arch) {
 function Build-TTS([string]$device,[string]$arch) {
   $project = 'tts.cpp'
   $binaryName = 'tts-cli.exe'
-  $cpuOutDir = Get-ProjectOutDir $arch 'cpu' $project
   $cpuLikeDevices = @('cpu','cpu-noavx')
-  if ($device -notin $cpuLikeDevices) {
-    $targetDir = Get-ProjectOutDir $arch $device $project
-    $targetBinary = Join-Path $targetDir $binaryName
-    if (Test-Path $targetBinary) {
-      Write-Host "[info] tts.cpp: reusing CPU binary for device '$device'"
+
+  # For now, ship Vulkan build in CUDA folder as a drop-in replacement.
+  if ($device -eq 'cuda') {
+    if (Can-Vulkan) {
+      Build-TTS 'vulkan' $arch
       return
     }
+    Write-Warning "tts.cpp: Vulkan not detected; falling back to CPU binary for device 'cuda'"
+    $cpuOutDir = Get-ProjectOutDir $arch 'cpu' $project
     $cpuBinary = Join-Path $cpuOutDir $binaryName
     if (-not (Test-Path $cpuBinary)) {
       Write-Host "[info] tts.cpp: CPU binary missing; building CPU variant first."
       Build-TTS 'cpu' $arch
-      if (Test-Path $targetBinary) {
-        Write-Host "[info] tts.cpp: populated device '$device' from CPU build"
-        return
-      }
     }
     if (-not (Test-Path $cpuBinary)) {
-      Write-Warning "tts.cpp: CPU binary unavailable; cannot populate device '$device'"
+      Write-Warning "tts.cpp: CPU binary unavailable; cannot populate device 'cuda'"
       return
     }
+    $targetDir = Get-ProjectOutDir $arch 'cuda' $project
     New-Item -ItemType Directory -Force -Path $targetDir | Out-Null
     Copy-Item $cpuBinary -Destination $targetDir -Force
     Write-Host "Copied $(Split-Path $cpuBinary -Leaf) -> $targetDir"
     return
   }
-  $targetOutDir = if ($device -eq 'cpu') { $cpuOutDir } else { Get-ProjectOutDir $arch $device $project }
+
+  # Keep other non-CPU devices CPU-only for now (populate their dirs from CPU build).
+  if (($device -notin $cpuLikeDevices) -and ($device -ne 'vulkan')) {
+    $cpuOutDir = Get-ProjectOutDir $arch 'cpu' $project
+    $cpuBinary = Join-Path $cpuOutDir $binaryName
+    if (-not (Test-Path $cpuBinary)) {
+      Write-Host "[info] tts.cpp: CPU binary missing; building CPU variant first."
+      Build-TTS 'cpu' $arch
+    }
+    if (-not (Test-Path $cpuBinary)) {
+      Write-Warning "tts.cpp: CPU binary unavailable; cannot populate device '$device'"
+      return
+    }
+    $targetDir = Get-ProjectOutDir $arch $device $project
+    New-Item -ItemType Directory -Force -Path $targetDir | Out-Null
+    Copy-Item $cpuBinary -Destination $targetDir -Force
+    Write-Host "Copied $(Split-Path $cpuBinary -Leaf) -> $targetDir"
+    return
+  }
+
+  $targetOutDir = Get-ProjectOutDir $arch $device $project
   $src = Resolve-Src 'tts.cpp' $TTSSrc 'TTS_SRC' @((Join-Path $ROOT 'tts.cpp'), (Join-Path $EXTERN 'tts.cpp'))
   if (-not $src) { throw "tts.cpp source not found. Provide -TTSSrc or set TTS_SRC or place repo at .\tts.cpp or .\external\tts.cpp." }
   Show-Version 'tts.cpp' $src $TTS_EXPECT_REF ''
   $bdir = Join-Path (Join-Path $BUILD 'tts.cpp') $device
   if ($Clean) { Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $bdir }
-  $defs = @(
-    '-D','TTS_BUILD_EXAMPLES=ON',
-    '-D','GGML_VULKAN=OFF',
-    '-D','GGML_CUDA=OFF',
-    '-D','GGML_OPENCL=OFF'
-  )
+  $defs = @('-D','TTS_BUILD_EXAMPLES=ON')
+  switch ($device) {
+    'vulkan' {  $defs += @('-D','GGML_VULKAN=ON','-D','GGML_CUDA=OFF','-D','GGML_OPENCL=OFF') }
+    default  { $defs += @('-D','GGML_VULKAN=OFF','-D','GGML_CUDA=OFF','-D','GGML_OPENCL=OFF') }
+  }
   $defs = Add-MingwCpuAccelGuards -defs $defs -device $device
   $gen = $GeneratorSpec
   Invoke-CMakeConfigure $src $bdir $gen $defs
-  if ($device -in @('vulkan','cuda','opencl')) { Assert-BackendEnabled $bdir $device 'tts.cpp' }
+  if ($device -eq 'vulkan') { Assert-BackendEnabled $bdir $device 'tts.cpp' }
   Invoke-CMakeBuild $bdir @('tts-cli')
   Copy-Binary $bdir 'tts-cli' $targetOutDir
-  if ($device -eq 'cpu') {
-    $cpuBinary = Join-Path $targetOutDir $binaryName
-    if ((Test-Path $cpuBinary) -and $script:AllDevices -and ($script:AllDevices.Count -gt 0)) {
-      foreach ($extra in $script:AllDevices) {
-        if ($extra -in @('cpu','cpu-noavx')) { continue }
-        $extraDir = Get-ProjectOutDir $arch $extra $project
-        New-Item -ItemType Directory -Force -Path $extraDir | Out-Null
-        Copy-Item $cpuBinary -Destination $extraDir -Force
-        Write-Host "Copied $(Split-Path $cpuBinary -Leaf) -> $extraDir"
-      }
+
+  if ($device -eq 'vulkan') {
+    $vkBinary = Join-Path $targetOutDir $binaryName
+    if (Test-Path $vkBinary) {
+      $cudaOutDir = Get-ProjectOutDir $arch 'cuda' $project
+      New-Item -ItemType Directory -Force -Path $cudaOutDir | Out-Null
+      Copy-Item $vkBinary -Destination $cudaOutDir -Force
+      Write-Host "Copied $(Split-Path $vkBinary -Leaf) -> $cudaOutDir"
+    } else {
+      Write-Warning "tts.cpp: Vulkan binary missing after build; cannot populate CUDA dir"
     }
   }
 }

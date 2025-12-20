@@ -50,13 +50,12 @@ if [[ -n "${TTS_CMAKE_ARGS:-}" ]]; then
   TTS_CMAKE_ARGS_ARR=(${TTS_CMAKE_ARGS})
 fi
 
-# Toolchain overrides for tts.cpp (auto-detect clang unless overridden)
-: "${TTS_CC:=clang-14}"
-: "${TTS_CXX:=clang++-14}"
+# Toolchain overrides for tts.cpp (optional; empty => CMake default toolchain)
+: "${TTS_CC:=}"
+: "${TTS_CXX:=}"
 : "${TTS_USE_LIBCXX:=auto}"
 : "${TTS_STATIC_STDLIB:=auto}"
 : "${TTS_LIBCXX_FLAG:=-stdlib=libc++}"
-: "${TTS_MIN_CLANG_MAJOR:=14}"
 
 # Pinned refs (only checked and warned; no automatic checkout)
 LLAMA_EXPECT_REF="b6880"
@@ -396,32 +395,57 @@ build_tts() {
   local device="$1" os="$2" arch="$3" exe_suf="$4"
   local project="tts.cpp"
   local bin_name="tts-cli$exe_suf"
-  local cpu_out="$OUT_DIR/$arch/$os/cpu/$project"
-  local cpu_bin="$cpu_out/$bin_name"
-  if [[ "$device" != "cpu" ]]; then
-    local target_dir="$OUT_DIR/$arch/$os/$device/$project"
-    local target_bin="$target_dir/$bin_name"
-    if [[ -f "$target_bin" ]]; then
-      echo "[info] tts.cpp: reusing CPU binary for device '$device'"
-      return 0
-    fi
-    if [[ ! -f "$cpu_bin" ]]; then
-      echo "[info] tts.cpp: CPU binary missing; building CPU variant first."
+
+  # For now, ship Vulkan build in CUDA folder as a drop-in replacement.
+  if [[ "$device" == "cuda" ]]; then
+    if ! can_vulkan; then
+      echo "[warn] tts.cpp: Vulkan not detected; falling back to CPU binary for device 'cuda'" >&2
       build_tts cpu "$os" "$arch" "$exe_suf"
-    fi
-    if [[ -f "$target_bin" ]]; then
-      echo "[info] tts.cpp: populated device '$device' from CPU build"
+      local cpu_out="$OUT_DIR/$arch/$os/cpu/$project"
+      local cpu_bin="$cpu_out/$bin_name"
+      if [[ -f "$cpu_bin" ]]; then
+        local cuda_out="$OUT_DIR/$arch/$os/cuda/$project"
+        mkdir -p "$cuda_out"
+        cp -f "$cpu_bin" "$cuda_out/"
+        echo "Copied $(basename "$cpu_bin") -> $cuda_out"
+      else
+        echo "[warn] tts.cpp: CPU binary unavailable; cannot populate device 'cuda'" >&2
+      fi
       return 0
     fi
-    if [[ ! -f "$cpu_bin" ]]; then
-      echo "[warn] tts.cpp: CPU binary unavailable; cannot populate device '$device'" >&2
-      return 0
+
+    local vk_out="$OUT_DIR/$arch/$os/vulkan/$project"
+    local vk_bin="$vk_out/$bin_name"
+    if [[ $CLEAN -eq 1 || ! -f "$vk_bin" ]]; then
+      build_tts vulkan "$os" "$arch" "$exe_suf"
     fi
-    mkdir -p "$target_dir"
-    cp -f "$cpu_bin" "$target_dir/"
-    echo "Copied $(basename "$cpu_bin") -> $target_dir"
+    local cuda_out="$OUT_DIR/$arch/$os/cuda/$project"
+    mkdir -p "$cuda_out"
+    if [[ -f "$vk_bin" ]]; then
+      cp -f "$vk_bin" "$cuda_out/"
+      echo "Copied $(basename "$vk_bin") -> $cuda_out"
+    else
+      echo "[warn] tts.cpp: Vulkan binary unavailable; cannot populate device 'cuda'" >&2
+    fi
     return 0
   fi
+
+  # Keep OpenCL builds CPU-only for now (populate OpenCL dir from CPU build).
+  if [[ "$device" == "opencl" ]]; then
+    build_tts cpu "$os" "$arch" "$exe_suf"
+    local cpu_out="$OUT_DIR/$arch/$os/cpu/$project"
+    local cpu_bin="$cpu_out/$bin_name"
+    local target_dir="$OUT_DIR/$arch/$os/$device/$project"
+    if [[ -f "$cpu_bin" ]]; then
+      mkdir -p "$target_dir"
+      cp -f "$cpu_bin" "$target_dir/"
+      echo "Copied $(basename "$cpu_bin") -> $target_dir"
+    else
+      echo "[warn] tts.cpp: CPU binary unavailable; cannot populate device '$device'" >&2
+    fi
+    return 0
+  fi
+
   local src
   src="$(resolve_src_dir tts "$TTS_SRC_CLI" TTS_SRC)"
   if [[ -z "$src" ]]; then
@@ -433,48 +457,8 @@ build_tts() {
   if [[ $CLEAN -eq 1 ]]; then rm -rf "$bdir"; fi
   local desired_cc="${TTS_CC:-}"
   local desired_cxx="${TTS_CXX:-}"
-  if [[ -n "$desired_cxx" ]]; then
-    if ! have "$desired_cxx"; then
-      echo "[warn] tts.cpp: preferred compiler '$desired_cxx' not found; falling back to auto-detect" >&2
-      desired_cxx=""
-    fi
-  fi
-  if [[ -z "$desired_cxx" ]]; then
-    if desired_cxx=$(detect_clang_binary clang++ "$TTS_MIN_CLANG_MAJOR"); then
-      echo "[info] tts.cpp: auto-detected C++ compiler '$desired_cxx'"
-    else
-      echo "[error] tts.cpp: could not find any clang++ binary meeting minimum version $TTS_MIN_CLANG_MAJOR; install clang-$TTS_MIN_CLANG_MAJOR or set TTS_CXX manually" >&2
-      exit 3
-    fi
-  fi
-  local clang_suffix=""
-  if [[ "$desired_cxx" == clang++-* ]]; then
-    clang_suffix="${desired_cxx#clang++}"
-  fi
-  if [[ -n "$desired_cc" ]]; then
-    if ! have "$desired_cc"; then
-      echo "[warn] tts.cpp: preferred compiler '$desired_cc' not found; falling back to auto-detect" >&2
-      desired_cc=""
-    fi
-  fi
-  if [[ -z "$desired_cc" && -n "$clang_suffix" ]]; then
-    local paired="clang${clang_suffix}"
-    if have "$paired"; then
-      desired_cc="$paired"
-    fi
-  fi
-  if [[ -z "$desired_cc" ]]; then
-    if desired_cc=$(detect_clang_binary clang "$TTS_MIN_CLANG_MAJOR"); then
-      echo "[info] tts.cpp: auto-detected C compiler '$desired_cc'"
-    else
-      echo "[error] tts.cpp: could not find any clang binary meeting minimum version $TTS_MIN_CLANG_MAJOR; install clang-$TTS_MIN_CLANG_MAJOR or set TTS_CC manually" >&2
-      exit 3
-    fi
-  fi
-  TTS_CXX="$desired_cxx"
-  TTS_CC="$desired_cc"
   mkdir -p "$bdir"
-  if [[ -f "$bdir/CMakeCache.txt" ]]; then
+  if [[ -f "$bdir/CMakeCache.txt" && -n "$desired_cxx" ]]; then
     local cache_cxx
     cache_cxx=$(grep -E '^CMAKE_CXX_COMPILER:FILEPATH=' "$bdir/CMakeCache.txt" 2>/dev/null | cut -d= -f2 || true)
     if [[ -n "$cache_cxx" && "$cache_cxx" != *"$(basename "$desired_cxx")" ]]; then
@@ -483,15 +467,20 @@ build_tts() {
       mkdir -p "$bdir"
     fi
   fi
-  if ! have "$desired_cc"; then
+  if [[ -n "$desired_cc" && ! have "$desired_cc" ]]; then
     echo "[error] tts.cpp: requested compiler '$desired_cc' not found in PATH" >&2
     exit 3
   fi
-  if ! have "$desired_cxx"; then
+  if [[ -n "$desired_cxx" && ! have "$desired_cxx" ]]; then
     echo "[error] tts.cpp: requested compiler '$desired_cxx' not found in PATH" >&2
     exit 3
   fi
-  echo "[info] tts.cpp: using CC='$desired_cc' CXX='$desired_cxx'"
+  local cmake_env=()
+  if [[ -n "$desired_cc" ]]; then cmake_env+=(CC="$desired_cc"); fi
+  if [[ -n "$desired_cxx" ]]; then cmake_env+=(CXX="$desired_cxx"); fi
+  if (( ${#cmake_env[@]} )); then
+    echo "[info] tts.cpp: using CC='$desired_cc' CXX='$desired_cxx'"
+  fi
   local host_uname
   host_uname=$(uname -s)
   local cmake_flag_args=()
@@ -560,8 +549,11 @@ build_tts() {
   fi
   local vflag="-DGGML_VULKAN=OFF" cuflag="-DGGML_CUDA=OFF" ocflag="-DGGML_OPENCL=OFF"
   local native_extra=""
+  case "$device" in
+    vulkan) vflag="-DGGML_VULKAN=ON" ;;
+  esac
   local extra_cmake=("${EVA_COMMON_CMAKE_ARGS[@]}" "${TTS_CMAKE_ARGS_ARR[@]}")
-  CC="$desired_cc" CXX="$desired_cxx" cmake -S "$src" -B "$bdir" $(cmake_gen) \
+  "${cmake_env[@]}" cmake -S "$src" -B "$bdir" $(cmake_gen) \
     -DBUILD_SHARED_LIBS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
     -DTTS_BUILD_EXAMPLES=ON \
     $vflag $cuflag $ocflag $native_extra -DCMAKE_BUILD_TYPE=Release \
@@ -570,16 +562,17 @@ build_tts() {
   cmake --build "$bdir" $(cmake_jobs_flag) --config Release --target tts-cli
   local out="$OUT_DIR/$arch/$os/$device/$project"
   copy_bin "$bdir" tts-cli "$out" "$exe_suf" || true
-  local cpu_bin_path="$out/$bin_name"
-  if [[ -f "$cpu_bin_path" && ${#ALL_DEVICES[@]} -gt 0 ]]; then
-    local extra
-    for extra in "${ALL_DEVICES[@]}"; do
-      [[ "$extra" == "cpu" ]] && continue
-      local extra_dir="$OUT_DIR/$arch/$os/$extra/$project"
-      mkdir -p "$extra_dir"
-      cp -f "$cpu_bin_path" "$extra_dir/"
-      echo "Copied $(basename "$cpu_bin_path") -> $extra_dir"
-    done
+
+  if [[ "$device" == "vulkan" ]]; then
+    local vk_bin_path="$out/$bin_name"
+    if [[ -f "$vk_bin_path" ]]; then
+      local cuda_dir="$OUT_DIR/$arch/$os/cuda/$project"
+      mkdir -p "$cuda_dir"
+      cp -f "$vk_bin_path" "$cuda_dir/"
+      echo "Copied $(basename "$vk_bin_path") -> $cuda_dir"
+    else
+      echo "[warn] tts.cpp: Vulkan binary missing after build; cannot populate CUDA dir" >&2
+    fi
   fi
 }
 
