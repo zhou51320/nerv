@@ -467,11 +467,11 @@ build_tts() {
       mkdir -p "$bdir"
     fi
   fi
-  if [[ -n "$desired_cc" && ! have "$desired_cc" ]]; then
+  if [[ -n "$desired_cc" ]] && ! have "$desired_cc"; then
     echo "[error] tts.cpp: requested compiler '$desired_cc' not found in PATH" >&2
     exit 3
   fi
-  if [[ -n "$desired_cxx" && ! have "$desired_cxx" ]]; then
+  if [[ -n "$desired_cxx" ]] && ! have "$desired_cxx"; then
     echo "[error] tts.cpp: requested compiler '$desired_cxx' not found in PATH" >&2
     exit 3
   fi
