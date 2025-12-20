@@ -25,16 +25,15 @@ bool play_tts_response(arg_list & args, const tts_response & data, float sample_
         exit(1);
     }
 
-    const SDL_AudioSpec desired{
-        .freq = static_cast<int>(sample_rate),
-        .format = AUDIO_F32,
-        .channels = 1,
-        .silence = 0,
-        .padding = 0,
-        .size = static_cast<unsigned>(data.n_outputs),
-        .callback = nullptr,
-        .userdata = nullptr,
-    };
+    SDL_AudioSpec desired{};
+    desired.freq     = static_cast<int>(sample_rate);
+    desired.format   = AUDIO_F32;
+    desired.channels = 1;
+    desired.silence  = 0;
+    desired.padding  = 0;
+    desired.size     = static_cast<unsigned>(data.n_outputs);
+    desired.callback = nullptr;
+    desired.userdata = nullptr;
     const SDL_AudioDeviceID dev = SDL_OpenAudioDevice(nullptr, false, &desired, nullptr, 0);
     if (!dev) {
         fprintf(stderr, "SDL_OpenAudioDevice failed\n");

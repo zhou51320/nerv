@@ -57,6 +57,7 @@ struct runner_context {
     void build_schedule(size_t max_nodes);
     bool prep_schedule(ggml_cgraph * gf);
     void prep_output_buffer(size_t new_size);
+    void sync();
 };
 
 struct tts_model {

@@ -198,8 +198,8 @@ void snac_runner::run(std::vector<std::vector<uint32_t>> & tokens, struct tts_re
 
     sctx->get_ggml_node_data(result, outputs->data, sequence_length*sizeof(float)*model->up_sampling_factor);
 
-    // Reset state for the next token before backend sync, to allow the CPU activities in the reset to
-    // overlap with device computation.
+    sctx->sync();
+    // 说明：异步后端需要先同步，避免 reset 释放仍在使用的 buffer。
     ggml_backend_sched_reset(sctx->sched);
     outputs->n_outputs = sequence_length * model->up_sampling_factor;
     return;

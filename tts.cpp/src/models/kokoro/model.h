@@ -250,6 +250,9 @@ struct kokoro_model : tts_model {
 	struct ggml_tensor * harmonic_sampling_norm = nullptr; // a static 1x9 harmonic multiplier
 	struct ggml_tensor * sampling_factor_scalar = nullptr; // a static scalar
 	struct ggml_tensor * sqrt_tensor = nullptr; // static tensor for constant division
+	// 说明：STFT/ISTFT 用的预计算基矩阵（conv 形式），用于 Vulkan 完整图执行。
+	struct ggml_tensor * stft_forward_basis = nullptr;
+	struct ggml_tensor * stft_inverse_basis = nullptr;
 
 	// Prosody Predictor portion of the model
 	struct duration_predictor * prosody_pred;
@@ -262,6 +265,9 @@ struct kokoro_model : tts_model {
 
 	// the default hidden states need to be initialized
 	std::vector<lstm*> lstms;
+	// 说明：Vulkan 下部分权重需要在模型外额外分配（例如 F32 拷贝/展开后的 depthwise kernel），
+	// 这些 buffer 不在基类的主权重 buffer 中，需在 free() 时额外释放。
+	std::vector<ggml_backend_buffer_t> extra_buffers;
 
 	size_t duration_node_counter = 0;
 	size_t generation_node_counter = 0;
@@ -284,6 +290,7 @@ struct kokoro_model : tts_model {
 
 
 	void post_load_assign();
+	void free();
     void assign_weight(const char * name, ggml_tensor & tensor);
     void prep_layers(gguf_context * meta);
     void prep_constants(gguf_context * meta);
@@ -339,8 +346,11 @@ struct kokoro_duration_context : runner_context {
 static struct ggml_tensor * build_albert_inputs(ggml_context * ctx, kokoro_model * model, ggml_tensor * input_tokens, ggml_tensor * positions, ggml_tensor * token_types);
 static struct ggml_tensor * build_albert_norm(ggml_context * ctx, ggml_tensor * cur, ggml_tensor * weight, ggml_tensor * bias);
 static struct ggml_tensor * build_ada_residual_conv(ggml_context * ctx, struct ggml_tensor * x, ada_residual_conv_block * block, struct ggml_tensor * style, struct ggml_tensor * sqrt_tensor);
-static struct ggml_tensor * build_kokoro_generator_res_block(ggml_context * ctx, struct ggml_tensor * x, struct ggml_tensor * style, kokoro_generator_residual_block * block);
-static struct ggml_tensor * build_noise_block(ggml_context * ctx, kokoro_noise_residual_block * block, struct ggml_tensor * x, struct ggml_tensor * style);
+static struct ggml_tensor * build_kokoro_generator_res_block(ggml_context * ctx, struct ggml_tensor * x, struct ggml_tensor * style,
+                                                             kokoro_generator_residual_block * block,
+                                                             std::vector<tts_graph_const_input> * const_inputs);
+static struct ggml_tensor * build_noise_block(ggml_context * ctx, kokoro_noise_residual_block * block, struct ggml_tensor * x,
+                                              struct ggml_tensor * style, std::vector<tts_graph_const_input> * const_inputs);
 static kokoro_generator_residual_block * build_res_block_from_file(gguf_context * meta, std::string base_config_key);
 static kokoro_noise_residual_block * build_noise_block_from_file(gguf_context * meta, int index);
 static kokoro_generator_upsample_block * kokoro_generator_upsample_block(gguf_context * meta, int index);
@@ -392,9 +402,14 @@ struct kokoro_context : runner_context {
 
     struct ggml_tensor * inp_tokens;
     struct ggml_tensor * duration_pred;
-    struct ggml_tensor * duration_mask;
+    // 每个 frame 对应的 token id（I32，长度=total_duration）。
+    // 用于把 token 级别的 hidden state 直接 gather 到 frame 级别，
+    // 替代原先的 duration_mask(tokens×frames)+mul_mat 的稀疏展开方式，显著降低算子数与内存占用。
+    struct ggml_tensor * duration_ids;
     struct ggml_tensor * window_sq_sum; // needs to be calculatd from the generator window.
     struct ggml_tensor * uv_noise_data;
+    struct ggml_tensor * stft_pad_indices = nullptr; // STFT 反射 padding 索引（I32）
+    std::vector<tts_graph_const_input> graph_const_inputs; // Vulkan 图常量输入（标量）
 
     void build_schedule() {
         runner_context::build_schedule(model->max_gen_nodes()*30);

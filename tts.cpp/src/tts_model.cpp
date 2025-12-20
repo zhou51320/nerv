@@ -1,9 +1,36 @@
 #include "tts_model.h"
 #include "llama-mmap.h"
 
+#include <cstdlib>
+
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "models/loaders.h"
+
+namespace {
+
+static bool tts_env_truthy_local(const char * name) {
+    const char * v = std::getenv(name);
+    if (v == nullptr || v[0] == '\0') {
+        return false;
+    }
+    return std::strcmp(v, "0") != 0 && std::strcmp(v, "off") != 0 && std::strcmp(v, "false") != 0;
+}
+
+static bool tts_backend_is_vulkan_local(ggml_backend_t backend) {
+    if (backend == nullptr) {
+        return false;
+    }
+    const char * name = ggml_backend_name(backend);
+    if (name == nullptr || name[0] == '\0') {
+        return false;
+    }
+    const std::string_view sv{name};
+    // 说明：ggml 的 Vulkan backend 名称通常以 "Vulkan" / "vulkan" 开头（可能带设备编号）。
+    return tts_starts_with(sv, "Vulkan") || tts_starts_with(sv, "vulkan");
+}
+
+} // namespace
 
 void append_to_response(tts_response & response, tts_response & to_append) {
     float * new_data = (float *) malloc((response.n_outputs + to_append.n_outputs) * sizeof(float));
@@ -80,8 +107,31 @@ bool runner_context::prep_schedule(struct ggml_cgraph * gf) {
     // 先做不分配的尺寸测量，若需求明显超出显存则跳过预分配，
     // 让运行时按实际输入图再分配，避免无意义的大额申请。
     if (backend != nullptr && backend_buffer != nullptr) {
+        // 说明：Kokoro 等模型的“最坏图”预分配在 Vulkan 上经常得不偿失：
+        // - 可能触发巨额 buffer 申请（甚至超过 VkPhysicalDeviceLimits::maxStorageBufferRange / maxBufferSize）；
+        // - 即便最终失败也会显著拉长 CLI 启动时间；
+        // 因此默认跳过 Vulkan 的预分配；如需开启可设置：TTS_VK_PREALLOC=1
+        if (tts_backend_is_vulkan_local(backend) && !tts_env_truthy_local("TTS_VK_PREALLOC")) {
+            return true;
+        }
+
         size_t sizes[2] = {0, 0};
         ggml_backend_sched_reserve_size(sched, gf, sizes);
+
+        const size_t backend_need = sizes[0];
+
+        // 说明：部分 Vulkan 设备虽然“显存/共享内存总量”很大，但单个 buffer 的最大尺寸受驱动/硬件限制。
+        // 预分配时 ggml 往往会尝试一次性申请一个大 buffer；若超过该上限会直接失败。
+        // 这里提前用 ggml 提供的 max_size 做剪枝，避免发生“先失败再回退”的高额启动开销。
+        const size_t backend_max_size = ggml_backend_get_max_size(backend);
+        if (backend_max_size > 0 && backend_need > backend_max_size) {
+            const double gib = 1024.0 * 1024.0 * 1024.0;
+            fprintf(stderr,
+                    "[tts] 加速后端预分配需求 %.2f GiB 超过后端单 buffer 上限 %.2f GiB，跳过预分配并在运行时按实际图分配。\n",
+                    backend_need / gib,
+                    backend_max_size / gib);
+            return true;
+        }
 
         ggml_backend_dev_t dev = ggml_backend_get_device(backend);
         ggml_backend_dev_props props{};
@@ -89,11 +139,18 @@ bool runner_context::prep_schedule(struct ggml_cgraph * gf) {
             ggml_backend_dev_get_props(dev, &props);
         }
 
-        const size_t backend_need = sizes[0];
         const size_t mem_total = props.memory_total;
         const size_t mem_free = props.memory_free;
         const bool exceed_total = mem_total > 0 && backend_need > mem_total;
         const bool exceed_free = !exceed_total && mem_free > 0 && backend_need > mem_free;
+        const bool mem_unknown = backend_need > 0 && mem_total == 0 && mem_free == 0;
+
+        if (mem_unknown) {
+            // 说明：部分 Vulkan/Metal 驱动无法返回显存信息；此时不做预分配，避免未知预算下直接 OOM。
+            fprintf(stderr,
+                    "[tts] 加速后端显存信息不可用，跳过预分配并在运行时按实际图分配。\n");
+            return true;
+        }
 
         if (exceed_total || exceed_free) {
             const double gib = 1024.0 * 1024.0 * 1024.0;
@@ -106,7 +163,14 @@ bool runner_context::prep_schedule(struct ggml_cgraph * gf) {
         }
     }
 
-    return ggml_backend_sched_reserve(sched, gf);
+    const bool ok = ggml_backend_sched_reserve(sched, gf);
+    if (!ok) {
+        // 说明：预分配失败时重置调度器，避免后续分配处于不一致状态。
+        fprintf(stderr,
+                "[tts] 加速后端预分配失败，已重置调度器并改为运行时分配。\n");
+        ggml_backend_sched_reset(sched);
+    }
+    return ok;
 }
 
 void runner_context::prep_output_buffer(size_t new_size) {
@@ -120,6 +184,15 @@ void runner_context::prep_output_buffer(size_t new_size) {
         buf_output = ggml_backend_buft_alloc_buffer(backend_cpu_buffer, new_size);
     }
     logits = (float *) ggml_backend_buffer_get_base(buf_output);
+}
+
+void runner_context::sync() {
+    if (!sched) {
+        return;
+    }
+    // 说明：异步后端（如 Vulkan/Metal）在 compute_async / tensor_get_async 后可能仍在执行，
+    // 必须先同步，避免 reset 释放仍在使用的 buffer 引发崩溃或数据未就绪。
+    ggml_backend_sched_synchronize(sched);
 }
 
 void tts_runner::init_build(std::vector<uint8_t>* buf_compute_meta) {
@@ -173,6 +246,18 @@ void tts_model::prep_buffers_and_context(bool cpu_only, float size_offset, uint3
         // 说明：根据当前线程的后端配置，初始化加速后端（Metal/Vulkan）。
         backend = tts_backend_init_accel();
         buffer = backend ? ggml_backend_get_default_buffer_type(backend) : nullptr;
+
+        // 说明：部分模型在 Vulkan 下会回退 CPU 计算，为避免 CPU 直接读取设备内存导致崩溃，
+        // 可选择“主机可见”的权重缓冲（若后端支持）。
+        const tts_backend_config cfg = tts_get_backend_config();
+        if (backend != nullptr && cfg.backend == tts_compute_backend::VULKAN && cfg.prefer_host_buffer) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+            ggml_backend_buffer_type_t host_buft = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+            if (host_buft != nullptr) {
+                buffer = host_buft;
+                fprintf(stderr, "[tts] Vulkan 权重使用主机可见缓冲，避免 CPU 回退时访问设备内存。\n");
+            }
+        }
 
         if (!backend || !buffer) {
             const tts_backend_config cfg = tts_get_backend_config();

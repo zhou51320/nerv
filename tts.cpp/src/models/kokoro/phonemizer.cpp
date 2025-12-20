@@ -280,7 +280,7 @@ void word_phonemizer::add_rule(std::vector<std::string> keys, std::string phonem
 	phonemizer_rule * current_rule = nullptr;
 	for (int i = 0; i < keys.size(); i++) {
 		if (current_rule) {
-			if (!current_rule->rules.contains(keys[i])) {
+			if (current_rule->rules.find(keys[i]) == current_rule->rules.end()) {
 				phonemizer_rule * nrule = new phonemizer_rule;
 				current_rule->rules[keys[i]] = nrule;
 				current_rule = nrule;
@@ -699,7 +699,7 @@ bool phonemizer::process_word(corpus* text, std::string* output, std::string wor
 			text->size_pop(word.size()+unaccented_size_difference);
 			return true;
 		}
-	} else if (word.length() > 1 && !small_english_words.contains(to_lower(word)) && can_be_roman_numeral(word) && is_all_upper(word) && handle_roman_numeral(text, output, flags)) {
+	} else if (word.length() > 1 && small_english_words.find(to_lower(word)) == small_english_words.end() && can_be_roman_numeral(word) && is_all_upper(word) && handle_roman_numeral(text, output, flags)) {
 		return true;
 	} else if (is_acronym_like(text, word, flags)) {
 		return handle_acronym(text, word, output, flags);

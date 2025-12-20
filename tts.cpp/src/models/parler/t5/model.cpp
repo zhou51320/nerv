@@ -349,8 +349,8 @@ void t5_runner::run(uint32_t * input_tokens, uint32_t sequence_length, struct tt
 
     t5ctx->get_ggml_node_data(result, outputs->data, batch.n_tokens*sizeof(float)*model->output_size);
 
-    // Reset state for the next token before backend sync, to allow the CPU activities in the reset to
-    // overlap with device computation.
+    t5ctx->sync();
+    // 说明：异步后端需要先同步，避免 reset 释放仍在使用的 buffer。
     ggml_backend_sched_reset(t5ctx->sched);
     outputs->n_outputs = sequence_length;
     outputs->hidden_size = model->output_size;

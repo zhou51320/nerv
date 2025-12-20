@@ -2,6 +2,7 @@
 
 #include <cstring>
 #include <cstdint>
+#include <cstdlib>
 #include <unordered_map>
 
 #include "../util.h"
@@ -23,6 +24,14 @@ namespace {
         // 常见表现就是在 unordered_map::emplace 内部触发除零而崩溃（GDB 显示 SIGFPE）。
         static loader_map registry;
         return registry;
+    }
+
+    bool tts_env_truthy(const char * name) {
+        const char * v = std::getenv(name);
+        if (v == nullptr || v[0] == '\0') {
+            return false;
+        }
+        return std::strcmp(v, "0") != 0 && std::strcmp(v, "off") != 0 && std::strcmp(v, "false") != 0;
     }
 }  // namespace
 
@@ -52,7 +61,7 @@ static unique_ptr<tts_generation_runner> runner_from_file_impl(const char * fnam
                                                                const generation_configuration & config, bool cpu_only) {
     auto &     loaders = get_loader_registry();
     string_view fname_sv{ fname };
-    if (fname_sv.starts_with("test:")) {
+    if (tts_starts_with(fname_sv, "test:")) {
         fname_sv.remove_prefix(sizeof("test:") - 1);
         const auto found{loaders.find(fname_sv)};
         if (found == loaders.end()) {
@@ -67,10 +76,10 @@ static unique_ptr<tts_generation_runner> runner_from_file_impl(const char * fnam
         in_mmap = make_unique<llama_mmap>(&in_map_file);
     }
     ggml_context * weight_ctx{};
-    gguf_context * meta_ctx = gguf_init_from_file(fname, {
-                                                             .no_alloc{ use_mmap },
-                                                             .ctx{ &weight_ctx },
-                                                         });
+    gguf_init_params gguf_params{};
+    gguf_params.no_alloc = use_mmap;
+    gguf_params.ctx      = &weight_ctx;
+    gguf_context * meta_ctx = gguf_init_from_file(fname, gguf_params);
     if (!meta_ctx) {
         GGML_ABORT("gguf_init_from_file failed for file %s\n", fname);
     }
@@ -90,6 +99,18 @@ static unique_ptr<tts_generation_runner> runner_from_file_impl(const char * fnam
     const auto         found = loaders.find(arch);
     if (found == loaders.end()) {
         GGML_ABORT("Unknown architecture %s\n", arch);
+    }
+    // 说明：Kokoro 在 Vulkan 下默认使用设备缓冲，保证 GPU 真正参与计算；
+    // 如需在自定义算子回退 CPU 时强制使用主机可见权重，可设置 TTS_VK_HOST_BUFFER=1。
+    {
+        const tts_backend_config cfg = tts_get_backend_config();
+        if (cfg.backend == tts_compute_backend::VULKAN && std::strcmp(arch, "kokoro") == 0) {
+            if (tts_env_truthy("TTS_VK_HOST_BUFFER")) {
+                tts_backend_config updated = cfg;
+                updated.prefer_host_buffer = true;
+                tts_set_backend_config(updated);
+            }
+        }
     }
     const auto &                      loader{ found->second.get() };
     unique_ptr<tts_generation_runner> runner{ loader.from_file(meta_ctx, weight_ctx, n_threads, cpu_only, config) };

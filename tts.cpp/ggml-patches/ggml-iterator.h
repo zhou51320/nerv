@@ -33,7 +33,15 @@ class gguf_key_iterator {
         return result;
     }
 
-    bool operator==(const gguf_key_iterator &) const = default;
+    // C++17 兼容：默认化比较运算符（= default）是 C++20 才支持的语法。
+    // 这里手写 == / !=，以便 range-for 能正常使用 begin != end 迭代。
+    bool operator==(const gguf_key_iterator & other) const noexcept {
+        return ctx == other.ctx && i == other.i;
+    }
+
+    bool operator!=(const gguf_key_iterator & other) const noexcept {
+        return !(*this == other);
+    }
 };
 
 class ggml_tensor_iterator {
@@ -62,5 +70,13 @@ class ggml_tensor_iterator {
         return result;
     }
 
-    bool operator==(const ggml_tensor_iterator &) const = default;
+    // C++17 兼容：默认化比较运算符（= default）是 C++20 才支持的语法。
+    // 这里手写 == / !=，以便 range-for 能正常使用 begin != end 迭代。
+    bool operator==(const ggml_tensor_iterator & other) const noexcept {
+        return ctx == other.ctx && cur == other.cur;
+    }
+
+    bool operator!=(const ggml_tensor_iterator & other) const noexcept {
+        return !(*this == other);
+    }
 };

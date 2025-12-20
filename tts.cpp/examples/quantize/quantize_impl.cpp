@@ -14,7 +14,7 @@
 static bool kokoro_is_f16_compatible(std::string_view name) {
     return name.find("voice_tensors") == std::string::npos && name.find("bias") == std::string::npos &&
            name.find("gamma") == std::string::npos && name.find("beta") == std::string::npos &&
-           name.find("alpha") == std::string::npos && !name.ends_with("embd") && !name.ends_with("norm");
+           name.find("alpha") == std::string::npos && !tts_ends_with(name, "embd") && !tts_ends_with(name, "norm");
 }
 
 static bool kokoro_is_quantizable(const std::string & name, const quantization_params & params) {
@@ -24,10 +24,10 @@ static bool kokoro_is_quantizable(const std::string & name, const quantization_p
     };
 
     if (kokoro_is_f16_compatible(name)) {
-        if (name.starts_with("kokoro.albert") || name.starts_with("kokoro.text_encoder.lstm")) {
+        if (tts_starts_with(name, "kokoro.albert") || tts_starts_with(name, "kokoro.text_encoder.lstm")) {
             return true;
         }
-        if (name.starts_with("kokoro.duration_predictor.")) {
+        if (tts_starts_with(name, "kokoro.duration_predictor.")) {
             std::vector<std::string> parts = split(name, ".");
             for (const auto part : DURATION_PREDICTOR_QUANTIZATION_COMPATIBLE_PARTS) {
                 if (part == parts[2]) {
@@ -41,27 +41,27 @@ static bool kokoro_is_quantizable(const std::string & name, const quantization_p
 
 static bool dia_is_quantizable(std::string_view name, const quantization_params & params) {
     // The DAC audio encoder / decoder is not compatible with quantization and normalization tensors should not be quantized.
-    bool quantizable = !name.starts_with("audio_encoder") && !name.ends_with("norm");
+    bool quantizable = !tts_starts_with(name, "audio_encoder") && !tts_ends_with(name, "norm");
     if (!params.quantize_output_heads) {
-        quantizable = quantizable && !name.starts_with("dia.decoder.heads");
+        quantizable = quantizable && !tts_starts_with(name, "dia.decoder.heads");
     }
     return quantizable;
 }
 
 static bool parler_is_quanitizable(std::string_view name, const quantization_params & params) {
     // the DAC audio encoder / decoder is not compatible with quantization, normalization weight shouldn't be quantized, and the text encoding shouldn't be normalized.
-    bool quantizable = !name.starts_with("audio_encoder") && !name.ends_with("norm.weight") &&
-                       !name.ends_with("text_encoding") && !name.ends_with("positional_embed") &&
-                       !name.ends_with("norm.bias");
+    bool quantizable = !tts_starts_with(name, "audio_encoder") && !tts_ends_with(name, "norm.weight") &&
+                       !tts_ends_with(name, "text_encoding") && !tts_ends_with(name, "positional_embed") &&
+                       !tts_ends_with(name, "norm.bias");
     if (!params.quantize_output_heads) {
-        quantizable = quantizable && !name.ends_with("weight.head");
+        quantizable = quantizable && !tts_ends_with(name, "weight.head");
     }
     if (!params.quantize_text_embeddings) {
-        quantizable = quantizable && !name.ends_with("embed_prompts");
+        quantizable = quantizable && !tts_ends_with(name, "embed_prompts");
     }
     if (!params.quantize_cross_attn_kv) {
-        quantizable = quantizable && !name.ends_with("encoder_attn.k_proj.weight") &&
-                      !name.ends_with("encoder_attn.v_proj.weight");
+        quantizable = quantizable && !tts_ends_with(name, "encoder_attn.k_proj.weight") &&
+                      !tts_ends_with(name, "encoder_attn.v_proj.weight");
     }
     return quantizable;
 }
@@ -170,10 +170,9 @@ template <typename T> struct no_init {
 
 void quantize_gguf(const char * ifile, const char * ofile, const quantization_params & params) {
     ggml_context *   weight_ctx{};
-    gguf_init_params gguf_params{
-        .no_alloc{ false },
-        .ctx{ &weight_ctx },
-    };
+    gguf_init_params gguf_params{};
+    gguf_params.no_alloc = false;
+    gguf_params.ctx      = &weight_ctx;
     gguf_context * meta_ctx = gguf_init_from_file(ifile, gguf_params);
     std::string    arch     = "parler-tts";  // only parler-tts gguf files should lack an explicit architecture.
 
@@ -269,7 +268,7 @@ void quantize_gguf(const char * ifile, const char * ofile, const quantization_pa
             new_data = work.data();
             new_size = quantize_tensor(new_data, cur, nullptr, new_type, params.n_threads);
         } else if ((params.convert_non_quantizable_to_f16 && kokoro_is_f16_compatible(name)) ||
-                   (params.convert_dac_to_f16 && name_sv.starts_with("audio_encoder") && !name_sv.ends_with("alpha"))) {
+                   (params.convert_dac_to_f16 && tts_starts_with(name_sv, "audio_encoder") && !tts_ends_with(name_sv, "alpha"))) {
             if ((cur->type) != GGML_TYPE_F32) {
                 GGML_ABORT(
                     "ERROR: All converted tensors must be transformed from 32bit floats. Tensor, '%s', has improper "

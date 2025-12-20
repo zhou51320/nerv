@@ -38,20 +38,19 @@ int main(int argc, const char ** argv) {
     }
     args.validate();
     std::string qtype = args.get_string_param("--quantized-type");
-    if (!valid_quantization_types.contains(qtype)) {
+    if (valid_quantization_types.find(qtype) == valid_quantization_types.end()) {
         fprintf(stderr, "ERROR: %s is not a valid quantization type.\n",
                 qtype.c_str());
         exit(1);
     }
-    quantization_params qp {
-        .n_threads{ static_cast<uint32_t>(*args.get_int_param("--n-threads")) },
-        .quantize_type{valid_quantization_types.at(qtype)},  // quantization type
-        .quantize_output_heads{ args.get_bool_param("--quantize-output-heads")},
-        .quantize_text_embeddings{args.get_bool_param("--quantize-text-embedding")},
-        .quantize_cross_attn_kv{ args.get_bool_param("--quantize-cross-attn-kv")},
-        .convert_dac_to_f16{ args.get_bool_param("--convert-dac-to-f16")},
-        .convert_non_quantizable_to_f16{ args.get_bool_param("--convert-non-quantized-to-f16")},
-    };
+    quantization_params qp{};
+    qp.n_threads                    = static_cast<uint32_t>(*args.get_int_param("--n-threads"));
+    qp.quantize_type                = valid_quantization_types.at(qtype);  // quantization type
+    qp.quantize_output_heads        = args.get_bool_param("--quantize-output-heads");
+    qp.quantize_text_embeddings     = args.get_bool_param("--quantize-text-embedding");
+    qp.quantize_cross_attn_kv       = args.get_bool_param("--quantize-cross-attn-kv");
+    qp.convert_dac_to_f16           = args.get_bool_param("--convert-dac-to-f16");
+    qp.convert_non_quantizable_to_f16 = args.get_bool_param("--convert-non-quantized-to-f16");
     quantize_gguf(args.get_string_param("--model-path").c_str(), args.get_string_param("--quantized-model-path").c_str(), qp);
     return 0;
 }

@@ -4,7 +4,9 @@
 #if defined(__has_include)
 #   if __has_include(<numbers>)
 #       include <numbers>
-#       define TTS_HAS_STD_NUMBERS 1
+#       if defined(__cpp_lib_math_constants) && __cpp_lib_math_constants >= 201907L
+#           define TTS_HAS_STD_NUMBERS 1
+#       endif
 #   endif
 #endif
 

@@ -13122,6 +13122,24 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     // Reserve tensor context space for all nodes
     ctx->tensor_ctxs.resize(cgraph->n_nodes);
 
+    // 说明：Vulkan 图中必须只包含 Vulkan buffer；若混入 CPU buffer 会触发崩溃。
+    // 这里提前检测并返回失败，便于上层回退到 CPU 重新计算。
+    for (int i = 0; i <= last_node; ++i) {
+        ggml_tensor * node = cgraph->nodes[i];
+        if (!node || ggml_is_empty(node) || ggml_op_is_empty(node->op) || !node->buffer) {
+            continue;
+        }
+        if (!ggml_backend_buffer_is_vk(node->buffer)) {
+            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(node->buffer);
+            const char * buft_name = (buft && buft->iface.get_name) ? buft->iface.get_name(buft) : "unknown";
+            GGML_LOG_ERROR("ggml_vulkan: graph node uses non-vulkan buffer: name=%s op=%s buft=%s\n",
+                           node->name ? node->name : "(null)",
+                           ggml_op_name(node->op),
+                           buft_name);
+            return GGML_STATUS_FAILED;
+        }
+    }
+
     bool first_node_in_batch = true; // true if next node will be first node in a batch
     int submit_node_idx = 0; // index to first node in a batch
 

@@ -194,21 +194,38 @@ float round_to_float(double v) {
     return roundf(v * powl(10, 6)) / powl(10, 6);
 }
 
-struct ggml_tensor * reciprocal(ggml_context * ctx, struct ggml_tensor * x) {
+// 说明：生成常量输入（如用于 Vulkan 图中的加/减常数），避免直接使用 host 指针。
+static ggml_tensor * tts_const_tensor(ggml_context * ctx, const float * v,
+                                      std::vector<tts_graph_const_input> * const_inputs) {
+    ggml_tensor * t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+    if (const_inputs != nullptr) {
+        ggml_set_input(t);
+        const_inputs->push_back({t, *v});
+    } else {
+        t->data = const_cast<float *>(v);
+    }
+    return t;
+}
+
+struct ggml_tensor * reciprocal(ggml_context * ctx, struct ggml_tensor * x,
+                                std::vector<tts_graph_const_input> * const_inputs) {
     TTS_ASSERT(x->ne[0] == 1);
     static constexpr float one = 1.0f;
-    ggml_tensor * numerator = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, x->ne[1]);
-    // stride trick so that the scalar numerator can be divided by x.
-    numerator->nb[1] = 0;
-    numerator->data = const_cast<float *>(&one);
-    return ggml_div(ctx, numerator, x);
+    ggml_tensor * numerator = tts_const_tensor(ctx, &one, const_inputs);
+    ggml_tensor * numerator_b = ggml_repeat(ctx, numerator, x);
+    return ggml_div(ctx, numerator_b, x);
 }
 
 // Described in https://arxiv.org/abs/2006.08195
 // Snake1d is a common tunable activation function used in the DAC model.
-struct ggml_tensor * snake_1d(ggml_context * ctx, struct ggml_tensor * alpha, struct ggml_tensor * a) {
+struct ggml_tensor * snake_1d(ggml_context * ctx, struct ggml_tensor * alpha, struct ggml_tensor * a,
+                              std::vector<tts_graph_const_input> * const_inputs) {
     assert(a->ne[2] == 1 && a->ne[3] == 1);
-    return ggml_add(ctx, a, ggml_mul(ctx, ggml_sqr(ctx, ggml_sin(ctx, ggml_mul(ctx, a, alpha))), reciprocal(ctx, alpha)));
+    return ggml_add(ctx,
+                    a,
+                    ggml_mul(ctx,
+                             ggml_sqr(ctx, ggml_sin(ctx, ggml_mul(ctx, a, alpha))),
+                             reciprocal(ctx, alpha, const_inputs)));
 }
 
 namespace {
@@ -683,6 +700,93 @@ static void tts_compute_istft_custom(struct ggml_tensor * dst, int ith, int nth,
     }
 }
 
+// ----------------------------- Vulkan/通用图实现辅助 -----------------------------
+// 说明：以下函数用于在“非自定义算子”路径下构建 STFT/ISTFT 计算图，避免 GGML_OP_CUSTOM。
+// 参考 whisper.cpp 的 STFT 方案：通过 conv_1d + 预计算基矩阵实现频域变换。
+
+// 近似 atan(z)，假设 |z| <= 1。公式来自常见快速 atan 近似，最大误差约 0.002rad。
+static ggml_tensor * tts_atan_approx_unit(ggml_context * ctx, ggml_tensor * z,
+                                          std::vector<tts_graph_const_input> * const_inputs) {
+    // atan(z) ≈ (π/4)*z - z*(|z|-1)*(0.2447 + 0.0663*|z|)
+    // 此处 z >= 0（由外层保证），所以 |z| == z。
+    const float k_pi_over_4 = TTS_TWO_PI_F * 0.25f;
+    static const float k_c1 = 0.2447f;
+    static const float k_c2 = 0.0663f;
+    static const float k_neg_one = -1.0f;
+
+    ggml_tensor * t = ggml_add(ctx, ggml_scale(ctx, z, k_c2), tts_const_tensor(ctx, &k_c1, const_inputs)); // 0.2447 + 0.0663*z
+    ggml_tensor * z_minus_one = ggml_add(ctx, z, tts_const_tensor(ctx, &k_neg_one, const_inputs));         // z - 1
+    ggml_tensor * corr = ggml_mul(ctx, ggml_mul(ctx, z, z_minus_one), t);      // z*(z-1)*(0.2447+0.0663*z)
+    return ggml_sub(ctx, ggml_scale(ctx, z, k_pi_over_4), corr);               // (π/4)*z - corr
+}
+
+// 近似 atan2(y, x)，避免依赖缺失的 atan2 算子。
+static ggml_tensor * tts_atan2_approx(ggml_context * ctx, ggml_tensor * y, ggml_tensor * x,
+                                      std::vector<tts_graph_const_input> * const_inputs) {
+    const float k_pi = TTS_TWO_PI_F * 0.5f;
+    const float k_pi_over_2 = TTS_TWO_PI_F * 0.25f;
+    static const float k_eps = 1e-8f; // 防止除 0
+    static const float k_one = 1.0f;
+    static const float k_neg_one = -1.0f;
+
+    ggml_tensor * abs_y = ggml_abs(ctx, y);
+    ggml_tensor * abs_x = ggml_abs(ctx, x);
+    ggml_tensor * abs_y_eps = ggml_add(ctx, abs_y, tts_const_tensor(ctx, &k_eps, const_inputs));
+    ggml_tensor * abs_x_eps = ggml_add(ctx, abs_x, tts_const_tensor(ctx, &k_eps, const_inputs));
+
+    // mask：|y| > |x|
+    ggml_tensor * mask = ggml_step(ctx, ggml_sub(ctx, abs_y_eps, abs_x_eps));
+
+    // z0/z1 保证在 [0, 1]，用于 atan 近似
+    ggml_tensor * z0 = ggml_div(ctx, abs_y_eps, abs_x_eps);
+    ggml_tensor * z1 = ggml_div(ctx, abs_x_eps, abs_y_eps);
+    ggml_tensor * atan0 = tts_atan_approx_unit(ctx, z0, const_inputs);
+    ggml_tensor * atan1 = tts_atan_approx_unit(ctx, z1, const_inputs);
+
+    ggml_tensor * base1 = ggml_add(ctx, ggml_neg(ctx, atan1), tts_const_tensor(ctx, &k_pi_over_2, const_inputs)); // π/2 - atan1
+    ggml_tensor * one_minus_mask = ggml_add(ctx, ggml_neg(ctx, mask), tts_const_tensor(ctx, &k_one, const_inputs));
+    ggml_tensor * base = ggml_add(ctx,
+                                  ggml_mul(ctx, atan0, one_minus_mask),
+                                  ggml_mul(ctx, base1, mask));
+
+    // sign(y)：用 step(y) 生成 {+1/-1}，避免 y==0 时得到 0（影响 x<0 的象限修正）。
+    ggml_tensor * sign_y = ggml_add(ctx, ggml_scale(ctx, ggml_step(ctx, y), 2.0f), tts_const_tensor(ctx, &k_neg_one, const_inputs));
+    ggml_tensor * angle = ggml_mul(ctx, base, sign_y);
+
+    // 当 x < 0 时，angle = π*sign(y) - angle
+    ggml_tensor * mask_x = ggml_step(ctx, ggml_neg(ctx, x));
+    ggml_tensor * pi_sign = ggml_scale(ctx, sign_y, k_pi);
+    ggml_tensor * two_angle = ggml_scale(ctx, angle, 2.0f);
+    ggml_tensor * delta = ggml_sub(ctx, pi_sign, two_angle);
+    ggml_tensor * angle_fixed = ggml_add(ctx, angle, ggml_mul(ctx, mask_x, delta));
+
+    // 当幅度极小（x≈0 且 y≈0）时，直接置 0，避免异常角度干扰后续网络。
+    ggml_tensor * mag2 = ggml_add(ctx, ggml_mul(ctx, x, x), ggml_mul(ctx, y, y));
+    ggml_tensor * non_zero = ggml_step(ctx, ggml_sub(ctx, mag2, tts_const_tensor(ctx, &k_eps, const_inputs)));
+    return ggml_mul(ctx, angle_fixed, non_zero);
+}
+
+// 使用反射 padding 索引对输入做 padding，返回形状 [len + 2*pad, 1, batch]。
+static ggml_tensor * tts_pad_reflect_with_indices(
+    ggml_context * ctx,
+    ggml_tensor * a,
+    ggml_tensor * pad_indices) {
+    GGML_ASSERT(a != nullptr);
+    GGML_ASSERT(pad_indices != nullptr);
+    GGML_ASSERT(a->ne[2] == 1 && a->ne[3] == 1);
+    GGML_ASSERT(pad_indices->type == GGML_TYPE_I32);
+    GGML_ASSERT(pad_indices->ne[1] == a->ne[1]);
+
+    if (!ggml_is_contiguous(a)) {
+        a = ggml_cont(ctx, a);
+    }
+
+    // 将 [len, batch] 视作 [1, len, batch]，便于 get_rows 按“行索引”抽取
+    ggml_tensor * a_view = ggml_reshape_3d(ctx, a, 1, a->ne[0], a->ne[1]);
+    ggml_tensor * gathered = ggml_get_rows(ctx, a_view, pad_indices); // [1, padded_len, batch]
+    return ggml_transpose(ctx, gathered); // [padded_len, 1, batch]
+}
+
 }  // namespace
 
 struct ggml_tensor * stft(ggml_context * ctx, struct ggml_tensor * a, struct ggml_tensor * window, size_t n_fft, size_t hop, bool abs_and_angle, bool one_sided) {
@@ -763,6 +867,136 @@ struct ggml_tensor * istft(ggml_context * ctx, struct ggml_tensor * a, struct gg
     // 去掉窗函数影响（与旧实现一致）
     out = ggml_div(ctx, out, window_squared_sum);
     return out;
+}
+
+struct ggml_tensor * stft_graph(
+    ggml_context * ctx,
+    struct ggml_tensor * a,
+    struct ggml_tensor * forward_basis,
+    struct ggml_tensor * pad_indices,
+    std::vector<tts_graph_const_input> * const_inputs,
+    size_t n_fft,
+    size_t hop,
+    bool abs_and_angle,
+    bool one_sided) {
+    if (a == nullptr || forward_basis == nullptr || pad_indices == nullptr) {
+        TTS_ABORT("stft_graph: 输入为空。\n");
+    }
+    if (!one_sided) {
+        TTS_ABORT("stft_graph: 当前仅支持 one_sided=true。\n");
+    }
+    if (a->type != GGML_TYPE_F32 || forward_basis->type != GGML_TYPE_F32) {
+        TTS_ABORT("stft_graph: 输入与基矩阵必须为 F32。\n");
+    }
+    if (pad_indices->type != GGML_TYPE_I32) {
+        TTS_ABORT("stft_graph: pad_indices 必须为 I32。\n");
+    }
+
+    const int64_t half = (int64_t) (n_fft / 2);
+    const int64_t cutoff = (int64_t) (n_fft / 2 + 1);
+    const int64_t padded_len = a->ne[0] + 2 * half;
+    if (pad_indices->ne[0] != padded_len || pad_indices->ne[1] != a->ne[1]) {
+        TTS_ABORT("stft_graph: pad_indices 维度不匹配（pad_len=%d, batch=%d）。\n",
+                  (int) pad_indices->ne[0], (int) pad_indices->ne[1]);
+    }
+    if (forward_basis->ne[0] != (int64_t) n_fft || forward_basis->ne[1] != 1 || forward_basis->ne[2] != cutoff * 2) {
+        TTS_ABORT("stft_graph: forward_basis 维度不匹配（期望 [n_fft,1,%d]）。\n", (int) (cutoff * 2));
+    }
+
+    // 1) 反射 padding：利用索引 + get_rows，避免 GGML_OP_CUSTOM / pad_reflect_1d
+    ggml_tensor * padded = tts_pad_reflect_with_indices(ctx, a, pad_indices); // [padded_len, 1, batch]
+    padded = ggml_cont(ctx, padded); // 说明：conv_1d 更偏好连续输入
+
+    // 2) conv_1d 得到实部/虚部（channels = 2 * cutoff）
+    ggml_tensor * stft_raw = ggml_conv_1d(ctx, forward_basis, padded, (int) hop, 0, 1);
+    if (stft_raw->ne[1] != cutoff * 2) {
+        TTS_ABORT("stft_graph: conv 输出通道数不匹配（got=%d expected=%d）。\n",
+                  (int) stft_raw->ne[1], (int) (cutoff * 2));
+    }
+
+    // 3) reshape + permute => [cutoff, frames, batch, 2]
+    ggml_tensor * stft_4d = ggml_reshape_4d(ctx, stft_raw, stft_raw->ne[0], cutoff, stft_raw->ne[2], 2);
+    ggml_tensor * stft_perm = ggml_permute(ctx, stft_4d, 1, 0, 2, 3);
+
+    if (!abs_and_angle) {
+        return stft_perm;
+    }
+
+    // 4) 转为 (magnitude, angle)
+    ggml_tensor * real = ggml_view_3d(ctx, stft_perm,
+                                      stft_perm->ne[0], stft_perm->ne[1], stft_perm->ne[2],
+                                      stft_perm->nb[1], stft_perm->nb[2], 0);
+    ggml_tensor * imag = ggml_view_3d(ctx, stft_perm,
+                                      stft_perm->ne[0], stft_perm->ne[1], stft_perm->ne[2],
+                                      stft_perm->nb[1], stft_perm->nb[2], stft_perm->nb[3]);
+
+    ggml_tensor * real_sq = ggml_mul(ctx, real, real);
+    ggml_tensor * imag_sq = ggml_mul(ctx, imag, imag);
+    ggml_tensor * mag = ggml_sqrt(ctx, ggml_add(ctx, real_sq, imag_sq));
+    ggml_tensor * ang = tts_atan2_approx(ctx, imag, real, const_inputs);
+
+    ggml_tensor * mag4 = ggml_reshape_4d(ctx, mag, mag->ne[0], mag->ne[1], mag->ne[2], 1);
+    ggml_tensor * ang4 = ggml_reshape_4d(ctx, ang, ang->ne[0], ang->ne[1], ang->ne[2], 1);
+    return ggml_concat(ctx, mag4, ang4, 3);
+}
+
+struct ggml_tensor * istft_graph(
+    ggml_context * ctx,
+    struct ggml_tensor * a,
+    struct ggml_tensor * window_squared_sum,
+    struct ggml_tensor * inverse_basis,
+    size_t n_fft,
+    size_t hop,
+    bool abs_and_angle,
+    bool one_sided) {
+    if (a == nullptr || window_squared_sum == nullptr || inverse_basis == nullptr) {
+        TTS_ABORT("istft_graph: 输入为空。\n");
+    }
+    if (!one_sided) {
+        TTS_ABORT("istft_graph: 当前仅支持 one_sided=true。\n");
+    }
+    if (a->type != GGML_TYPE_F32 || inverse_basis->type != GGML_TYPE_F32) {
+        TTS_ABORT("istft_graph: 输入与基矩阵必须为 F32。\n");
+    }
+    if (a->ne[3] != 2) {
+        TTS_ABORT("istft_graph: 输入最后一维必须为 2（实/虚或幅度/相位）。\n");
+    }
+
+    const int64_t half = (int64_t) (n_fft / 2);
+    const int64_t cutoff = (int64_t) (n_fft / 2 + 1);
+    if (a->ne[0] != cutoff) {
+        TTS_ABORT("istft_graph: 频率维长度不匹配（ne0=%d，期望=%d）。\n", (int) a->ne[0], (int) cutoff);
+    }
+    if (inverse_basis->ne[0] != (int64_t) n_fft || inverse_basis->ne[1] != 1 || inverse_basis->ne[2] != cutoff * 2) {
+        TTS_ABORT("istft_graph: inverse_basis 维度不匹配（期望 [n_fft,1,%d]）。\n", (int) (cutoff * 2));
+    }
+
+    ggml_tensor * part0 = ggml_view_3d(ctx, a, a->ne[0], a->ne[1], a->ne[2], a->nb[1], a->nb[2], 0);
+    ggml_tensor * part1 = ggml_view_3d(ctx, a, a->ne[0], a->ne[1], a->ne[2], a->nb[1], a->nb[2], a->nb[3]);
+
+    ggml_tensor * real = nullptr;
+    ggml_tensor * imag = nullptr;
+    if (abs_and_angle) {
+        // 相位来自 atan2 的输出，保持与前向 STFT 一致（imag 可为负）
+        real = ggml_mul(ctx, part0, ggml_cos(ctx, part1));
+        imag = ggml_mul(ctx, part0, ggml_sin(ctx, part1));
+    } else {
+        real = part0;
+        imag = part1;
+    }
+
+    // [freq, frames, batch] -> [frames, freq, batch]
+    ggml_tensor * real_t = ggml_transpose(ctx, real);
+    ggml_tensor * imag_t = ggml_transpose(ctx, imag);
+    ggml_tensor * feat = ggml_concat(ctx, real_t, imag_t, 1); // [frames, 2*freq, batch]
+    feat = ggml_cont(ctx, feat);
+
+    // 通过转置卷积做 overlap-add，padding=half 以还原输出长度
+    ggml_tensor * out = tts_conv_transpose_1d(ctx, inverse_basis, feat, (int) hop, (int) half, 1);
+    out = ggml_reshape_4d(ctx, out, out->ne[0], out->ne[2], 1, 1); // [out_len, batch, 1, 1]
+
+    // 去掉窗函数影响
+    return ggml_div(ctx, out, window_squared_sum);
 }
 
 struct ggml_tensor * tts_conv_transpose_1d(

@@ -775,8 +775,8 @@ int dia_runner::decode(dia_ubatch & batch) {
     float * logits_out = dctx->logits + dctx->current_position * model->output_vocab_size * model->n_output_heads;
     dctx->get_ggml_node_data(res, logits_out, model->output_vocab_size * model->n_output_heads * sizeof(float));
 
-    // Reset state for the next token before backend sync, to allow the CPU activities in the reset to
-    // overlap with device computation.
+    dctx->sync();
+    // 说明：异步后端需要先同步，避免 reset 释放仍在使用的 buffer。
     ggml_backend_sched_reset(dctx->sched);
 
     return 0;
@@ -888,7 +888,7 @@ void dia_runner::generate(const char * sentence, tts_response & output, const ge
 }
 
 void dia_runner::assign_weight(const char * name, ggml_tensor & tensor) {
-    if (const string_view name_sv{ name }; name_sv.starts_with("audio_encoder.")) {
+    if (const string_view name_sv{ name }; tts_starts_with(name_sv, "audio_encoder.")) {
         dac_runner->model->assign_weight(string{ name_sv.substr(sizeof("audio_encoder.") - 1) }, &tensor);
     } else {
         model->assign_weight(name, &tensor);

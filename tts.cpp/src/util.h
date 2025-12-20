@@ -9,6 +9,7 @@
 #include <mutex>
 #include <stdio.h>
 #include <string>
+#include <string_view>
 #include <cstring>
 #include <vector>
 #include <stdint.h>
@@ -23,12 +24,28 @@
 #include "ggml-impl.h"
 #include "ggml-cpp.h"
 
+// C++17 兼容工具：老编译器/标准库没有 std::string(_view)::starts_with / ends_with（C++20 才加入）。
+// 这里提供轻量替代，便于在不升标准的情况下继续使用 string_view 风格的前后缀判断。
+inline bool tts_starts_with(std::string_view s, std::string_view prefix) noexcept {
+    return s.size() >= prefix.size() && s.compare(0, prefix.size(), prefix) == 0;
+}
+
+inline bool tts_ends_with(std::string_view s, std::string_view suffix) noexcept {
+    return s.size() >= suffix.size() && s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
 #define TTS_ABORT(...) tts_abort(__FILE__, __LINE__, __VA_ARGS__)
 #define TTS_ASSERT(x) if (!(x)) TTS_ABORT("TTS_ASSERT(%s) failed", #x)
 
 struct model_tensor_meta {
 	uint32_t n_tensors = 0;
 	size_t n_bytes = 0;
+};
+
+// 说明：用于在“无自定义算子”图中注册常量输入（避免 Vulkan 读取未分配的 host 指针）。
+struct tts_graph_const_input {
+    struct ggml_tensor * tensor = nullptr;
+    float value = 0.0f;
 };
 
 /**
@@ -41,7 +58,8 @@ void random_normal_gen(int count, float * tgt, float mean = 0.0f, float std = 1.
 std::pair<int, std::string> parse_layer_count(std::string name, int skip = 0);
 
 struct model_tensor_meta compute_tensor_meta(std::string name_prefix, ggml_context * weight_ctx, std::function<void(ggml_tensor*)>* callback = nullptr);
-struct ggml_tensor * snake_1d(ggml_context * ctx, struct ggml_tensor * alpha, struct ggml_tensor * a);
+struct ggml_tensor * snake_1d(ggml_context * ctx, struct ggml_tensor * alpha, struct ggml_tensor * a,
+                              std::vector<tts_graph_const_input> * const_inputs = nullptr);
 int search_for_gguf_keys(gguf_context * meta, std::vector<std::string> possible_keys);
 
 // a simple window function for stft
@@ -54,13 +72,40 @@ void compute_window_squared_sum(size_t n_fft, size_t hop, size_t n_frames, float
 struct ggml_tensor * stft(ggml_context * ctx, struct ggml_tensor * a, struct ggml_tensor * window, size_t n_fft, size_t hop, bool abs_and_angle, bool one_sided);
 struct ggml_tensor * istft(ggml_context * ctx, struct ggml_tensor * a, struct ggml_tensor * window_squared_sum, struct ggml_tensor * window, size_t n_fft, size_t hop, bool abs_and_angle, bool one_sided);
 
+// 使用标准 ggml 算子（conv/get_rows/数学算子）构建 STFT/ISTFT 计算图：
+// - 不依赖 GGML_OP_CUSTOM，便于 Vulkan 后端完整执行。
+// - forward_basis / inverse_basis 需由外部预先计算（形状 [n_fft, 1, 2*(n_fft/2+1)]）。
+// - pad_indices 为反射 padding 的索引（形状 [padded_len, batch]，类型 I32）。
+// - const_inputs 用于注册图中的标量常量（Vulkan 需要显式输入缓冲）。
+struct ggml_tensor * stft_graph(
+    ggml_context * ctx,
+    struct ggml_tensor * a,
+    struct ggml_tensor * forward_basis,
+    struct ggml_tensor * pad_indices,
+    std::vector<tts_graph_const_input> * const_inputs,
+    size_t n_fft,
+    size_t hop,
+    bool abs_and_angle,
+    bool one_sided);
+
+struct ggml_tensor * istft_graph(
+    ggml_context * ctx,
+    struct ggml_tensor * a,
+    struct ggml_tensor * window_squared_sum,
+    struct ggml_tensor * inverse_basis,
+    size_t n_fft,
+    size_t hop,
+    bool abs_and_angle,
+    bool one_sided);
+
 // This is a custom op for sine_generation in the Kokoro model.
 void uv_noise_compute(struct ggml_tensor * dst, const struct ggml_tensor * a, const struct ggml_tensor * b, const struct ggml_tensor * c, int ith, int nth, void * userdata);
 
 // This is a custom op for logit correction in the Dia model.
 void cfg_scale(struct ggml_tensor * dst, const struct ggml_tensor * a, const struct ggml_tensor * b, int ith, int nth, void * userdata);
 
-struct ggml_tensor * reciprocal(ggml_context * ctx, struct ggml_tensor * x);
+struct ggml_tensor * reciprocal(ggml_context * ctx, struct ggml_tensor * x,
+                                std::vector<tts_graph_const_input> * const_inputs = nullptr);
 
 // ---------------------------
 // ggml 后端选择（CPU/Metal/Vulkan）

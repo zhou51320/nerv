@@ -1,6 +1,7 @@
 #include <thread>
 #include <vector>
 #include <cstdarg>
+#include <cctype>
 #include <cstdio>
 #include <filesystem>
 #include <system_error>
@@ -62,6 +63,39 @@ static double tts_cli_us_to_ms(const int64_t us) {
     return us / 1000.0;
 }
 
+static std::string tts_cli_to_lower(std::string v) {
+    for (char & c : v) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return v;
+}
+
+static bool tts_cli_parse_language(const std::string & value, tts_language & out) {
+    const std::string lower = tts_cli_to_lower(value);
+    if (lower.empty() || lower == "zh" || lower == "cn" || lower == "chinese") {
+        out = tts_language::ZH;
+        return true;
+    }
+    if (lower == "en" || lower == "english") {
+        out = tts_language::EN;
+        return true;
+    }
+    if (lower == "ja" || lower == "jp" || lower == "japanese") {
+        out = tts_language::JA;
+        return true;
+    }
+    return false;
+}
+
+static const char * tts_cli_language_name(tts_language lang) {
+    switch (lang) {
+        case tts_language::ZH: return "zh";
+        case tts_language::EN: return "en";
+        case tts_language::JA: return "ja";
+    }
+    return "zh";
+}
+
 class tts_timing_printer {
     const int64_t start_us{[] {
         tts_time_init_once();
@@ -82,7 +116,11 @@ static int main_impl(int argc, const char ** argv) {
 
     const tts_timing_printer _{};
     float default_temperature = 1.0f;
-    int default_n_threads = std::max((int)std::thread::hardware_concurrency(), 1);
+    // 默认线程数改为“硬件并发的一半”（最少 1）。
+    // 说明：很多 CPU 的 hardware_concurrency() 返回的是“逻辑核数”（含超线程），
+    // 直接拉满线程在部分平台上反而会增加调度/缓存竞争开销，端到端延迟更差；
+    // 取一半通常更接近“物理核数”，对推理更稳。
+    int default_n_threads = std::max((int) std::thread::hardware_concurrency() / 2, 1);
     int default_top_k = 50;
     int default_max_tokens = 0;
     float default_repetition_penalty = 1.0f;
@@ -93,7 +131,7 @@ static int main_impl(int argc, const char ** argv) {
     args.add_argument(string_arg("--prompt", "(REQUIRED) The text prompt for which to generate audio in quotation markers.", "-p", false));
     args.add_argument(string_arg("--save-path", "(OPTIONAL) The path to save the audio output to in a .wav format. Defaults to TTS.cpp.wav", "-sp", false, "TTS.cpp.wav"));
     args.add_argument(float_arg("--temperature", "The temperature to use when generating outputs. Defaults to 1.0.", "-t", false, &default_temperature));
-    args.add_argument(int_arg("--n-threads", "The number of cpu threads to run generation with. Defaults to hardware concurrency. If hardware concurrency cannot be determined then it defaults to 1.", "-nt", false, &default_n_threads));
+    args.add_argument(int_arg("--n-threads", "The number of cpu threads to run generation with. Defaults to half of hardware concurrency (min 1). If hardware concurrency cannot be determined then it defaults to 1.", "-nt", false, &default_n_threads));
     args.add_argument(int_arg("--topk", "(OPTIONAL) When set to an integer value greater than 0 generation uses nucleus sampling over topk nucleaus size. Defaults to 50.", "-tk", false, &default_top_k));
     args.add_argument(float_arg("--repetition-penalty", "The by channel repetition penalty to be applied the sampled output of the model. defaults to 1.0.", "-r", false, &default_repetition_penalty));
     args.add_argument(bool_arg("--use-metal", "(OPTIONAL) Whether to use metal acceleration", "-m"));
@@ -103,6 +141,12 @@ static int main_impl(int argc, const char ** argv) {
     args.add_argument(string_arg("--conditional-prompt", "(OPTIONAL) A distinct conditional prompt to use for generating. If none is provided the preencoded prompt is used. '--text-encoder-path' must be set to use conditional generation.", "-cp", false));
     args.add_argument(string_arg("--text-encoder-path", "(OPTIONAL) The local path of the text encoder gguf model for conditional generaiton.", "-tep", false));
     args.add_argument(string_arg("--voice", "(OPTIONAL) The voice to use to generate the audio. This is only used for models with voice packs.", "-v", false, ""));
+    args.add_argument(string_arg("--lang", "(OPTIONAL) Language preference for digit reading / CJK frontend: zh, en, ja. Defaults to zh.", "-l", false, "zh"));
+    args.add_argument(string_arg("--zh-dict-dir",
+                                 "(OPTIONAL) Kokoro zh dict directory (pinyin_phrase.txt/pinyin.txt). Empty=auto (try ./dict then builtin if enabled); ':builtin' forces builtin; '-' disables.",
+                                 "-zd",
+                                 false,
+                                 ""));
     args.add_argument(bool_arg("--list-voices", "(OPTIONAL) List available voices for the selected model and exit.", "-lv"));
     args.add_argument(bool_arg("--vad", "(OPTIONAL) whether to apply voice inactivity detection (VAD) and strip silence form the end of the output (particularly useful for Parler TTS). By default, no VAD is applied.", "-va"));
     args.add_argument(int_arg("--max-tokens", "(OPTIONAL) The max audio tokens or token batches to generate where each represents approximates 11 ms of audio. Only applied to Dia generation. If set to zero as is its default then the default max generation size. Warning values under 15 are not supported.", "-mt", false, &default_max_tokens));
@@ -137,6 +181,13 @@ static int main_impl(int argc, const char ** argv) {
         exit(1);
     }
 
+    tts_language language = tts_language::ZH;
+    if (!tts_cli_parse_language(args.get_string_param("--lang"), language)) {
+        fprintf(stderr, "The '--lang' value must be 'zh', 'en' or 'ja'. It was set to '%s'.\n",
+                args.get_string_param("--lang").c_str());
+        exit(1);
+    }
+
     const generation_configuration config{
         args.get_string_param("--voice"),
         *args.get_int_param("--topk"),
@@ -144,7 +195,10 @@ static int main_impl(int argc, const char ** argv) {
         *args.get_float_param("--repetition-penalty"),
         !args.get_bool_param("--no-cross-attn"),
         *args.get_int_param("--max-tokens"),
-        *args.get_float_param("--top-p")};
+        *args.get_float_param("--top-p"),
+        true,
+        language,
+        args.get_string_param("--zh-dict-dir")};
 
     {
         const bool        list_voices = args.get_bool_param("--list-voices");
@@ -181,11 +235,24 @@ static int main_impl(int argc, const char ** argv) {
         const bool has_size = !model_path.empty() && model_path.rfind("test:", 0) != 0 &&
                               tts_cli_try_file_size(model_path, model_bytes);
 
-        tts_cli_log("运行配置：threads=%d device=%s vad=%s list_voices=%s",
+        const std::string zh_dict_dir = args.get_string_param("--zh-dict-dir");
+        std::string       zh_dict_desc;
+        if (zh_dict_dir.empty()) {
+            zh_dict_desc = "(auto: ./dict -> builtin)";
+        } else if (zh_dict_dir == "-") {
+            zh_dict_desc = "(disabled)";
+        } else if (zh_dict_dir == ":builtin") {
+            zh_dict_desc = "(builtin)";
+        } else {
+            zh_dict_desc = zh_dict_dir;
+        }
+        tts_cli_log("运行配置：threads=%d device=%s vad=%s list_voices=%s lang=%s zh_dict=%s",
                     *args.get_int_param("--n-threads"),
                     device_name.c_str(),
                     args.get_bool_param("--vad") ? "on" : "off",
-                    list_voices ? "yes" : "no");
+                    list_voices ? "yes" : "no",
+                    tts_cli_language_name(language),
+                    zh_dict_desc.c_str());
         if (has_size) {
             tts_cli_log("模型文件：%s (%.2f MiB)", model_path.c_str(), model_bytes / 1024.0 / 1024.0);
         } else {

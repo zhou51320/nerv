@@ -330,8 +330,8 @@ void orpheus_runner::decode(orpheus_ubatch & batch) {
     // update the total number of outputs retrieved and the current position
     octx->current_position += batch.n_tokens;
 
-    // Reset state for the next token before backend sync, to allow the CPU activities in the reset to
-    // overlap with device computation.
+    octx->sync();
+    // 说明：异步后端需要先同步，避免 reset 释放仍在使用的 buffer。
     ggml_backend_sched_reset(octx->sched);
 }
 
@@ -433,9 +433,9 @@ orpheus_ubatch orpheus_runner::build_worst_case_batch() {
 }
 
 void orpheus_runner::assign_weight(const char * name, ggml_tensor & tensor) {
-    if (const string_view name_sv{ name }; name_sv.starts_with("snac.")) {
+    if (const string_view name_sv{ name }; tts_starts_with(name_sv, "snac.")) {
         srunner->model->assign_weight(string{ name_sv.substr(sizeof("snac.") - 1) }, &tensor);
-    } else if (name_sv.starts_with("orpheus.")) {
+    } else if (tts_starts_with(name_sv, "orpheus.")) {
         model->assign_weight(string{ name_sv.substr(sizeof("orpheus.") - 1) }, &tensor);
     } else {
         fprintf(stdout, "Warning: function %s encountered an unhandled tensor named '%s'.\n", __func__, name);

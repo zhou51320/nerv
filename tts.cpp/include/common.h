@@ -5,6 +5,7 @@
 #include <string>
 #include <map>
 #include <memory>
+#include <utility>
 #include <vector>
 
 using namespace std;
@@ -22,6 +23,13 @@ enum tts_arch {
 	KOKORO_ARCH = 1,
 	DIA_ARCH = 2,
 	ORPHEUS_ARCH = 3,
+};
+
+// 文本语言偏好（主要用于 Kokoro 的多语言前端与数字读法选择）。
+enum class tts_language : uint8_t {
+    ZH = 0,
+    EN = 1,
+    JA = 2,
 };
 
 // 推理后端类型（用于选择 ggml 的设备后端）。
@@ -43,6 +51,8 @@ enum class tts_compute_backend {
 struct tts_backend_config {
     tts_compute_backend backend = tts_compute_backend::CPU;
     int device = 0;
+    // 是否优先使用“主机可见”的权重缓冲（主要用于 Vulkan 场景下回退 CPU 时避免读到设备内存）。
+    bool prefer_host_buffer = false;
 };
 
 const std::map<std::string, tts_arch> SUPPORTED_ARCHITECTURES = {
@@ -70,10 +80,22 @@ struct generation_configuration {
     	int top_k = 50,
     	float temperature = 1.0,
     	float repetition_penalty = 1.0,
-    	bool use_cross_attn = true,
+        bool use_cross_attn = true,
     	int max_tokens = 0,
     	float top_p = 1.0,
-    	bool sample = true): top_k(top_k), temperature(temperature), repetition_penalty(repetition_penalty), use_cross_attn(use_cross_attn), sample(sample), voice(voice), max_tokens(max_tokens), top_p(top_p) {};
+    	bool sample = true,
+        tts_language language = tts_language::ZH,
+        std::string zh_dict_dir = ""):
+        use_cross_attn(use_cross_attn),
+        temperature(temperature),
+        repetition_penalty(repetition_penalty),
+        top_p(top_p),
+        top_k(top_k),
+        max_tokens(max_tokens),
+        voice(std::move(voice)),
+        sample(sample),
+        zh_dict_dir(std::move(zh_dict_dir)),
+        language(language) {};
 
     bool use_cross_attn;
     float temperature;
@@ -83,6 +105,11 @@ struct generation_configuration {
     int max_tokens;
     std::string voice = "";
     bool sample = true;
+    // Kokoro 中文前端词典目录（可选）：包含 `pinyin_phrase.txt` / `pinyin.txt`。
+    // - 为空：默认尝试使用工作目录下的 `dict/`；若加载失败则回退到内置逐字映射。
+    // - "-"：显式禁用词典（便于对比/排查）。
+    std::string zh_dict_dir = "";
+    tts_language language = tts_language::ZH;
 };
 
 struct tts_runner {

@@ -160,6 +160,8 @@ void parler_tts_model::prep_cross_key_values(int n_threads, struct tts_response 
     }
 
     ggml_backend_sched_graph_compute_async(sched, gf);
+    // 说明：异步后端需要先同步，避免后续读取/释放时仍在执行。
+    ggml_backend_sched_synchronize(sched);
     
     for (int i = 0; i < layers.size(); i++) {
         struct ggml_tensor * k = ggml_graph_get_tensor(gf, ("cross_key_" + std::to_string(i)).c_str());
@@ -495,9 +497,9 @@ static struct parler_ubatch batch_from_sentence(std::string sentence, parler_tts
 }
 
 void parler_tts_runner::assign_weight(const char * name, ggml_tensor & tensor) {
-    if (const string_view name_sv{ name }; name_sv.starts_with("audio_encoder.")) {
+    if (const string_view name_sv{ name }; tts_starts_with(name_sv, "audio_encoder.")) {
         dac_runner->model->assign_weight(string{ name_sv.substr(sizeof("audio_encoder.") - 1) }, &tensor);
-    } else if (name_sv.starts_with("decoder.")) {
+    } else if (tts_starts_with(name_sv, "decoder.")) {
         model->assign_weight(string{ name_sv.substr(sizeof("decoder.") - 1) }, &tensor);
     } else {
         fprintf(stdout, "Warning: function %s encountered an unhandled tensor named '%s'.\n", __func__, name);
@@ -682,8 +684,8 @@ int parler_tts_runner::decode(parler_ubatch & batch) {
     // set to total number of outputs in the batch*/
     pctx->n_outputs += n_outputs_new;
 
-    // Reset state for the next token before backend sync, to allow the CPU activities in the reset to
-    // overlap with device computation.
+    pctx->sync();
+    // 说明：异步后端需要先同步，避免 reset 释放仍在使用的 buffer。
     ggml_backend_sched_reset(pctx->sched);
 
     return 0;
