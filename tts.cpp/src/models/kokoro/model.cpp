@@ -51,6 +51,23 @@ static bool tts_env_truthy_default(const char * name, bool default_value) {
     return std::strcmp(v, "0") != 0 && std::strcmp(v, "off") != 0 && std::strcmp(v, "false") != 0;
 }
 
+// 说明：Kokoro 的 tokenizer 是“按 UTF-8 字符（codepoint）”做单字切分的：
+// - 对英文/标点：1 字节 == 1 token（与 std::string::size() 一致）
+// - 对中文/注音符号等：通常是 3 字节/字符，但仍然应该算作 1 token
+// 因此在判断是否需要 chunking（是否超过 max_context_length）时，不能用字节长度，
+// 必须用 UTF-8 字符数量，否则会在中文场景下“误判为超长”，导致不必要的分句/多次推理，
+// 进而显著拉低 Vulkan 端到端吞吐（尤其是输出回读开销会被放大）。
+static size_t tts_utf8_codepoint_count(std::string_view s) {
+    size_t n = 0;
+    for (unsigned char c : s) {
+        // UTF-8 continuation byte 形如 10xxxxxx（0x80..0xBF），不计为新字符起始。
+        if ((c & 0xC0) != 0x80) {
+            ++n;
+        }
+    }
+    return n;
+}
+
 static int tts_env_int_default(const char * name, int default_value) {
     const char * v = std::getenv(name);
     if (v == nullptr || v[0] == '\0') {
@@ -2879,7 +2896,8 @@ bool kokoro_runner::try_phonemize(const char * prompt, std::string & out_phoneme
     // 说明：保持与 generate() 一致的“句末标点处理”逻辑：
     // - 短文本：把 ".!?" 替换为 ","（弱停顿），避免触发 EOS 提前结束；
     // - 长文本：进入 chunking 逻辑（这里不做拼接，直接返回原始音素串）。
-    if (!phonemized_prompt.empty() && phonemized_prompt.size() < model->max_context_length - 2) {
+    const size_t max_no_special = model->max_context_length > 2 ? (size_t) model->max_context_length - 2 : 0;
+    if (!phonemized_prompt.empty() && tts_utf8_codepoint_count(phonemized_prompt) <= max_no_special) {
         phonemized_prompt = strip(replace_any(std::move(phonemized_prompt), ".!?", ","));
     }
 
@@ -2968,8 +2986,9 @@ void kokoro_runner::generate(const char * prompt, tts_response & response, const
     size_t n_tokens_total = 0;
 
    	// Kokoro users a utf-8 single character tokenizer so if the size of the prompt is smaller than the max context length without the
-   	// beginning of sentence and end of sentence tokens then we can compute it all at once.
-   	if (phonemized_prompt.size() < model->max_context_length - 2) {
+	// beginning of sentence and end of sentence tokens then we can compute it all at once.
+    const size_t max_no_special = model->max_context_length > 2 ? (size_t) model->max_context_length - 2 : 0;
+    if (tts_utf8_codepoint_count(phonemized_prompt) <= max_no_special) {
    		// 说明：
    		// - Kokoro 会把 ".!?" 视为 EOS（句末）信号；若直接喂给模型，可能导致提前结束。
    		// - 但“直接删除”会丢失句间停顿，中文听感容易“一口气读完”。

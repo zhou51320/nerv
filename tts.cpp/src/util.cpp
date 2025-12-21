@@ -1122,29 +1122,36 @@ struct ggml_tensor * stft_graph(
                   (int) stft_raw->ne[1], (int) (cutoff * 2));
     }
 
-    // 3) reshape + permute => [cutoff, frames, batch, 2]
+    // 3) reshape => [frames, cutoff, batch, 2]
     ggml_tensor * stft_4d = ggml_reshape_4d(ctx, stft_raw, stft_raw->ne[0], cutoff, stft_raw->ne[2], 2);
-    ggml_tensor * stft_perm = ggml_permute(ctx, stft_4d, 1, 0, 2, 3);
 
+    // 说明（非常重要）：
+    // - ggml_permute 只返回 view（stride 会变得很“怪”），在 Vulkan 后端下，部分逐元素算子（abs/step/div 等）
+    //   对非连续/大 stride 的输入存在兼容性差异，可能表现为相位抖动，最终合成音频出现“沙沙声/电流声”。
+    // - 因此这里将“幅度/相位”的逐元素计算固定在 reshape 后的连续布局上完成，
+    //   再在最后做一次 permute 得到期望的 [cutoff, frames, batch, 2] 布局。
     if (!abs_and_angle) {
-        return stft_perm;
+        return ggml_permute(ctx, stft_4d, 1, 0, 2, 3);
     }
 
-    // 4) 转为 (magnitude, angle)
-    ggml_tensor * real = ggml_view_3d(ctx, stft_perm,
-                                      stft_perm->ne[0], stft_perm->ne[1], stft_perm->ne[2],
-                                      stft_perm->nb[1], stft_perm->nb[2], 0);
-    ggml_tensor * imag = ggml_view_3d(ctx, stft_perm,
-                                      stft_perm->ne[0], stft_perm->ne[1], stft_perm->ne[2],
-                                      stft_perm->nb[1], stft_perm->nb[2], stft_perm->nb[3]);
+    // 4) 转为 (magnitude, angle) —— 在连续布局 [frames, cutoff, batch] 上计算
+    ggml_tensor * real_f = ggml_view_3d(ctx, stft_4d,
+                                        stft_4d->ne[0], stft_4d->ne[1], stft_4d->ne[2],
+                                        stft_4d->nb[1], stft_4d->nb[2], 0);
+    ggml_tensor * imag_f = ggml_view_3d(ctx, stft_4d,
+                                        stft_4d->ne[0], stft_4d->ne[1], stft_4d->ne[2],
+                                        stft_4d->nb[1], stft_4d->nb[2], stft_4d->nb[3]);
 
-    ggml_tensor * real_sq = ggml_mul(ctx, real, real);
-    ggml_tensor * imag_sq = ggml_mul(ctx, imag, imag);
-    ggml_tensor * mag = ggml_sqrt(ctx, ggml_add(ctx, real_sq, imag_sq));
-    ggml_tensor * ang = tts_atan2_approx(ctx, imag, real, const_inputs);
+    ggml_tensor * real_sq = ggml_mul(ctx, real_f, real_f);
+    ggml_tensor * imag_sq = ggml_mul(ctx, imag_f, imag_f);
+    ggml_tensor * mag_f = ggml_sqrt(ctx, ggml_add(ctx, real_sq, imag_sq));
+    ggml_tensor * ang_f = tts_atan2_approx(ctx, imag_f, real_f, const_inputs);
 
-    ggml_tensor * mag4 = ggml_reshape_4d(ctx, mag, mag->ne[0], mag->ne[1], mag->ne[2], 1);
-    ggml_tensor * ang4 = ggml_reshape_4d(ctx, ang, ang->ne[0], ang->ne[1], ang->ne[2], 1);
+    // 5) permute 到 [cutoff, frames, batch, 1]，再 concat 得到 [cutoff, frames, batch, 2]
+    ggml_tensor * mag4_f = ggml_reshape_4d(ctx, mag_f, mag_f->ne[0], mag_f->ne[1], mag_f->ne[2], 1);
+    ggml_tensor * ang4_f = ggml_reshape_4d(ctx, ang_f, ang_f->ne[0], ang_f->ne[1], ang_f->ne[2], 1);
+    ggml_tensor * mag4 = ggml_permute(ctx, mag4_f, 1, 0, 2, 3);
+    ggml_tensor * ang4 = ggml_permute(ctx, ang4_f, 1, 0, 2, 3);
     return ggml_concat(ctx, mag4, ang4, 3);
 }
 
