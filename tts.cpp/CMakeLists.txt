@@ -87,6 +87,8 @@ if (TTS_STATIC_RUNTIME AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     add_link_options(
         $<$<LINK_LANGUAGE:CXX>:-static-libstdc++>
         $<$<LINK_LANGUAGE:CXX>:-static-libgcc>
+        # 避免静态 libgomp.a 依赖的 dl 符号被 --as-needed 丢弃
+        $<$<AND:$<STREQUAL:${CMAKE_SYSTEM_NAME},Linux>,$<LINK_LANGUAGE:CXX>>:-Wl,--no-as-needed>
     )
 endif()
 

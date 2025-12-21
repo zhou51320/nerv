@@ -19,7 +19,9 @@ $script:OutOsId = $OS_ID
 $script:AllDevices = @()
 $script:CompilerMode = 'auto'
 $script:GlobalCMakeConfigureArgs = @(
-  '-D', 'CMAKE_CUDA_FLAGS:STRING=-allow-unsupported-compiler'
+  '-D', 'CMAKE_CUDA_FLAGS:STRING=-allow-unsupported-compiler',
+  # 禁用 GGML AVX512 加速，避免在硬件/工具链不匹配时出问题
+  '-D', 'GGML_AVX512=OFF'
 )
 
 $Compiler = if ($Compiler) { $Compiler.Trim() } else { 'auto' }

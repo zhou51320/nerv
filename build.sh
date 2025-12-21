@@ -50,6 +50,9 @@ if [[ -n "${TTS_CMAKE_ARGS:-}" ]]; then
   TTS_CMAKE_ARGS_ARR=(${TTS_CMAKE_ARGS})
 fi
 
+# 禁用 AVX512 加速，避免在不支持/稳定性欠佳的平台上触发
+EVA_COMMON_CMAKE_ARGS+=(-DGGML_AVX512=OFF)
+
 # Toolchain overrides for tts.cpp (optional; empty => CMake default toolchain)
 : "${TTS_CC:=}"
 : "${TTS_CXX:=}"
