@@ -59,6 +59,55 @@ static bool tts_cli_try_file_size(const std::string & path, uint64_t & out_bytes
     return true;
 }
 
+static std::filesystem::path tts_cli_self_exe_dir(const char * argv0) {
+    // 说明：用于默认寻找 `dict/`（多音字短语词典），避免用户必须在“特定工作目录”运行 tts-cli。
+    // 优先使用 WinAPI 获取真实路径；其它平台退化为解析 argv0。
+#ifdef _WIN32
+    wchar_t buf[MAX_PATH + 1] = {0};
+    const DWORD n = GetModuleFileNameW(nullptr, buf, MAX_PATH);
+    if (n > 0 && n < MAX_PATH) {
+        return std::filesystem::path(buf).parent_path();
+    }
+#endif
+
+    if (argv0 == nullptr || argv0[0] == '\0') {
+        return {};
+    }
+
+    std::error_code ec;
+    std::filesystem::path p = std::filesystem::u8path(argv0);
+    p = std::filesystem::absolute(p, ec);
+    if (ec) {
+        return {};
+    }
+    return p.parent_path();
+}
+
+static std::string tts_cli_resolve_zh_dict_dir(const std::string & user_value, const char * argv0) {
+    // 说明：
+    // - 用户显式传入 --zh-dict-dir 时，完全尊重其值；
+    // - 未传时：优先 ./dict（工作目录），若不存在则尝试 exe 同目录的 dict/（便于随 exe 打包）。
+    if (!user_value.empty()) {
+        return user_value;
+    }
+
+    std::error_code ec;
+    if (std::filesystem::exists(std::filesystem::path("dict") / "pinyin_phrase.txt", ec) && !ec) {
+        // 保持空字符串：让库侧继续走 “auto: ./dict -> builtin” 的逻辑。
+        return "";
+    }
+
+    const std::filesystem::path exe_dir = tts_cli_self_exe_dir(argv0);
+    if (!exe_dir.empty()) {
+        ec.clear();
+        if (std::filesystem::exists(exe_dir / "dict" / "pinyin_phrase.txt", ec) && !ec) {
+            return (exe_dir / "dict").u8string();
+        }
+    }
+
+    return "";
+}
+
 static double tts_cli_us_to_ms(const int64_t us) {
     return us / 1000.0;
 }
@@ -68,6 +117,14 @@ static std::string tts_cli_to_lower(std::string v) {
         c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     }
     return v;
+}
+
+static const char * tts_cli_bench_prompt() {
+    // 说明：内置一段“中英混合、约 200 字”的固定测试文本，方便快速验证：
+    // - 中文：停顿/语速/数字读法/单位（℃）
+    // - 英文：常见单词与缩写（OpenAI/GPU/Vulkan/C++17）
+    // 注意：当 CLI 传入 --bench 时，会强制使用该文本进行推理，并忽略用户通过 -p/--prompt 传入的内容。
+    return u8"你好，这是 tts.cpp 的中英混合语音测试的行为，用来检查停顿、重音和数字读法。今天是2025年12月21日，温度23.5°C；请读：一二三四五，七八九零。Now in English: Hello world! This is a quick benchmark for Kokoro TTS. Please pronounce OpenAI, GPU, Vulkan, and C++17 clearly. Thanks.";
 }
 
 static bool tts_cli_try_parse_int(const std::string & text, int & out) {
@@ -178,6 +235,45 @@ static const char * tts_cli_language_name(tts_language lang) {
     return "zh";
 }
 
+static void tts_cli_print_phoneme_debug(tts_generation_runner * runner,
+                                        const std::string & prompt,
+                                        const generation_configuration & config) {
+    // 说明：默认打印“原文 + 音素串 + 分词(词(音素))”，便于快速定位：
+    // - 小数点/单位是否被正确归一化；
+    // - 多音字是否命中短语词典；
+    // - 卷舌/舌尖元音等细节是否生效。
+    if (runner == nullptr) {
+        return;
+    }
+
+    std::string phonemes;
+    std::vector<tts_generation_runner::phoneme_segment> segments;
+    if (!runner->try_phonemize_segments(prompt.c_str(), phonemes, segments, config)) {
+        return;
+    }
+
+    tts_cli_log("原文：%s", prompt.c_str());
+    tts_cli_log("音素：%s", phonemes.c_str());
+
+    std::string pretty;
+    pretty.reserve(phonemes.size() + segments.size() * 6);
+    for (const auto & seg : segments) {
+        if (seg.is_boundary) {
+            pretty.append(seg.text);
+            continue;
+        }
+        pretty.append(seg.text);
+        pretty.push_back('(');
+        pretty.append(seg.phonemes);
+        pretty.push_back(')');
+        pretty.push_back(' ');
+    }
+    if (!pretty.empty() && pretty.back() == ' ') {
+        pretty.pop_back();
+    }
+    tts_cli_log("分词：%s", pretty.c_str());
+}
+
 class tts_timing_printer {
     const int64_t start_us{[] {
         tts_time_init_once();
@@ -210,7 +306,8 @@ static int main_impl(int argc, const char ** argv) {
     int default_vulkan_device = 0;
     arg_list args;
     args.add_argument(string_arg("--model-path", "(REQUIRED) The local path of the gguf model file for Parler TTS mini or large v1, Dia, or Kokoro.", "-mp", true));
-    args.add_argument(string_arg("--prompt", "(REQUIRED) The text prompt for which to generate audio in quotation markers.", "-p", false));
+    args.add_argument(string_arg("--prompt", "(REQUIRED unless --bench) The text prompt for which to generate audio in quotation markers.", "-p", false));
+    args.add_argument(bool_arg("--bench", "(OPTIONAL) Use the built-in mixed zh/en benchmark prompt and ignore '--prompt'/'-p'.", "-b"));
     args.add_argument(string_arg("--save-path", "(OPTIONAL) The path to save the audio output to in a .wav format. Defaults to TTS.cpp.wav", "-sp", false, "TTS.cpp.wav"));
     args.add_argument(float_arg("--temperature", "The temperature to use when generating outputs. Defaults to 1.0.", "-t", false, &default_temperature));
     args.add_argument(int_arg("--n-threads", "The number of cpu threads to run generation with. Defaults to half of hardware concurrency (min 1). If hardware concurrency cannot be determined then it defaults to 1.", "-nt", false, &default_n_threads));
@@ -252,8 +349,9 @@ static int main_impl(int argc, const char ** argv) {
     const int64_t t_parse_end_us = ggml_time_us();
     tts_cli_log("参数解析完成：%.2f ms", tts_cli_us_to_ms(t_parse_end_us - t_parse_start_us));
 
-    if (!args.get_bool_param("--list-voices") && args.get_string_param("--prompt").empty()) {
-        fprintf(stderr, "argument '--prompt' is required.\n");
+    const bool bench = args.get_bool_param("--bench");
+    if (!args.get_bool_param("--list-voices") && !bench && args.get_string_param("--prompt").empty()) {
+        fprintf(stderr, "argument '--prompt' is required unless '--bench' is set.\n");
         exit(1);
     }
 
@@ -276,6 +374,9 @@ static int main_impl(int argc, const char ** argv) {
         exit(1);
     }
 
+    const std::string zh_dict_dir_raw = args.get_string_param("--zh-dict-dir");
+    const std::string zh_dict_dir = tts_cli_resolve_zh_dict_dir(zh_dict_dir_raw, (argc > 0) ? argv[0] : nullptr);
+
     const generation_configuration config{
         args.get_string_param("--voice"),
         *args.get_int_param("--topk"),
@@ -286,7 +387,7 @@ static int main_impl(int argc, const char ** argv) {
         *args.get_float_param("--top-p"),
         true,
         language,
-        args.get_string_param("--zh-dict-dir")};
+        zh_dict_dir};
 
     // ----------------------------
     // 选择推理后端（CPU / Metal / Vulkan）
@@ -341,16 +442,17 @@ static int main_impl(int argc, const char ** argv) {
         const bool has_size = !model_path.empty() && model_path.rfind("test:", 0) != 0 &&
                               tts_cli_try_file_size(model_path, model_bytes);
 
-        const std::string zh_dict_dir = args.get_string_param("--zh-dict-dir");
-        std::string       zh_dict_desc;
-        if (zh_dict_dir.empty()) {
+        std::string zh_dict_desc;
+        if (zh_dict_dir_raw.empty() && !zh_dict_dir.empty()) {
+            zh_dict_desc = "(auto: exe_dir/dict) " + zh_dict_dir;
+        } else if (zh_dict_dir_raw.empty()) {
             zh_dict_desc = "(auto: ./dict -> builtin)";
-        } else if (zh_dict_dir == "-") {
+        } else if (zh_dict_dir_raw == "-") {
             zh_dict_desc = "(disabled)";
-        } else if (zh_dict_dir == ":builtin") {
+        } else if (zh_dict_dir_raw == ":builtin") {
             zh_dict_desc = "(builtin)";
         } else {
-            zh_dict_desc = zh_dict_dir;
+            zh_dict_desc = zh_dict_dir_raw;
         }
         tts_cli_log("运行配置：threads=%d device=%s vad=%s list_voices=%s lang=%s zh_dict=%s",
                     *args.get_int_param("--n-threads"),
@@ -409,6 +511,9 @@ static int main_impl(int argc, const char ** argv) {
     }
     tts_response data;
 
+    // 说明：--bench 的设计目标是“一键用固定文本跑通一次推理”，因此这里强制覆盖 prompt，避免 -p/--prompt 影响基准对比的一致性。
+    const std::string prompt = bench ? std::string(tts_cli_bench_prompt()) : args.get_string_param("--prompt");
+
     const int64_t t_gen_start_us = ggml_time_us();
     tts_cli_log("开始生成语音：voice=\"%s\" top_k=%d top_p=%.3f temp=%.3f rep_pen=%.3f",
                 config.voice.c_str(),
@@ -416,7 +521,10 @@ static int main_impl(int argc, const char ** argv) {
                 config.top_p,
                 config.temperature,
                 config.repetition_penalty);
-    runner->generate(args.get_string_param("--prompt").c_str(), data, config);
+
+    // 默认打印音素调试信息（stderr），不影响生成的 wav 文件。
+    tts_cli_print_phoneme_debug(runner.get(), prompt, config);
+    runner->generate(prompt.c_str(), data, config);
     const int64_t t_gen_end_us = ggml_time_us();
     if (data.n_outputs > 0 && runner->sampling_rate > 0.0f) {
         const double audio_s = static_cast<double>(data.n_outputs) / runner->sampling_rate;
@@ -425,7 +533,7 @@ static int main_impl(int argc, const char ** argv) {
         tts_cli_log("生成完成：samples=%zu (%.2f ms)", data.n_outputs, tts_cli_us_to_ms(t_gen_end_us - t_gen_start_us));
     }
     if (data.n_outputs == 0) {
-        fprintf(stderr, "Got empty response for prompt, '%s'.\n", args.get_string_param("--prompt").c_str());
+        fprintf(stderr, "Got empty response for prompt, '%s'.\n", prompt.c_str());
         exit(1);
     }
     if (args.get_bool_param("--vad")) {

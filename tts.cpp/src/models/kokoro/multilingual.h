@@ -20,3 +20,7 @@ std::string kokoro_phonemize_multilingual(const std::string & text,
                                           const std::string & zh_dict_dir = "");
 
 bool kokoro_contains_cjk(const std::string & text);
+
+// 中文偏好下的“单位/符号”轻量归一化（用于把 “23.5°C/℃/°F/℉/km/h ...” 改写为更自然的中文读法）。
+// 说明：该函数不会做数字转中文（数字读法由 zh_frontend 处理）。
+std::string kokoro_normalize_zh_units(const std::string & text);

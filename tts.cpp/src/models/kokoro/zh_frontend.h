@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 // Kokoro 中文（普通话）G2P：将中文文本转换为 Kokoro 可识别的“单字符 token 串”。
 //
@@ -15,6 +16,27 @@
 
 namespace kokoro_zh {
 
+struct zh_debug_item {
+    // 归一化后的“原文片段”（通常是一个“词/短语”或一个边界符号）。
+    std::string text;
+    // 对应的 Kokoro token 串（UTF-8，单字符 token + 声调数字）。
+    std::string phonemes;
+    // 是否为边界符号（空白/标点等）。边界符号在调试打印时通常不需要括号包裹。
+    bool is_boundary = false;
+};
+
+struct zh_debug_result {
+    // 数字归一化后的文本（例如 23.5 -> 二十三点五）。
+    std::string normalized_text;
+    // 最终输出的 Kokoro token 串。
+    std::string phonemes;
+    // 逐字对齐信息（便于观测多音字/声调/卷舌等问题）。
+    std::vector<zh_debug_item> items;
+};
+
 std::string text_to_zh_phonemes(const std::string & text, const std::string & dict_dir = "");
+
+// 调试版：除了返回音素串，还会提供“归一化文本 + 逐字对齐”的信息。
+zh_debug_result text_to_zh_phonemes_debug(const std::string & text, const std::string & dict_dir = "");
 
 } // namespace kokoro_zh

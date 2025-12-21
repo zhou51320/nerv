@@ -211,9 +211,15 @@ struct ggml_tensor * reciprocal(ggml_context * ctx, struct ggml_tensor * x,
                                 std::vector<tts_graph_const_input> * const_inputs) {
     TTS_ASSERT(x->ne[0] == 1);
     static constexpr float one = 1.0f;
-    ggml_tensor * numerator = tts_const_tensor(ctx, &one, const_inputs);
-    ggml_tensor * numerator_b = ggml_repeat(ctx, numerator, x);
-    return ggml_div(ctx, numerator_b, x);
+    // 说明：
+    // - 旧实现为了得到 "1/x" 会先构造一个与 x 同形状的全 1 张量再做除法。
+    // - 在 Vulkan 下用 ggml_repeat 去广播标量常量，有概率触发后端对标量 repeat 的边界问题（表现为输出出现明显的“金属音”失真）。
+    // - 这里改为用标准算子生成同形状的全 1：ones = x*0 + 1，再计算 ones/x。
+    //   这样避免了标量 repeat，同时仍保持整段计算可被 Vulkan 图执行。
+    ggml_tensor * one_t = tts_const_tensor(ctx, &one, const_inputs); // 标量 1
+    ggml_tensor * zeros = ggml_scale(ctx, x, 0.0f);                 // 与 x 同形状的全 0
+    ggml_tensor * ones  = ggml_add(ctx, zeros, one_t);              // 与 x 同形状的全 1（标量自动广播）
+    return ggml_div(ctx, ones, x);
 }
 
 // Described in https://arxiv.org/abs/2006.08195
@@ -221,11 +227,16 @@ struct ggml_tensor * reciprocal(ggml_context * ctx, struct ggml_tensor * x,
 struct ggml_tensor * snake_1d(ggml_context * ctx, struct ggml_tensor * alpha, struct ggml_tensor * a,
                               std::vector<tts_graph_const_input> * const_inputs) {
     assert(a->ne[2] == 1 && a->ne[3] == 1);
-    return ggml_add(ctx,
-                    a,
-                    ggml_mul(ctx,
-                             ggml_sqr(ctx, ggml_sin(ctx, ggml_mul(ctx, a, alpha))),
-                             reciprocal(ctx, alpha, const_inputs)));
+    // 说明：
+    // Snake1d(a, alpha) = a + (sin(alpha * a)^2) / alpha
+    //
+    // 这里故意使用 “/ alpha” 而不是先算 reciprocal(alpha) 再乘：
+    // - 可避免 Vulkan 路径下对标量常量的 repeat 广播（见 reciprocal() 的说明）；
+    // - 算子更少（少一次 reciprocal 分支），在 Vulkan 下也更稳定。
+    (void) const_inputs; // 当前实现不再需要通过 const_inputs 注入常量
+    ggml_tensor * sin_sq = ggml_sqr(ctx, ggml_sin(ctx, ggml_mul(ctx, a, alpha)));
+    ggml_tensor * term   = ggml_div(ctx, sin_sq, alpha);
+    return ggml_add(ctx, a, term);
 }
 
 namespace {

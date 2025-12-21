@@ -1,6 +1,7 @@
 #include "model.h"
 #include "numbers_compat.h"
 #include "multilingual.h"
+#include "zh_frontend.h"
 
 #include <algorithm>
 #include <cmath>
@@ -707,6 +708,71 @@ static void kokoro_force_supported_ops_backend(runner_context * ctx, ggml_cgraph
     }
 }
 
+// 说明：为排查/规避部分 Vulkan 驱动在 STFT/ISTFT（conv 版）上的数值/实现问题，
+// 提供一个“仅把 STFT/ISTFT 核心卷积算子固定到 CPU”的开关。
+//
+// 设计目标：
+// - 尽量保持其余大头算子（mul_mat / upsample conv_transpose 等）继续走 Vulkan，以保留加速收益；
+// - 只对 `kokoro.stft_forward_basis` / `kokoro.stft_inverse_basis` 这两组基矩阵相关的卷积算子做定点处理。
+//
+// 开关：
+// - TTS_VK_STFT_CPU=1：将 STFT 的 ggml_conv_1d（kernel=stft_forward_basis）固定到 CPU
+// - TTS_VK_ISTFT_CPU=1：将 ISTFT 的 ggml_conv_transpose_1d（kernel=stft_inverse_basis）固定到 CPU
+// - TTS_VK_AUDIO_QUALITY=1：等价于同时开启上述两项
+static void kokoro_force_vk_stft_istft_cpu_if_needed(runner_context * ctx, ggml_cgraph * gf, const kokoro_model * model) {
+    if (!ctx || !gf || !model || !ctx->sched || !ctx->backend_cpu) {
+        return;
+    }
+    if (!ctx->backend || !tts_backend_is_vulkan(ctx->backend)) {
+        return;
+    }
+
+    const bool quality_mode = tts_env_truthy("TTS_VK_AUDIO_QUALITY");
+    const bool stft_cpu = quality_mode || tts_env_truthy("TTS_VK_STFT_CPU");
+    const bool istft_cpu = quality_mode || tts_env_truthy("TTS_VK_ISTFT_CPU");
+    if (!stft_cpu && !istft_cpu) {
+        return;
+    }
+
+    const ggml_tensor * fwd0 = model->stft_forward_basis;
+    const ggml_tensor * fwd1 = model->stft_forward_basis_cpu;
+    const ggml_tensor * inv0 = model->stft_inverse_basis;
+    const ggml_tensor * inv1 = model->stft_inverse_basis_cpu;
+
+    auto is_fwd_basis = [&](const ggml_tensor * t) {
+        return t != nullptr && (t == fwd0 || (fwd1 != nullptr && t == fwd1));
+    };
+    auto is_inv_basis = [&](const ggml_tensor * t) {
+        return t != nullptr && (t == inv0 || (inv1 != nullptr && t == inv1));
+    };
+
+    for (int i = 0; i < gf->n_nodes; ++i) {
+        ggml_tensor * node = gf->nodes[i];
+        if (!node) {
+            continue;
+        }
+
+        // ggml_conv_1d 当前是由 im2col + mul_mat 组合实现的（没有独立的 GGML_OP_CONV_1D）。
+        // 因此这里通过“权重指针”精确定位 STFT 相关节点：
+        // - im2col(src0==stft_forward_basis)
+        // - mul_mat(src1 的 view_src==stft_forward_basis)
+        if (stft_cpu) {
+            if (node->op == GGML_OP_IM2COL && is_fwd_basis(node->src[0])) {
+                ggml_backend_sched_set_tensor_backend(ctx->sched, node, ctx->backend_cpu);
+                continue;
+            }
+            if (node->op == GGML_OP_MUL_MAT && node->src[1] && is_fwd_basis(node->src[1]->view_src)) {
+                ggml_backend_sched_set_tensor_backend(ctx->sched, node, ctx->backend_cpu);
+                continue;
+            }
+        }
+        if (istft_cpu && node->op == GGML_OP_CONV_TRANSPOSE_1D && is_inv_basis(node->src[0])) {
+            ggml_backend_sched_set_tensor_backend(ctx->sched, node, ctx->backend_cpu);
+            continue;
+        }
+    }
+}
+
 // 说明：自定义算子目前仅支持 CPU；在 Vulkan 图中显式固定它们到 CPU，避免被错误分配到 GPU 后端。
 static void kokoro_force_custom_ops_cpu(runner_context * ctx, ggml_cgraph * gf) {
     if (!ctx || !gf || !ctx->backend || !tts_backend_is_vulkan(ctx->backend) || !ctx->sched || !ctx->backend_cpu) {
@@ -1068,9 +1134,35 @@ static struct ggml_tensor * build_generator(ggml_context * ctx, kokoro_model * m
 	struct ggml_tensor * sing = build_sin_gen(ctx, model, kctx, f0_curve, model->harmonic_num + 1, f0_curve->ne[0] * 300, model->voice_threshold, model->sin_amp, model->noise_std);
 	struct ggml_tensor * har = ggml_tanh(ctx, ggml_add(ctx, ggml_mul_mat(ctx, generator->m_source_weight, sing), generator->m_source_bias));
 
-    const bool use_graph_stft = tts_backend_is_vulkan(kctx->backend) && model->stft_forward_basis && model->stft_inverse_basis;
-    const bool use_graph_consts = tts_backend_is_vulkan(kctx->backend);
+    // 说明：Vulkan 路径默认启用 conv 版 STFT/ISTFT（完整图执行更快）。
+    // 若遇到明显音质劣化（如“金属音”），可用环境变量回退到自定义 STFT/ISTFT：
+    // - TTS_VK_GRAPH_STFT=0：har 的 STFT 回退到自定义算子（CPU）
+    // - TTS_VK_GRAPH_ISTFT=0：末端 ISTFT 回退到自定义算子（CPU）
+    const bool vk_backend = tts_backend_is_vulkan(kctx->backend);
+    const bool graph_stft_allowed = vk_backend && model->stft_forward_basis && model->stft_inverse_basis;
+    const bool use_graph_stft = graph_stft_allowed && tts_env_truthy_default("TTS_VK_GRAPH_STFT", /*default_value=*/true);
+    const bool use_graph_istft = graph_stft_allowed && tts_env_truthy_default("TTS_VK_GRAPH_ISTFT", /*default_value=*/true);
+    const bool use_graph_consts = use_graph_stft; // 目前常量输入仅用于 stft_graph 内的 atan2 近似
     std::vector<tts_graph_const_input> * const_inputs = use_graph_consts ? &kctx->graph_const_inputs : nullptr;
+
+    // 说明：质量兜底/排查开关：可选择仅让 STFT/ISTFT 在 CPU 上执行（避免某些 Vulkan 实现导致的音质问题）。
+    // 注意：这里并不改变“图结构”（仍使用 conv 版 stft_graph/istft_graph），只是在权重与调度上让其走 CPU 后端。
+    const bool vk_quality_mode = vk_backend && tts_env_truthy("TTS_VK_AUDIO_QUALITY");
+    const bool stft_cpu = vk_backend && (vk_quality_mode || tts_env_truthy("TTS_VK_STFT_CPU"));
+    const bool istft_cpu = vk_backend && (vk_quality_mode || tts_env_truthy("TTS_VK_ISTFT_CPU"));
+
+    // 说明：自定义 STFT/ISTFT（GGML_OP_CUSTOM）在实现中会直接读取 window->data，
+    // 因此在 Vulkan 权重位于设备内存时必须改用 CPU 可读副本。
+    ggml_tensor * window_custom = generator->window_cpu ? generator->window_cpu : generator->window;
+
+    ggml_tensor * stft_forward_basis = model->stft_forward_basis;
+    ggml_tensor * stft_inverse_basis = model->stft_inverse_basis;
+    if (stft_cpu && model->stft_forward_basis_cpu) {
+        stft_forward_basis = model->stft_forward_basis_cpu;
+    }
+    if (istft_cpu && model->stft_inverse_basis_cpu) {
+        stft_inverse_basis = model->stft_inverse_basis_cpu;
+    }
     // 说明：清理上一次图构建的输入指针，避免 set_inputs 误写旧地址。
     kctx->stft_pad_indices = nullptr;
     kctx->graph_const_inputs.clear();
@@ -1083,10 +1175,10 @@ static struct ggml_tensor * build_generator(ggml_context * ctx, kokoro_model * m
         kctx->stft_pad_indices = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, pad_len, har_in->ne[1]);
         ggml_set_input(kctx->stft_pad_indices);
         ggml_set_name(kctx->stft_pad_indices, "kokoro.stft_pad_indices");
-        har = stft_graph(ctx, har_in, model->stft_forward_basis, kctx->stft_pad_indices, const_inputs,
+        har = stft_graph(ctx, har_in, stft_forward_basis, kctx->stft_pad_indices, const_inputs,
                          model->true_n_fft, model->stft_hop, true, true);
     } else {
-        har = stft(ctx, har_in, generator->window, model->true_n_fft, model->stft_hop, true, true);
+        har = stft(ctx, har_in, window_custom, model->true_n_fft, model->stft_hop, true, true);
     }
 
 	// stft returns a vector of shape [nfft, frames, batch, 2] where the final shape (2) separates the magnitude and the phase
@@ -1142,11 +1234,11 @@ static struct ggml_tensor * build_generator(ggml_context * ctx, kokoro_model * m
 
 	cur = ggml_concat(ctx, spec, phase, 3); // istft expects the magnitude and phase concatenated after the batch;
     ggml_tensor * istft_in = ggml_cont(ctx, ggml_transpose(ctx, cur));
-    if (use_graph_stft) {
-        cur = istft_graph(ctx, istft_in, window_sq_sum, model->stft_inverse_basis,
+    if (use_graph_istft) {
+        cur = istft_graph(ctx, istft_in, window_sq_sum, stft_inverse_basis,
                           model->true_n_fft, model->stft_hop, true, true);
     } else {
-        cur = istft(ctx, istft_in, window_sq_sum, generator->window,
+        cur = istft(ctx, istft_in, window_sq_sum, window_custom,
                     model->true_n_fft, model->stft_hop, true, true);
     }
 	ggml_set_name(cur, "after_res_gen");
@@ -1282,6 +1374,27 @@ void kokoro_model::post_load_assign() {
         alloc_tensor(decoder->generator->window, "stft_window");
  		size_t size = ggml_nbytes(decoder->generator->window);
  		ggml_backend_tensor_set(decoder->generator->window, decoder->generator->window_host.data(), 0, size);
+
+        // 说明：为自定义 STFT/ISTFT（GGML_OP_CUSTOM）回退路径准备一份 CPU 可读的 window 张量。
+        // - 自定义算子在实现中直接读取 win->data，因此当 window 位于 Vulkan 设备内存时会读到不可用地址，
+        //   进而表现为“电流声/人声消失/强金属音”等严重失真。
+        // - 这里按 buffer 类型判断是否为 host；若不是，则额外分配 CPU buffer 并拷贝一份数据。
+        const bool window_host = (buffer != nullptr) ? ggml_backend_buft_is_host(buffer) : true;
+        if (window_host) {
+            decoder->generator->window_cpu = decoder->generator->window;
+        } else {
+            decoder->generator->window_cpu = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, true_n_fft);
+            ggml_set_name(decoder->generator->window_cpu, "stft_window.cpu");
+            ggml_backend_buffer_t win_cpu_buf = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), ggml_nbytes(decoder->generator->window_cpu));
+            if (!win_cpu_buf) {
+                TTS_ABORT("Failed to allocate CPU buffer for stft_window.cpu (bytes=%zu)\n",
+                          ggml_nbytes(decoder->generator->window_cpu));
+            }
+            extra_buffers.push_back(win_cpu_buf);
+            decoder->generator->window_cpu->buffer = win_cpu_buf;
+            decoder->generator->window_cpu->data = ggml_backend_buffer_get_base(win_cpu_buf);
+            ggml_backend_tensor_set(decoder->generator->window_cpu, decoder->generator->window_host.data(), 0, size);
+        }
  	} else {
  		TTS_ABORT("Window of type %s is not supported.", window.c_str());
  	}
@@ -1309,6 +1422,39 @@ void kokoro_model::post_load_assign() {
         stft_inverse_basis->buffer = inv_buf;
         stft_inverse_basis->data = ggml_backend_buffer_get_base(inv_buf);
         ggml_backend_tensor_set(stft_inverse_basis, inverse_basis.data(), 0, inverse_basis.size() * sizeof(float));
+
+        // 说明：为支持 Vulkan 下 STFT/ISTFT 回退 CPU（或混合计算），需要一份 CPU 可读的基矩阵。
+        // - 若当前权重 buffer 本身是 host buffer（CPU 或 Vulkan-host-visible），则直接复用即可；
+        // - 否则（Vulkan 设备内存）：额外分配一份 CPU buffer 副本，避免 CPU 回退时读到设备内存导致崩溃/异常。
+        const bool basis_host = (buffer != nullptr) ? ggml_backend_buft_is_host(buffer) : true;
+        if (basis_host) {
+            stft_forward_basis_cpu = stft_forward_basis;
+            stft_inverse_basis_cpu = stft_inverse_basis;
+        } else {
+            stft_forward_basis_cpu = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, true_n_fft, 1, rows);
+            ggml_set_name(stft_forward_basis_cpu, "kokoro.stft_forward_basis.cpu");
+            ggml_backend_buffer_t fwd_cpu_buf = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), ggml_nbytes(stft_forward_basis_cpu));
+            if (!fwd_cpu_buf) {
+                TTS_ABORT("Failed to allocate CPU buffer for kokoro.stft_forward_basis.cpu (bytes=%zu)\n",
+                          ggml_nbytes(stft_forward_basis_cpu));
+            }
+            extra_buffers.push_back(fwd_cpu_buf);
+            stft_forward_basis_cpu->buffer = fwd_cpu_buf;
+            stft_forward_basis_cpu->data = ggml_backend_buffer_get_base(fwd_cpu_buf);
+            ggml_backend_tensor_set(stft_forward_basis_cpu, forward_basis.data(), 0, forward_basis.size() * sizeof(float));
+
+            stft_inverse_basis_cpu = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, true_n_fft, 1, rows);
+            ggml_set_name(stft_inverse_basis_cpu, "kokoro.stft_inverse_basis.cpu");
+            ggml_backend_buffer_t inv_cpu_buf = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), ggml_nbytes(stft_inverse_basis_cpu));
+            if (!inv_cpu_buf) {
+                TTS_ABORT("Failed to allocate CPU buffer for kokoro.stft_inverse_basis.cpu (bytes=%zu)\n",
+                          ggml_nbytes(stft_inverse_basis_cpu));
+            }
+            extra_buffers.push_back(inv_cpu_buf);
+            stft_inverse_basis_cpu->buffer = inv_cpu_buf;
+            stft_inverse_basis_cpu->data = ggml_backend_buffer_get_base(inv_cpu_buf);
+            ggml_backend_tensor_set(stft_inverse_basis_cpu, inverse_basis.data(), 0, inverse_basis.size() * sizeof(float));
+        }
     }
 
  	harmonic_sampling_norm = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, harmonic_num + 1);
@@ -2526,10 +2672,12 @@ void kokoro_runner::run(kokoro_ubatch & batch, tts_response & outputs) {
             kokoro_force_custom_views_cpu(kctx, gf);
             kokoro_force_supported_ops_backend(kctx, gf, kctx->backend);
             kokoro_force_inputs_backend(kctx, gf);
+            kokoro_force_vk_stft_istft_cpu_if_needed(kctx, gf, model.get());
             fprintf(stderr,
                     "[kokoro] Vulkan 后端检测到自定义算子，已固定为 CPU；其余节点仍走 Vulkan。如需强制全部 Vulkan 可设置 TTS_VK_FORCE_GEN=1。\n");
         } else {
             kokoro_force_inputs_backend(kctx, gf);
+            kokoro_force_vk_stft_istft_cpu_if_needed(kctx, gf, model.get());
         }
     }
     bool alloc_ok = ggml_backend_sched_alloc_graph(kctx->sched, gf);
@@ -2703,6 +2851,85 @@ void kokoro_runner::propagate_voice_setting() {
     drunner->kctx->voice = voice;
 }
 
+bool kokoro_runner::try_phonemize(const char * prompt, std::string & out_phonemes, const generation_configuration & config) {
+    // 说明：该接口仅用于 CLI 调试输出（原文/音素串），不执行推理。
+    // 这里尽量复用 generate() 的“音素化前半段逻辑”，确保输出与实际推理一致。
+    voice = config.voice;
+    propagate_voice_setting();
+
+    std::string normalized = prompt ? std::string(prompt) : std::string();
+    normalized = replace_any(std::move(normalized), "\n", " ");
+
+    // Enable built-in zh phonemization when either:
+    // - voice is Mandarin (z*)  OR
+    // - prompt contains CJK characters
+    const bool contains_cjk = kokoro_contains_cjk(normalized);
+    const bool use_multilingual = (config.language == tts_language::ZH) ||
+                                  (config.language == tts_language::JA) ||
+                                  (!voice.empty() && (voice[0] == 'z' || voice[0] == 'j')) ||
+                                  contains_cjk;
+
+    std::string phonemized_prompt;
+    if (use_multilingual) {
+        phonemized_prompt = kokoro_phonemize_multilingual(normalized, phmzr, config.language, config.zh_dict_dir);
+    } else {
+        phonemized_prompt = phmzr ? phmzr->text_to_phonemes(normalized) : "";
+    }
+
+    // 说明：保持与 generate() 一致的“句末标点处理”逻辑：
+    // - 短文本：把 ".!?" 替换为 ","（弱停顿），避免触发 EOS 提前结束；
+    // - 长文本：进入 chunking 逻辑（这里不做拼接，直接返回原始音素串）。
+    if (!phonemized_prompt.empty() && phonemized_prompt.size() < model->max_context_length - 2) {
+        phonemized_prompt = strip(replace_any(std::move(phonemized_prompt), ".!?", ","));
+    }
+
+    out_phonemes = std::move(phonemized_prompt);
+    return !out_phonemes.empty();
+}
+
+bool kokoro_runner::try_phonemize_segments(const char * prompt,
+                                          std::string & out_phonemes,
+                                          std::vector<tts_generation_runner::phoneme_segment> & out_segments,
+                                          const generation_configuration & config) {
+    // 说明：用于 CLI 调试打印（分词 + 音素），不执行推理。
+    // 设计目标：
+    // - 输出的 out_phonemes 尽量与 generate() 最终喂给 tokenizer 的串一致（包含短文本标点替换）；
+    // - out_segments 更偏“可读性”：中文走词典 DP 分词，输出“词(音素)”方便肉眼排查多音字/数字/卷舌等问题。
+    out_segments.clear();
+    out_phonemes.clear();
+
+    if (!try_phonemize(prompt, out_phonemes, config)) {
+        return false;
+    }
+
+    // 目前仅对中文偏好输出“分词级别”的 segments；其它语言退化为“整句一个 segment”。
+    if (config.language != tts_language::ZH) {
+        tts_generation_runner::phoneme_segment seg;
+        seg.text = prompt ? std::string(prompt) : std::string();
+        seg.phonemes = out_phonemes;
+        seg.is_boundary = false;
+        out_segments.push_back(std::move(seg));
+        return true;
+    }
+
+    // 说明：分词逻辑以中文前端为准；为保证与实际推理一致，这里先应用“单位归一化”。
+    std::string text = prompt ? std::string(prompt) : std::string();
+    text = replace_any(std::move(text), "\n", " ");
+    text = kokoro_normalize_zh_units(text);
+
+    const kokoro_zh::zh_debug_result dbg = kokoro_zh::text_to_zh_phonemes_debug(text, config.zh_dict_dir);
+    out_segments.reserve(dbg.items.size());
+    for (const auto & it : dbg.items) {
+        tts_generation_runner::phoneme_segment seg;
+        seg.text = it.text;
+        seg.phonemes = it.phonemes;
+        seg.is_boundary = it.is_boundary;
+        out_segments.push_back(std::move(seg));
+    }
+
+    return true;
+}
+
 void kokoro_runner::generate(const char * prompt, tts_response & response, const generation_configuration & config) {
     const bool timings = tts_timings_enabled();
     const int64_t t_start_us = timings ? tts_time_us() : 0;
@@ -2740,14 +2967,17 @@ void kokoro_runner::generate(const char * prompt, tts_response & response, const
     double run_ms = 0.0;
     size_t n_tokens_total = 0;
 
-  	// Kokoro users a utf-8 single character tokenizer so if the size of the prompt is smaller than the max context length without the
-  	// beginning of sentence and end of sentence tokens then we can compute it all at once.
-  	if (phonemized_prompt.size() < model->max_context_length - 2) {
-  		// we preserved punctuation and Kokoro interprets these tokens as end of sentence tokens, so we have to remove them for all-at-once compute.
-  		phonemized_prompt = strip(replace_any(phonemized_prompt, ".!?", ""));
-  		if (phonemized_prompt.empty()) {
-  			return;
-  		}
+   	// Kokoro users a utf-8 single character tokenizer so if the size of the prompt is smaller than the max context length without the
+   	// beginning of sentence and end of sentence tokens then we can compute it all at once.
+   	if (phonemized_prompt.size() < model->max_context_length - 2) {
+   		// 说明：
+   		// - Kokoro 会把 ".!?" 视为 EOS（句末）信号；若直接喂给模型，可能导致提前结束。
+   		// - 但“直接删除”会丢失句间停顿，中文听感容易“一口气读完”。
+   		// 因此这里把 ".!?" 替换为 ","（更弱的停顿），既避免 EOS，又尽量保留断句节奏。
+   		phonemized_prompt = strip(replace_any(phonemized_prompt, ".!?", ","));
+   		if (phonemized_prompt.empty()) {
+   			return;
+   		}
         const int64_t t_before_tokenize_us = timings ? tts_time_us() : 0;
 		std::vector<uint32_t> tokens;
 		tokens.push_back(model->bos_token_id);
@@ -2764,13 +2994,26 @@ void kokoro_runner::generate(const char * prompt, tts_response & response, const
 		run(batch, response);
         const int64_t t_after_run_us = timings ? tts_time_us() : 0;
         run_ms = us_to_ms(t_after_run_us - t_before_run_us);
-  	} else {
-  		// TODO: determine the performance to memory trade off in using a batched compute approach verse this chunking approach.
-  		// This approach is likely to be slower than a batched approach, but given the already huge memory overhead of Kokoro's graph it
-  		// might be preferable to use this chunking approach.
-  		std::vector<std::string> clauses = split(phonemized_prompt, ".!?");
+   	} else {
+   		// TODO: determine the performance to memory trade off in using a batched compute approach verse this chunking approach.
+   		// This approach is likely to be slower than a batched approach, but given the already huge memory overhead of Kokoro's graph it
+   		// might be preferable to use this chunking approach.
+   		std::vector<std::string> clauses = split(phonemized_prompt, ".!?");
+        // 说明：chunking 模式下 ".!?" 已被用于切句，因此不再喂给模型；这里用 ',' 作为弱停顿，
+        // 让多句长文本在拼接时更像自然断句（避免整段听起来“粘在一起”）。
+        std::vector<std::string> normalized_clauses;
+        normalized_clauses.reserve(clauses.size());
+        for (auto & clause : clauses) {
+            clause = strip(clause);
+            if (!clause.empty()) {
+                normalized_clauses.push_back(std::move(clause));
+            }
+        }
+        for (size_t ci = 0; ci + 1 < normalized_clauses.size(); ++ci) {
+            normalized_clauses[ci].push_back(',');
+        }
         const int64_t t_before_tokenize_us = timings ? tts_time_us() : 0;
-        const auto chunks = tokenize_chunks(clauses);
+        const auto chunks = tokenize_chunks(std::move(normalized_clauses));
         const int64_t t_after_tokenize_us = timings ? tts_time_us() : 0;
         tokenize_ms = us_to_ms(t_after_tokenize_us - t_before_tokenize_us);
         for (const auto & t : chunks) {

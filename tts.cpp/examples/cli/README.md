@@ -42,7 +42,9 @@ In order to get a detailed breakdown the functionality currently available you c
 --model-path (-mp):
     (REQUIRED) The local path of the gguf model file for Parler TTS mini or large v1, Dia, or Kokoro.
 --prompt (-p):
-    (REQUIRED) The text prompt for which to generate audio in quotation markers.
+    (REQUIRED unless --bench) The text prompt for which to generate audio in quotation markers.
+--bench (-b):
+    (OPTIONAL) Use the built-in mixed zh/en benchmark prompt and ignore '--prompt'/'-p'.
 --save-path (-sp):
     (OPTIONAL) The path to save the audio output to in a .wav format. Defaults to TTS.cpp.wav
 --conditional-prompt (-cp):
@@ -61,6 +63,12 @@ General usage should follow from these possible parameters. E.G. The following c
 
 ```bash
 ./tts-cli --model-path /model/path/to/gguf_file.gguf --prompt "I am saying some words" --save-path /tmp/test.wav
+```
+
+Or, to run a built-in mixed zh/en benchmark prompt (ignores `--prompt` / `-p`):
+
+```bash
+./tts-cli --model-path /model/path/to/gguf_file.gguf --bench --save-path /tmp/bench.wav
 ```
 
 #### Dia and Orpheus Generation Arguments

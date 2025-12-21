@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <filesystem>
 #include <fstream>
 #include <limits>
 #include <mutex>
@@ -135,6 +136,11 @@ static bool is_minus_sign(uint32_t cp) {
     return cp == '-' || cp == 0xFF0D || cp == 0x2212;
 }
 
+static bool is_ascii_space(uint32_t cp) {
+    // 说明：数字归一化仅需要处理常见 ASCII 空白即可。
+    return cp == ' ' || cp == '\t' || cp == '\r' || cp == '\n';
+}
+
 static char normalize_number_separator(uint32_t cp) {
     if (cp == 0xFF0E) {
         return '.';
@@ -147,6 +153,9 @@ static char normalize_number_separator(uint32_t cp) {
 
 static bool collect_number_token(const std::string & text, size_t start_offset, std::string & out_token, size_t & out_next_offset) {
     // 说明：解析连续数字（含英文/全角），并在数字之间保留 '.'/',' 作为分隔符。
+    // 兼容写法：
+    // - 23.5
+    // - 23. 5 / 23 .5 / 23 . 5（允许小数点两侧有空格，实际文本里很常见）
     out_token.clear();
     size_t offset = start_offset;
     bool has_digit = false;
@@ -164,13 +173,70 @@ static bool collect_number_token(const std::string & text, size_t start_offset, 
                 continue;
             }
         }
-        if (is_number_separator(cp) && has_digit) {
+        if (has_digit && is_number_separator(cp)) {
+            // 小数点/分隔符：允许分隔符后出现空格，再跟一个数字。
             size_t lookahead = offset;
             uint32_t next_cp = 0;
-            if (utf8_decode_next(text, lookahead, next_cp) && is_digit_cp(next_cp)) {
+            while (lookahead < text.size()) {
+                const size_t saved = lookahead;
+                if (!utf8_decode_next(text, lookahead, next_cp)) {
+                    lookahead = saved;
+                    break;
+                }
+                if (is_ascii_space(next_cp)) {
+                    continue;
+                }
+                break;
+            }
+            if (is_digit_cp(next_cp)) {
                 out_token.push_back(normalize_number_separator(cp));
+                // 重要：lookahead 这里已经“吃掉了下一个数字”，因此需要把该数字也写入 token，再推进 offset。
+                const int val = digit_value(next_cp);
+                if (val >= 0) {
+                    out_token.push_back(static_cast<char>('0' + val));
+                }
                 offset = lookahead;
                 continue;
+            }
+        }
+        if (has_digit && is_ascii_space(cp)) {
+            // 允许“数字 与 小数点之间”夹空格：例如 "23 .5" / "23 . 5"。
+            size_t lookahead = offset;
+            uint32_t sep_cp = 0;
+            while (lookahead < text.size()) {
+                const size_t saved = lookahead;
+                if (!utf8_decode_next(text, lookahead, sep_cp)) {
+                    lookahead = saved;
+                    break;
+                }
+                if (is_ascii_space(sep_cp)) {
+                    continue;
+                }
+                break;
+            }
+            if (is_number_separator(sep_cp)) {
+                size_t look2 = lookahead;
+                uint32_t digit_cp = 0;
+                while (look2 < text.size()) {
+                    const size_t saved = look2;
+                    if (!utf8_decode_next(text, look2, digit_cp)) {
+                        look2 = saved;
+                        break;
+                    }
+                    if (is_ascii_space(digit_cp)) {
+                        continue;
+                    }
+                    break;
+                }
+                if (is_digit_cp(digit_cp)) {
+                    out_token.push_back(normalize_number_separator(sep_cp));
+                    const int val = digit_value(digit_cp);
+                    if (val >= 0) {
+                        out_token.push_back(static_cast<char>('0' + val));
+                    }
+                    offset = look2;
+                    continue;
+                }
             }
         }
         offset = cp_start;
@@ -742,6 +808,25 @@ static bool parse_pinyin_syllable(std::string_view in, zh_syllable & out) {
     return true;
 }
 
+static void fix_apical_vowel_for_builtin(kokoro_zh::zh_syllable_base & base) {
+    // 说明：
+    // - zh_pinyin_data 是由脚本批量生成的“单字拼音表”，用于在没有短语拼音时快速得到一个默认读音。
+    // - 对于 z/c/s 与 zh/ch/sh/r 这两组“舌尖元音 i”（zi/ci/si vs zhi/chi/shi/ri），需要区分为 ii/iii，
+    //   否则会出现“卷舌音不明显/听起来像 z/c/s”的问题。
+    // - 短语词典路径（parse_pinyin_syllable）已经做了该区分，这里补齐内置单字表的兜底修正。
+    if (base.final != "i") {
+        return;
+    }
+    if (base.initial == "z" || base.initial == "c" || base.initial == "s") {
+        base.final = "ii";
+        return;
+    }
+    if (base.initial == "zh" || base.initial == "ch" || base.initial == "sh" || base.initial == "r") {
+        base.final = "iii";
+        return;
+    }
+}
+
 static void utf16_append(std::u16string & out, uint32_t cp) {
     if (cp <= 0xFFFF) {
         out.push_back(static_cast<char16_t>(cp));
@@ -915,8 +1000,9 @@ struct zh_pinyin_dict {
 
         // 1) 短语词典（多音字消歧）
         {
-            const std::string path = join_path(dir, "pinyin_phrase.txt");
-            std::ifstream     fin(path);
+            // 说明：使用 filesystem::u8path 以支持 Windows 下的 UTF-8 路径（例如包含中文目录名）。
+            const std::filesystem::path path = std::filesystem::u8path(dir) / "pinyin_phrase.txt";
+            std::ifstream               fin(path);
             if (fin.good()) {
                 phrase.reserve(420000);
                 std::string line;
@@ -931,8 +1017,8 @@ struct zh_pinyin_dict {
 
         // 2) 单字兜底（pinyin.txt）
         {
-            const std::string path = join_path(dir, "pinyin.txt");
-            std::ifstream     fin(path);
+            const std::filesystem::path path = std::filesystem::u8path(dir) / "pinyin.txt";
+            std::ifstream               fin(path);
             if (fin.good()) {
                 single.reserve(28000);
                 std::string line;
@@ -1242,6 +1328,7 @@ static bool build_syllable_from_char(char16_t c, const zh_pinyin_dict & dict, zh
     // 优先内置逐字映射；缺失时使用 pinyin.txt 兜底。
     kokoro_zh::zh_syllable_base base{};
     if (kokoro_zh::lookup_zh_syllable(static_cast<uint32_t>(c), base)) {
+        fix_apical_vowel_for_builtin(base);
         out.initial = std::string(base.initial);
         out.final = std::string(base.final);
         out.tone = base.tone;
@@ -1285,7 +1372,21 @@ static void build_word_syllables(const std::u16string & word,
     apply_erhua(word, out);
 }
 
-static void append_hanzi_segment_with_dict(const std::u16string & segment, const zh_pinyin_dict & dict, std::string & out) {
+static std::string u16_to_utf8_simple(const std::u16string & s) {
+    // 说明：本文件内部使用 UTF-16（u16string）做 DP 分词与字典 key；这里提供一个轻量转换，便于调试输出。
+    // 注意：当前中文前端主要处理 BMP 内的汉字/符号，通常不会出现代理项对；若遇到代理项对则直接按原值写出。
+    std::string out;
+    out.reserve(s.size() * 3);
+    for (char16_t c : s) {
+        utf8_append(out, static_cast<uint32_t>(c));
+    }
+    return out;
+}
+
+static void append_hanzi_segment_with_dict(const std::u16string & segment,
+                                          const zh_pinyin_dict & dict,
+                                          std::string & out,
+                                          std::vector<kokoro_zh::zh_debug_item> * debug_items) {
     // 连续汉字段：用短语词典做 DP 分段，优先匹配更长短语；对每个词段生成音节并追加到 out。
     static constexpr size_t kMaxPhraseChars = 8;
     const size_t n = segment.size();
@@ -1349,24 +1450,50 @@ static void append_hanzi_segment_with_dict(const std::u16string & segment, const
         }
 
         build_word_syllables(word, pinyins, dict, syllables);
+
+        // 说明：每个 word（分词结果）在调试输出中按一个“词条”展示：word(phonemes)。
+        std::string word_phonemes;
+        word_phonemes.reserve(syllables.size() * 6);
         for (const auto & syl : syllables) {
             if (!syl.initial.empty()) {
-                out.append(zh_map(syl.initial));
+                const std::string_view v = zh_map(syl.initial);
+                out.append(v);
+                word_phonemes.append(v);
             }
-            out.append(zh_map(syl.final));
+            {
+                const std::string_view v = zh_map(syl.final);
+                out.append(v);
+                word_phonemes.append(v);
+            }
             if (syl.erhua) {
                 out.push_back('R');
+                word_phonemes.push_back('R');
             }
             out.push_back(static_cast<char>('0' + syl.tone));
+            word_phonemes.push_back(static_cast<char>('0' + syl.tone));
+        }
+
+        if (debug_items != nullptr) {
+            kokoro_zh::zh_debug_item item;
+            item.text = u16_to_utf8_simple(word);
+            item.phonemes = std::move(word_phonemes);
+            item.is_boundary = false;
+            debug_items->push_back(std::move(item));
         }
 
         i += len;
     }
 }
 
-static std::string text_to_zh_phonemes_with_dict(const std::string & text, const zh_pinyin_dict & dict) {
+static std::string text_to_zh_phonemes_with_dict(const std::string & text,
+                                                 const zh_pinyin_dict & dict,
+                                                 std::vector<kokoro_zh::zh_debug_item> * debug_items,
+                                                 std::string * normalized_out) {
     // 说明：词典增强版：对连续汉字段做 DP + 变调/儿化/轻声；其它字符保留标点/空白。
     const std::string normalized = normalize_zh_numbers(text);
+    if (normalized_out != nullptr) {
+        *normalized_out = normalized;
+    }
 
     std::string out;
     out.reserve(normalized.size() * 2);
@@ -1378,7 +1505,7 @@ static std::string text_to_zh_phonemes_with_dict(const std::string & text, const
         if (hanzi_segment.empty()) {
             return;
         }
-        append_hanzi_segment_with_dict(hanzi_segment, dict, out);
+        append_hanzi_segment_with_dict(hanzi_segment, dict, out, debug_items);
         hanzi_segment.clear();
     };
 
@@ -1401,12 +1528,27 @@ static std::string text_to_zh_phonemes_with_dict(const std::string & text, const
             const char c = static_cast<char>(cp);
             if (c != '\0') {
                 out.push_back(c);
+                if (debug_items != nullptr) {
+                    kokoro_zh::zh_debug_item item;
+                    item.text.assign(1, c);
+                    item.phonemes.assign(1, c);
+                    item.is_boundary = true;
+                    debug_items->push_back(std::move(item));
+                }
             }
             continue;
         }
 
         if (is_boundary_cp(cp)) {
             utf8_append(out, cp);
+            if (debug_items != nullptr) {
+                kokoro_zh::zh_debug_item item;
+                item.text = std::string();
+                utf8_append(item.text, cp);
+                item.phonemes = item.text;
+                item.is_boundary = true;
+                debug_items->push_back(std::move(item));
+            }
         }
     }
     flush_hanzi();
@@ -1429,7 +1571,7 @@ std::string text_to_zh_phonemes(const std::string & text, const std::string & di
     if (dict_dir != "-") {
         const std::string effective_dir = dict_dir.empty() ? "dict" : dict_dir;
         if (const zh_pinyin_dict * dict = zh_try_get_dict(effective_dir)) {
-            return text_to_zh_phonemes_with_dict(text, *dict);
+            return text_to_zh_phonemes_with_dict(text, *dict, nullptr, nullptr);
         }
     }
 
@@ -1448,6 +1590,7 @@ std::string text_to_zh_phonemes(const std::string & text, const std::string & di
 
         zh_syllable_base syl{};
         if (lookup_zh_syllable(cp, syl)) {
+            fix_apical_vowel_for_builtin(syl);
             zh_token t{};
             t.t = zh_token::type::syllable;
             t.cp = cp;
@@ -1532,6 +1675,145 @@ std::string text_to_zh_phonemes(const std::string & text, const std::string & di
     }
 
     return out;
+}
+
+zh_debug_result text_to_zh_phonemes_debug(const std::string & text, const std::string & dict_dir) {
+    zh_debug_result res;
+
+    // 说明：优先使用“词典 + DP 分词”路径，以便输出更符合口语的分词与多音字读音。
+    if (dict_dir != "-") {
+        const std::string effective_dir = dict_dir.empty() ? "dict" : dict_dir;
+        if (const zh_pinyin_dict * dict = zh_try_get_dict(effective_dir)) {
+            res.phonemes = text_to_zh_phonemes_with_dict(text, *dict, &res.items, &res.normalized_text);
+            return res;
+        }
+    }
+
+    // 无词典：回退到逐字映射 + 极简变调，并提供逐字调试信息。
+    res.normalized_text = normalize_zh_numbers(text);
+
+    std::vector<zh_token> tokens;
+    tokens.reserve(res.normalized_text.size());
+
+    size_t offset = 0;
+    while (offset < res.normalized_text.size()) {
+        uint32_t cp = 0;
+        utf8_decode_next(res.normalized_text, offset, cp);
+        cp = normalize_punctuation(cp);
+
+        zh_syllable_base syl{};
+        if (lookup_zh_syllable(cp, syl)) {
+            fix_apical_vowel_for_builtin(syl);
+            zh_token t{};
+            t.t = zh_token::type::syllable;
+            t.cp = cp;
+            t.syl = syl;
+            tokens.push_back(t);
+        } else {
+            zh_token t{};
+            t.t = zh_token::type::boundary;
+            t.cp = cp;
+            tokens.push_back(t);
+        }
+    }
+
+    // Apply minimal tone sandhi (character-level, no word segmentation).
+    for (size_t i = 0; i + 1 < tokens.size(); ++i) {
+        if (tokens[i].t != zh_token::type::syllable) {
+            continue;
+        }
+        if (tokens[i + 1].t != zh_token::type::syllable) {
+            continue;
+        }
+
+        if (tokens[i].cp == 0x4E0D && tokens[i + 1].syl.tone == 4) {
+            tokens[i].syl.tone = 2;
+        }
+
+        if (tokens[i].cp == 0x4E00) {
+            const uint8_t next_tone = tokens[i + 1].syl.tone;
+            tokens[i].syl.tone = (next_tone == 4 || next_tone == 5) ? 2 : 4;
+        }
+    }
+
+    // 3rd tone sandhi: for any contiguous run of 3-3-...-3, change all but last to 2.
+    for (size_t i = 0; i < tokens.size();) {
+        if (tokens[i].t != zh_token::type::syllable || tokens[i].syl.tone != 3) {
+            ++i;
+            continue;
+        }
+
+        size_t j = i;
+        while (j < tokens.size() && tokens[j].t == zh_token::type::syllable && tokens[j].syl.tone == 3) {
+            ++j;
+        }
+        const size_t run_len = j - i;
+        if (run_len >= 2) {
+            for (size_t k = i; k + 1 < j; ++k) {
+                tokens[k].syl.tone = 2;
+            }
+        }
+        i = j;
+    }
+
+    res.phonemes.clear();
+    res.phonemes.reserve(res.normalized_text.size() * 2);
+    res.items.clear();
+    res.items.reserve(tokens.size());
+
+    for (const auto & tok : tokens) {
+        if (tok.t == zh_token::type::syllable) {
+            std::string piece;
+            piece.reserve(8);
+            if (!tok.syl.initial.empty()) {
+                const std::string_view v = zh_map(tok.syl.initial);
+                res.phonemes.append(v);
+                piece.append(v);
+            }
+            {
+                const std::string_view v = zh_map(tok.syl.final);
+                res.phonemes.append(v);
+                piece.append(v);
+            }
+            res.phonemes.push_back(static_cast<char>('0' + tok.syl.tone));
+            piece.push_back(static_cast<char>('0' + tok.syl.tone));
+
+            zh_debug_item item;
+            item.text = std::string();
+            utf8_append(item.text, tok.cp);
+            item.phonemes = std::move(piece);
+            item.is_boundary = false;
+            res.items.push_back(std::move(item));
+            continue;
+        }
+
+        if (tok.cp <= 0x7F) {
+            const char c = static_cast<char>(tok.cp);
+            if (c == '\0') {
+                continue;
+            }
+            res.phonemes.push_back(c);
+            zh_debug_item item;
+            item.text.assign(1, c);
+            item.phonemes.assign(1, c);
+            item.is_boundary = true;
+            res.items.push_back(std::move(item));
+            continue;
+        }
+
+        if (is_boundary_cp(tok.cp)) {
+            std::string s;
+            utf8_append(s, tok.cp);
+            res.phonemes.append(s);
+            zh_debug_item item;
+            item.text = s;
+            item.phonemes = std::move(s);
+            item.is_boundary = true;
+            res.items.push_back(std::move(item));
+        }
+    }
+
+    return res;
 }
 
 } // namespace kokoro_zh

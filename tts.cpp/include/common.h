@@ -138,6 +138,41 @@ struct tts_generation_runner : tts_runner {
     virtual vector<string_view> list_voices();
     virtual void                update_conditional_prompt(const char * file_path, const char * prompt);
     virtual void generate(const char * sentence, tts_response & output, const generation_configuration & config) = 0;
+
+    // 可选：返回“音素化后的 prompt”（用于 CLI 调试打印）。
+    // 说明：
+    // - 默认实现返回 false，表示该 runner 不支持输出音素串；
+    // - Kokoro runner 会覆盖该接口，返回其实际使用的 phoneme/token 串（UTF-8）。
+    virtual bool try_phonemize(const char * sentence, std::string & out_phonemes, const generation_configuration & config) {
+        (void) sentence;
+        (void) out_phonemes;
+        (void) config;
+        return false;
+    }
+
+    // 可选：返回“分段后的文本 + 每段对应的音素串”（用于 CLI 更直观地观测分词/多音字/数字/单位等处理是否符合预期）。
+    // 默认实现：若 try_phonemize() 可用，则把整段文本作为一个 segment 返回。
+    struct phoneme_segment {
+        std::string text;
+        std::string phonemes;
+        bool        is_boundary = false;
+    };
+
+    virtual bool try_phonemize_segments(const char * sentence,
+                                        std::string & out_phonemes,
+                                        std::vector<phoneme_segment> & out_segments,
+                                        const generation_configuration & config) {
+        out_segments.clear();
+        if (!try_phonemize(sentence, out_phonemes, config)) {
+            return false;
+        }
+        phoneme_segment seg;
+        seg.text = sentence ? std::string(sentence) : std::string();
+        seg.phonemes = out_phonemes;
+        seg.is_boundary = false;
+        out_segments.push_back(std::move(seg));
+        return true;
+    }
 };
 
 struct test_tts_generation_runner : tts_generation_runner {

@@ -150,6 +150,10 @@ struct kokoro_generator {
 	// unfortunately the squared sum of the windows needs to be computed dynamically per run because it is dependent
 	// on the sequence size of the generation and the hop is typically less than half the size of our window.
 	struct ggml_tensor * window;
+	// 说明：CPU 可读的窗函数张量副本（用于自定义 STFT/ISTFT 回退路径）。
+	// - 当权重位于 Vulkan 设备内存时，window->data 不可被 CPU 侧自定义算子直接读取；
+	// - 回退到 GGML_OP_CUSTOM 的 stft/istft 时必须使用该副本，否则会出现“电流声/人声消失”等异常输出。
+	struct ggml_tensor * window_cpu;
 	// 说明：CPU 侧缓存的窗函数数据（用于生成 window_sq_sum），避免直接读取 GPU buffer。
 	std::vector<float> window_host;
 
@@ -270,6 +274,11 @@ struct kokoro_model : tts_model {
 	// 说明：STFT/ISTFT 用的预计算基矩阵（conv 形式），用于 Vulkan 完整图执行。
 	struct ggml_tensor * stft_forward_basis = nullptr;
 	struct ggml_tensor * stft_inverse_basis = nullptr;
+    // 说明：部分 Vulkan 设备/驱动在 STFT/ISTFT（conv 版）上可能出现音质问题（如“金属音”）。
+    // 为了支持“仅把 STFT/ISTFT 固定到 CPU，其余仍走 Vulkan”的混合方案，这里额外保留一份 CPU 可读的基矩阵副本。
+    // - 当主权重使用 Vulkan 设备内存时，CPU 无法直接读取 stft_*_basis；此副本用于避免回退时崩溃/读错数据。
+    struct ggml_tensor * stft_forward_basis_cpu = nullptr;
+    struct ggml_tensor * stft_inverse_basis_cpu = nullptr;
 
 	// Prosody Predictor portion of the model
 	struct duration_predictor * prosody_pred;
@@ -482,8 +491,13 @@ struct kokoro_runner : tts_generation_runner {
     kokoro_gen_input_timings set_inputs(kokoro_ubatch & batch, uint32_t total_size);
     struct ggml_cgraph * build_kokoro_graph(kokoro_ubatch & batch);
     void run(kokoro_ubatch & batch, tts_response & outputs);
+    bool try_phonemize(const char * prompt, std::string & out_phonemes, const generation_configuration & config) override;
+    bool try_phonemize_segments(const char * prompt,
+                               std::string & out_phonemes,
+                               std::vector<tts_generation_runner::phoneme_segment> & out_segments,
+                               const generation_configuration & config) override;
     void generate(const char * prompt, tts_response & response, const generation_configuration & config) override;
-private:
+ private:
     string voice{};
     void propagate_voice_setting();
 };
