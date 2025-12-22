@@ -17,6 +17,10 @@ struct runner_context {
     virtual ~runner_context() {
         // 注意：部分后端/对象在某些配置下可能为 nullptr（例如纯 CPU、或提前退出未完成初始化）。
         // 为避免析构阶段因为对 nullptr 调用 free 接口而崩溃，这里做防御性判空。
+        if (galloc) {
+            ggml_gallocr_free(galloc);
+            galloc = nullptr;
+        }
         if (sched) {
             ggml_backend_sched_free(sched);
             sched = nullptr;
@@ -47,6 +51,10 @@ struct runner_context {
     
     std::vector<uint8_t> buf_compute_meta;
     ggml_backend_buffer_t buf_output = nullptr;
+    // 说明：CPU-only 下不再创建 ggml scheduler（其内部会为 graph_size 预留非常大的 context buffer，
+    // 在 ARM Linux 等 “无 swap + 严格 overcommit” 场景下容易直接触发 ENOMEM/断言崩溃）。
+    // 改用 ggml_gallocr 只按“实际图的 n_nodes+n_leafs”分配/复用计算 buffer，可显著降低常驻内存与启动失败概率。
+    ggml_gallocr_t galloc = nullptr;
     ggml_backend_sched_t sched = nullptr;
     ggml_threadpool_t threadpool = nullptr;
     float * logits = nullptr;
@@ -56,6 +64,10 @@ struct runner_context {
     void set_threads();
     void build_schedule(size_t max_nodes);
     bool prep_schedule(ggml_cgraph * gf);
+    // 统一封装：根据是否存在 sched/galloc 来分配图与执行计算（避免各模型 runner 直接依赖 sched 指针）。
+    void reset_graph();
+    bool alloc_graph(struct ggml_cgraph * gf);
+    enum ggml_status compute_graph_async(struct ggml_cgraph * gf);
     void prep_output_buffer(size_t new_size);
     void sync();
 };

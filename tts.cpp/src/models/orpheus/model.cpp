@@ -308,7 +308,7 @@ struct ggml_cgraph * orpheus_runner::build_orpheus_graph(orpheus_ubatch & batch)
 }
 
 void orpheus_runner::decode(orpheus_ubatch & batch) {
-    ggml_backend_sched_reset(octx->sched);
+    octx->reset_graph();
     
     octx->output_tokens.reserve(model->max_generation_size);
     
@@ -319,10 +319,15 @@ void orpheus_runner::decode(orpheus_ubatch & batch) {
 
     // the output is always the last tensor in the graph
     struct ggml_tensor * res = gf->nodes[gf->n_nodes - 1];
-    ggml_backend_sched_alloc_graph(octx->sched, gf);
+    if (!octx->alloc_graph(gf)) {
+        TTS_ABORT("Orpheus 图分配失败。");
+    }
     
     set_inputs(batch);
-    ggml_backend_sched_graph_compute_async(octx->sched, gf);
+    const enum ggml_status st = octx->compute_graph_async(gf);
+    if (st != GGML_STATUS_SUCCESS) {
+        TTS_ABORT("Orpheus 计算失败：status=%d。", (int) st);
+    }
  
     float * logits_out = octx->logits + octx->n_outputs * model->vocab_size;
     octx->get_ggml_node_data(res, logits_out, model->vocab_size * sizeof(float));
@@ -332,7 +337,7 @@ void orpheus_runner::decode(orpheus_ubatch & batch) {
 
     octx->sync();
     // 说明：异步后端需要先同步，避免 reset 释放仍在使用的 buffer。
-    ggml_backend_sched_reset(octx->sched);
+    octx->reset_graph();
 }
 
 void orpheus_runner::set_inputs(orpheus_ubatch & batch) {

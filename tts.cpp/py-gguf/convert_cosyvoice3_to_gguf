@@ -1,0 +1,40 @@
+#!/usr/bin/env python3
+
+import argparse
+from pathlib import Path
+from os.path import dirname, isdir
+
+from tts_encoders.cosyvoice3_gguf_encoder import CosyVoice3Encoder
+
+
+DEFAULT_MODEL_DIR = "参考项目/Fun-CosyVoice3-0.5B-2512"
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--save-path", type=str, required=True, help="保存 GGUF 的路径。")
+    parser.add_argument("--model-dir", type=str, default=DEFAULT_MODEL_DIR, help="包含 llm.pt/flow.pt/hift.pt 的目录。")
+    parser.add_argument("--vocab-dir", type=str, default=None, help="Tokenizer 目录（默认使用 <model-dir>/CosyVoice-BlankEN）。")
+    parser.add_argument("--tokenizer-py", type=str, default=None, help="CosyVoice tokenizer.py 路径。")
+    parser.add_argument("--voice-pack", type=str, default=None, help="预制 voice pack (.npz 或目录)。")
+    parser.add_argument("--voice-name", type=str, default="default", help="单个 voice pack 的名称。")
+    parser.add_argument("--never-make-dirs", default=False, action="store_true",
+                        help="当目录不存在时不自动创建。")
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_arguments()
+    save_dir = dirname(args.save_path)
+    if save_dir and not isdir(save_dir) and args.never_make_dirs:
+        raise ValueError(f"model path, {args.save_path} is not a valid path.")
+
+    encoder = CosyVoice3Encoder(
+        model_path=args.save_path,
+        model_dir=args.model_dir,
+        voice_pack=args.voice_pack,
+        voice_name=args.voice_name,
+        vocab_dir=args.vocab_dir,
+        tokenizer_py=args.tokenizer_py,
+    )
+    encoder.write()

@@ -692,6 +692,307 @@ static void kokoro_force_custom_views_cpu(runner_context * ctx, ggml_cgraph * gf
 }
 
 // 说明：优先将 Vulkan 可执行的非自定义算子固定到 Vulkan，避免整图被 CPU anchor。
+// 说明：Vulkan 的 storage buffer offset 需要对齐；若算子输入来自 view 且 view_offs 未对齐，
+// ggml-vulkan 会触发断言崩溃。这里在图编译前对“需要严格对齐”的算子做兜底处理：
+// 一旦检测到未对齐 view 输入，就将该算子回退到 CPU。
+static size_t kokoro_vk_tensor_view_offset_bytes(const ggml_tensor * t) {
+    size_t offset = 0;
+    const ggml_tensor * cur = t;
+    while (cur && cur->view_src) {
+        offset += cur->view_offs;
+        cur = cur->view_src;
+    }
+    return offset;
+}
+
+static bool kokoro_vk_tensor_view_misaligned(const ggml_tensor * t, size_t alignment) {
+    if (!t || alignment <= 1) {
+        return false;
+    }
+    const size_t offset = kokoro_vk_tensor_view_offset_bytes(t);
+    if (offset == 0) {
+        return false;
+    }
+    return (offset % alignment) != 0;
+}
+
+static ggml_tensor * kokoro_vk_cont_if_misaligned_view(ggml_context * ctx, ggml_tensor * t, const kokoro_model * model) {
+    if (!ctx || !t || !model || !kokoro_use_vk_weights(model) || !t->view_src) {
+        return t;
+    }
+    const size_t alignment = model->buffer ? ggml_backend_buft_get_alignment(model->buffer) : 0;
+    if (alignment <= 1) {
+        return t;
+    }
+    if (!kokoro_vk_tensor_view_misaligned(t, alignment)) {
+        return t;
+    }
+    // 说明：view 偏移未对齐时，先做一次 cont 复制，避免 Vulkan 断言。
+    return ggml_cont(ctx, t);
+}
+
+static size_t kokoro_vk_required_alignment(runner_context * ctx) {
+    if (!ctx || !ctx->backend) {
+        return 0;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(ctx->backend);
+    if (!dev) {
+        return 0;
+    }
+    ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+    if (!buft) {
+        return 0;
+    }
+    return ggml_backend_buft_get_alignment(buft);
+}
+
+static bool kokoro_vk_op_requires_aligned_view(enum ggml_op op) {
+    switch (op) {
+        // 说明：以下算子在 Vulkan 后端支持 misalign offset（unary/binary/sum_rows/pad 等），
+        // 允许 view_offs 非对齐；其余算子默认要求对齐以规避断言崩溃。
+        // 注意：GGML_OP_UNARY 在 Vulkan 中使用通用 push constant，仍要求对齐，故不放行。
+        case GGML_OP_NONE:
+        case GGML_OP_ADD:
+        case GGML_OP_SUB:
+        case GGML_OP_MUL:
+        case GGML_OP_DIV:
+        case GGML_OP_ADD1:
+        case GGML_OP_CONCAT:
+        case GGML_OP_REPEAT:
+        case GGML_OP_REPEAT_BACK:
+        case GGML_OP_CPY:
+        case GGML_OP_CONT:
+        case GGML_OP_DUP:
+        case GGML_OP_SQR:
+        case GGML_OP_SQRT:
+        case GGML_OP_SIN:
+        case GGML_OP_COS:
+        case GGML_OP_LOG:
+        case GGML_OP_PAD:
+        case GGML_OP_SUM_ROWS:
+        case GGML_OP_IM2COL_3D:
+        case GGML_OP_UPSCALE:
+        case GGML_OP_ROLL:
+        case GGML_OP_CLAMP:
+        case GGML_OP_DIAG:
+        case GGML_OP_TRI:
+        case GGML_OP_SET_ROWS:
+            return false;
+        default:
+            return true;
+    }
+}
+
+static bool kokoro_is_view_op(const ggml_tensor * node) {
+    if (!node) {
+        return false;
+    }
+    switch (node->op) {
+        case GGML_OP_VIEW:
+        case GGML_OP_RESHAPE:
+        case GGML_OP_PERMUTE:
+        case GGML_OP_TRANSPOSE:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static void kokoro_force_vk_misaligned_view_ops_cpu(runner_context * ctx, ggml_cgraph * gf) {
+    if (!ctx || !gf || !ctx->backend || !tts_backend_is_vulkan(ctx->backend) || !ctx->sched || !ctx->backend_cpu) {
+        return;
+    }
+    const size_t alignment = kokoro_vk_required_alignment(ctx);
+    if (alignment <= 1) {
+        return;
+    }
+
+    size_t forced = 0;
+    for (int i = 0; i < gf->n_nodes; ++i) {
+        ggml_tensor * node = gf->nodes[i];
+        if (!node || kokoro_is_view_op(node)) {
+            continue;
+        }
+        if (!kokoro_vk_op_requires_aligned_view(node->op)) {
+            continue;
+        }
+        bool has_misaligned_view = false;
+        const ggml_tensor * bad_src = nullptr;
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            if (kokoro_vk_tensor_view_misaligned(node->src[j], alignment)) {
+                has_misaligned_view = true;
+                bad_src = node->src[j];
+                break;
+            }
+        }
+        if (!has_misaligned_view) {
+            continue;
+        }
+        if (forced < 4 && bad_src) {
+            const char * node_name = ggml_get_name(node);
+            const char * src_name = ggml_get_name(bad_src);
+            const char * src_op = ggml_op_name(bad_src->op);
+            const char * src0_name = bad_src->view_src ? ggml_get_name(bad_src->view_src) : nullptr;
+            const char * src0_op = bad_src->view_src ? ggml_op_name(bad_src->view_src->op) : nullptr;
+            fprintf(stderr,
+                    "[kokoro][vk-align] force_cpu op=%s node=%s src=%s src_op=%s view_offs=%zu align=%zu view_src=%s view_src_op=%s\n",
+                    ggml_op_name(node->op),
+                    node_name ? node_name : "(unnamed)",
+                    src_name ? src_name : "(unnamed)",
+                    src_op ? src_op : "(unknown)",
+                    kokoro_vk_tensor_view_offset_bytes(bad_src),
+                    alignment,
+                    src0_name ? src0_name : "(unnamed)",
+                    src0_op ? src0_op : "(unknown)");
+            if (node->op == GGML_OP_UNARY) {
+                fprintf(stderr,
+                        "[kokoro][vk-align]   unary_op=%s\n",
+                        ggml_unary_op_name(ggml_get_unary_op(node)));
+            }
+            fprintf(stderr,
+                    "[kokoro][vk-align]   src_ne=(%lld,%lld,%lld,%lld) src_nb=(%zu,%zu,%zu,%zu)\n",
+                    (long long) bad_src->ne[0], (long long) bad_src->ne[1],
+                    (long long) bad_src->ne[2], (long long) bad_src->ne[3],
+                    (size_t) bad_src->nb[0], (size_t) bad_src->nb[1],
+                    (size_t) bad_src->nb[2], (size_t) bad_src->nb[3]);
+            if (bad_src->view_src) {
+                fprintf(stderr,
+                        "[kokoro][vk-align]   view_src_ne=(%lld,%lld,%lld,%lld) view_src_nb=(%zu,%zu,%zu,%zu)\n",
+                        (long long) bad_src->view_src->ne[0], (long long) bad_src->view_src->ne[1],
+                        (long long) bad_src->view_src->ne[2], (long long) bad_src->view_src->ne[3],
+                        (size_t) bad_src->view_src->nb[0], (size_t) bad_src->view_src->nb[1],
+                        (size_t) bad_src->view_src->nb[2], (size_t) bad_src->view_src->nb[3]);
+            }
+        }
+        ggml_backend_sched_set_tensor_backend(ctx->sched, node, ctx->backend_cpu);
+        ++forced;
+    }
+
+    if (forced > 0) {
+        fprintf(stderr,
+                "[kokoro] Vulkan 检测到 view 偏移未对齐，已将 %zu 个算子回退 CPU（对齐=%zu 字节）。\n",
+                forced,
+                alignment);
+    }
+}
+
+// 说明：在图分配完成后检查 Vulkan 实际 buffer offset 对齐情况，必要时回退相关算子到 CPU。
+static bool kokoro_vk_tensor_offset_misaligned(const ggml_tensor * t, size_t alignment) {
+    if (!t || alignment <= 1) {
+        return false;
+    }
+    const ggml_tensor * base_t = t;
+    size_t view_offset = 0;
+    while (base_t && base_t->view_src) {
+        view_offset += base_t->view_offs;
+        base_t = base_t->view_src;
+    }
+    ggml_backend_buffer_t buf = base_t->buffer;
+    if (!buf || !base_t->data) {
+        return false;
+    }
+    const uint8_t * base = (const uint8_t *) ggml_backend_buffer_get_base(buf);
+    const uint8_t * data = (const uint8_t *) base_t->data;
+    if (!base || !data) {
+        return false;
+    }
+    const size_t offset = (size_t) (data - base) + view_offset;
+    return (offset % alignment) != 0;
+}
+
+static size_t kokoro_vk_tensor_offset_bytes(const ggml_tensor * t) {
+    if (!t) {
+        return 0;
+    }
+    const ggml_tensor * base_t = t;
+    size_t view_offset = 0;
+    while (base_t && base_t->view_src) {
+        view_offset += base_t->view_offs;
+        base_t = base_t->view_src;
+    }
+    ggml_backend_buffer_t buf = base_t->buffer;
+    if (!buf || !base_t->data) {
+        return 0;
+    }
+    const uint8_t * base = (const uint8_t *) ggml_backend_buffer_get_base(buf);
+    const uint8_t * data = (const uint8_t *) base_t->data;
+    if (!base || !data) {
+        return 0;
+    }
+    return (size_t) (data - base) + view_offset;
+}
+
+static void kokoro_vk_log_misaligned_node(const ggml_tensor * node, size_t alignment) {
+    if (!node) {
+        return;
+    }
+    const char * node_name = ggml_get_name(node);
+    fprintf(stderr, "[kokoro][vk-align] op=%s node=%s\n", ggml_op_name(node->op), node_name ? node_name : "(unnamed)");
+    if (kokoro_vk_tensor_offset_misaligned(node, alignment)) {
+        fprintf(stderr,
+                "[kokoro][vk-align]   dst offset=%zu align=%zu\n",
+                kokoro_vk_tensor_offset_bytes(node),
+                alignment);
+        return;
+    }
+    for (int j = 0; j < GGML_MAX_SRC; ++j) {
+        const ggml_tensor * src = node->src[j];
+        if (!src) {
+            continue;
+        }
+        if (kokoro_vk_tensor_offset_misaligned(src, alignment)) {
+            const char * src_name = ggml_get_name(src);
+            fprintf(stderr,
+                    "[kokoro][vk-align]   src%d=%s offset=%zu align=%zu\n",
+                    j,
+                    src_name ? src_name : "(unnamed)",
+                    kokoro_vk_tensor_offset_bytes(src),
+                    alignment);
+            return;
+        }
+    }
+}
+
+static bool kokoro_collect_vk_misaligned_nodes(runner_context * ctx, ggml_cgraph * gf,
+                                               std::vector<ggml_tensor *> & out_nodes) {
+    out_nodes.clear();
+    if (!ctx || !gf || !ctx->backend || !tts_backend_is_vulkan(ctx->backend) || !ctx->sched) {
+        return false;
+    }
+    const size_t alignment = kokoro_vk_required_alignment(ctx);
+    if (alignment <= 1) {
+        return false;
+    }
+    for (int i = 0; i < gf->n_nodes; ++i) {
+        ggml_tensor * node = gf->nodes[i];
+        if (!node || kokoro_is_view_op(node)) {
+            continue;
+        }
+        if (!kokoro_vk_op_requires_aligned_view(node->op)) {
+            continue;
+        }
+        if (ggml_backend_sched_get_tensor_backend(ctx->sched, node) != ctx->backend) {
+            continue;
+        }
+        bool misaligned = kokoro_vk_tensor_offset_misaligned(node, alignment);
+        if (!misaligned) {
+            for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                if (kokoro_vk_tensor_offset_misaligned(node->src[j], alignment)) {
+                    misaligned = true;
+                    break;
+                }
+            }
+        }
+        if (misaligned) {
+            out_nodes.push_back(node);
+            if (out_nodes.size() <= 3) {
+                kokoro_vk_log_misaligned_node(node, alignment);
+            }
+        }
+    }
+    return !out_nodes.empty();
+}
+
 static void kokoro_force_supported_ops_backend(runner_context * ctx, ggml_cgraph * gf, ggml_backend_t backend) {
     if (!ctx || !gf || !backend || !ctx->sched) {
         return;
@@ -881,6 +1182,13 @@ static struct ggml_tensor * build_lstm_run(ggml_context * ctx, ggml_cgraph * gf,
 
 	const lstm_cell::fused_gates & fused = reversed ? cell->fused_reverse : cell->fused;
 	const bool is_vulkan = !weights.empty() && kokoro_tensor_on_vulkan(weights[0]);
+    auto vk_cont_view = [ctx, is_vulkan](ggml_tensor * t) -> ggml_tensor * {
+        // 说明：Vulkan 对 view 偏移对齐要求严格，遇到 view 直接做一次 cont，避免断言崩溃。
+        if (is_vulkan && t && t->view_src) {
+            return ggml_cont(ctx, t);
+        }
+        return t;
+    };
 
 	// 说明：逐步 concat 会产生 O(T^2) 的拷贝；CPU 下用 ggml_set_2d_inplace 直接写入预分配输出，可显著降低开销。
 	const bool use_set_output = !is_vulkan && kokoro_env_cpu_lstm_set_output();
@@ -911,10 +1219,10 @@ static struct ggml_tensor * build_lstm_run(ggml_context * ctx, ggml_cgraph * gf,
 			struct ggml_tensor * gates   = ggml_add(ctx, gates_x_t, gates_h);
 
 			const size_t gate_off = (size_t) hidden * gates->nb[0];
-			struct ggml_tensor * I_cur = ggml_sigmoid(ctx, ggml_view_3d(ctx, gates, hidden, 1, gates->ne[2], gates->nb[0], gates->nb[1], gate_off * 0));
-			struct ggml_tensor * F_cur = ggml_sigmoid(ctx, ggml_view_3d(ctx, gates, hidden, 1, gates->ne[2], gates->nb[0], gates->nb[1], gate_off * 1));
-			struct ggml_tensor * G_cur = ggml_tanh   (ctx, ggml_view_3d(ctx, gates, hidden, 1, gates->ne[2], gates->nb[0], gates->nb[1], gate_off * 2));
-			struct ggml_tensor * O_cur = ggml_sigmoid(ctx, ggml_view_3d(ctx, gates, hidden, 1, gates->ne[2], gates->nb[0], gates->nb[1], gate_off * 3));
+			struct ggml_tensor * I_cur = ggml_sigmoid(ctx, vk_cont_view(ggml_view_3d(ctx, gates, hidden, 1, gates->ne[2], gates->nb[0], gates->nb[1], gate_off * 0)));
+			struct ggml_tensor * F_cur = ggml_sigmoid(ctx, vk_cont_view(ggml_view_3d(ctx, gates, hidden, 1, gates->ne[2], gates->nb[0], gates->nb[1], gate_off * 1)));
+			struct ggml_tensor * G_cur = ggml_tanh   (ctx, vk_cont_view(ggml_view_3d(ctx, gates, hidden, 1, gates->ne[2], gates->nb[0], gates->nb[1], gate_off * 2)));
+			struct ggml_tensor * O_cur = ggml_sigmoid(ctx, vk_cont_view(ggml_view_3d(ctx, gates, hidden, 1, gates->ne[2], gates->nb[0], gates->nb[1], gate_off * 3)));
 
 			c_0 = ggml_add(ctx, ggml_mul(ctx, F_cur, c_0), ggml_mul(ctx, I_cur, G_cur));
 			h_0 = ggml_mul(ctx, ggml_tanh(ctx, c_0), O_cur);
@@ -949,16 +1257,32 @@ static struct ggml_tensor * build_lstm_run(ggml_context * ctx, ggml_cgraph * gf,
 		const int t = reversed ? (int) sequence_length - 1 - index : index;
 
 		struct ggml_tensor * I_cur = ggml_view_3d(ctx, I, I->ne[0], 1, I->ne[2], I->nb[0], I->nb[1], I->nb[1] * t);
-		I_cur = ggml_sigmoid(ctx, ggml_add(ctx, I_cur, ggml_add(ctx, ggml_mul_mat(ctx, weights[1], h_0), biases[1])));
+        {
+            struct ggml_tensor * I_sum = ggml_add(ctx, I_cur, ggml_add(ctx, ggml_mul_mat(ctx, weights[1], h_0), biases[1]));
+            I_sum = vk_cont_view(I_sum);
+            I_cur = ggml_sigmoid(ctx, I_sum);
+        }
 
 		struct ggml_tensor * F_cur = ggml_view_3d(ctx, F, F->ne[0], 1, F->ne[2], F->nb[0], F->nb[1], F->nb[1] * t);
-		F_cur = ggml_sigmoid(ctx, ggml_add(ctx, F_cur, ggml_add(ctx, ggml_mul_mat(ctx, weights[3], h_0), biases[3])));
+        {
+            struct ggml_tensor * F_sum = ggml_add(ctx, F_cur, ggml_add(ctx, ggml_mul_mat(ctx, weights[3], h_0), biases[3]));
+            F_sum = vk_cont_view(F_sum);
+            F_cur = ggml_sigmoid(ctx, F_sum);
+        }
 
 		struct ggml_tensor * G_cur = ggml_view_3d(ctx, G, G->ne[0], 1, G->ne[2], G->nb[0], G->nb[1], G->nb[1] * t);
-		G_cur = ggml_tanh(ctx, ggml_add(ctx, G_cur, ggml_add(ctx, ggml_mul_mat(ctx, weights[5], h_0), biases[5])));
+        {
+            struct ggml_tensor * G_sum = ggml_add(ctx, G_cur, ggml_add(ctx, ggml_mul_mat(ctx, weights[5], h_0), biases[5]));
+            G_sum = vk_cont_view(G_sum);
+            G_cur = ggml_tanh(ctx, G_sum);
+        }
 
 		struct ggml_tensor * O_cur = ggml_view_3d(ctx, O, O->ne[0], 1, O->ne[2], O->nb[0], O->nb[1], O->nb[1] * t);
-		O_cur = ggml_sigmoid(ctx, ggml_add(ctx, O_cur, ggml_add(ctx, ggml_mul_mat(ctx, weights[7], h_0), biases[7])));
+        {
+            struct ggml_tensor * O_sum = ggml_add(ctx, O_cur, ggml_add(ctx, ggml_mul_mat(ctx, weights[7], h_0), biases[7]));
+            O_sum = vk_cont_view(O_sum);
+            O_cur = ggml_sigmoid(ctx, O_sum);
+        }
 
 		c_0 = ggml_add(ctx, ggml_mul(ctx, F_cur, c_0), ggml_mul(ctx, I_cur, G_cur));
 		h_0 = ggml_mul(ctx, ggml_tanh(ctx, c_0), O_cur);
@@ -1012,7 +1336,7 @@ static struct ggml_tensor * build_ada_residual_conv(ggml_context * ctx, struct g
 		cur = ggml_add(ctx, cur, block->pool_bias);
 	}
 
- 	cur = ggml_conv_1d(ctx, block->conv1, cur, 1, 1, 1);
+	cur = tts_conv_1d(ctx, block->conv1, cur, 1, 1, 1);
 
 	cur   = ggml_add(ctx, cur, block->conv1_bias);
 	gamma = ggml_add(ctx, ggml_mul_mat(ctx, block->norm2_gamma, style), block->norm2_gamma_bias);
@@ -1025,7 +1349,7 @@ static struct ggml_tensor * build_ada_residual_conv(ggml_context * ctx, struct g
 	cur = ggml_add(ctx, cur, ggml_mul(ctx, cur, ggml_cont(ctx, ggml_transpose(ctx, gamma))));
 	cur = ggml_add(ctx, cur, ggml_cont(ctx, ggml_transpose(ctx, beta)));
 	cur = ggml_leaky_relu(ctx, cur, 0.2f, false);
-	cur = ggml_add(ctx, ggml_conv_1d(ctx, block->conv2, cur, 1, 1, 1), block->conv2_bias);
+	cur = ggml_add(ctx, tts_conv_1d(ctx, block->conv2, cur, 1, 1, 1), block->conv2_bias);
 
 	struct ggml_tensor * res = cur;
 	cur = x;
@@ -1071,7 +1395,7 @@ static struct ggml_tensor * build_kokoro_generator_res_block(ggml_context * ctx,
 		cur   = ggml_add(ctx, ggml_add(ctx, cur, ggml_mul(ctx, cur, broadcast_channel_param(ctx, gamma))), broadcast_channel_param(ctx, beta));
 		cur   = snake_1d(ctx, block->input_alphas[i], cur, const_inputs);
 
-		cur   = ggml_add(ctx, ggml_conv_1d(ctx, block->convs1_weights[i], cur, 1, block->conv1_paddings[i], block->conv1_dilations[i]), block->convs1_biases[i]);
+		cur   = ggml_add(ctx, tts_conv_1d(ctx, block->convs1_weights[i], cur, 1, block->conv1_paddings[i], block->conv1_dilations[i]), block->convs1_biases[i]);
 		gamma = ggml_add(ctx, ggml_mul_mat(ctx, block->adain1d_2_gamma_weights[i], style), block->adain1d_2_gamma_biases[i]);
 		beta  = ggml_add(ctx, ggml_mul_mat(ctx, block->adain1d_2_beta_weights[i], style), block->adain1d_2_beta_biases[i]);
 		cur   = ggml_norm(ctx, cur, 0.00001);
@@ -1081,7 +1405,7 @@ static struct ggml_tensor * build_kokoro_generator_res_block(ggml_context * ctx,
 		cur   = ggml_add(ctx, ggml_add(ctx, cur, ggml_mul(ctx, cur, broadcast_channel_param(ctx, gamma))), broadcast_channel_param(ctx, beta));
 
 		cur   = snake_1d(ctx, block->output_alphas[i], cur, const_inputs);
-		cur   = ggml_add(ctx, ggml_conv_1d(ctx, block->convs2_weights[i], cur, 1, block->conv1_paddings[0], 1), block->convs2_biases[i]);
+		cur   = ggml_add(ctx, tts_conv_1d(ctx, block->convs2_weights[i], cur, 1, block->conv1_paddings[0], 1), block->convs2_biases[i]);
 		inpl   = ggml_add(ctx, inpl, cur);
 	}
 	return inpl;
@@ -1090,7 +1414,7 @@ static struct ggml_tensor * build_kokoro_generator_res_block(ggml_context * ctx,
 static struct ggml_tensor * build_noise_block(ggml_context * ctx, kokoro_noise_residual_block * block, struct ggml_tensor * x,
                                               struct ggml_tensor * style, std::vector<tts_graph_const_input> * const_inputs) {
 	// This conv_1d seems replaceable with squeezed and transposed ggml_mul_mut, but s0 and p0 are dynamic
-	ggml_tensor * cur = ggml_add(ctx, ggml_conv_1d(ctx, block->input_conv, x, block->input_conv_stride, block->input_conv_padding, 1), block->input_conv_bias);
+	ggml_tensor * cur = ggml_add(ctx, tts_conv_1d(ctx, block->input_conv, x, block->input_conv_stride, block->input_conv_padding, 1), block->input_conv_bias);
 	return build_kokoro_generator_res_block(ctx, cur, style, block->res_block, const_inputs);
 }
 
@@ -1242,7 +1566,7 @@ static struct ggml_tensor * build_generator(ggml_context * ctx, kokoro_model * m
 	}
 
 	cur = ggml_leaky_relu(ctx, cur, 0.01f, false);
-	cur = ggml_add(ctx, ggml_conv_1d(ctx, generator->out_conv_weight, tts_cont_if_needed(ctx, cur), 1, model->out_conv_padding, 1), generator->out_conv_bias);
+	cur = ggml_add(ctx, tts_conv_1d(ctx, generator->out_conv_weight, tts_cont_if_needed(ctx, cur), 1, model->out_conv_padding, 1), generator->out_conv_bias);
 
 	struct ggml_tensor * spec = ggml_view_3d(ctx, cur, cur->ne[0], model->post_n_fft, cur->ne[2], cur->nb[1], cur->nb[2], 0);
 	struct ggml_tensor * phase = ggml_view_3d(ctx, cur, cur->ne[0], cur->ne[1] - model->post_n_fft, cur->ne[2], cur->nb[1], cur->nb[2], cur->nb[1] * model->post_n_fft);
@@ -2116,7 +2440,11 @@ struct ggml_cgraph * kokoro_duration_runner::build_kokoro_duration_graph(kokoro_
 
 	        // ffn
 	        {
-	        	cur = ggml_gelu(ctx, ggml_add(ctx, ggml_mul_mat(ctx, model->layers[l]->ffn, cur), model->layers[l]->ffn_bias));
+                {
+                    struct ggml_tensor * ffn_in = ggml_add(ctx, ggml_mul_mat(ctx, model->layers[l]->ffn, cur), model->layers[l]->ffn_bias);
+                    ffn_in = kokoro_vk_cont_if_misaligned_view(ctx, ffn_in, model);
+                    cur = ggml_gelu(ctx, ffn_in);
+                }
 	        	cur = ggml_add(ctx, ggml_mul_mat(ctx, model->layers[l]->ffn_out, cur), model->layers[l]->ffn_out_bias);
 	        }
 
@@ -2202,7 +2530,7 @@ void kokoro_duration_runner::run(kokoro_ubatch & batch) {
     const bool timings = tts_timings_enabled();
     const int64_t t_start_us = timings ? tts_time_us() : 0;
 
-    ggml_backend_sched_reset(kctx->sched);
+    kctx->reset_graph();
     const int64_t t_after_sched_reset_us = timings ? tts_time_us() : 0;
 
     size_t prev_size = kctx->buf_output ? ggml_backend_buffer_get_size(kctx->buf_output) : 0;
@@ -2263,16 +2591,43 @@ void kokoro_duration_runner::run(kokoro_ubatch & batch) {
     }
     kokoro_force_inputs_backend(kctx, gf);
     kokoro_force_custom_views_cpu(kctx, gf);
-    bool alloc_ok = ggml_backend_sched_alloc_graph(kctx->sched, gf);
+    kokoro_force_vk_misaligned_view_ops_cpu(kctx, gf);
+    bool alloc_ok = kctx->alloc_graph(gf);
     if (!alloc_ok && tts_backend_is_vulkan(kctx->backend) && kctx->backend_cpu) {
         // 说明：Vulkan 分配失败时回退到 CPU，避免继续使用未分配成功的张量导致崩溃。
         fprintf(stderr, "[kokoro] Vulkan 时长图分配失败，回退 CPU 重新分配。\n");
-        ggml_backend_sched_reset(kctx->sched);
+        kctx->reset_graph();
         kokoro_force_graph_backend(kctx, gf, kctx->backend_cpu);
-        alloc_ok = ggml_backend_sched_alloc_graph(kctx->sched, gf);
+        alloc_ok = kctx->alloc_graph(gf);
     }
     if (!alloc_ok) {
         TTS_ABORT("Kokoro 时长图分配失败。\n");
+    }
+
+    if (tts_backend_is_vulkan(kctx->backend) && kctx->backend_cpu) {
+        std::vector<ggml_tensor *> misaligned_nodes;
+        if (kokoro_collect_vk_misaligned_nodes(kctx, gf, misaligned_nodes)) {
+            fprintf(stderr,
+                    "[kokoro] Vulkan 检测到 %zu 个未对齐节点，回退相关算子并重新分配。\n",
+                    misaligned_nodes.size());
+            kctx->reset_graph();
+            kokoro_force_inputs_backend(kctx, gf);
+            kokoro_force_custom_views_cpu(kctx, gf);
+            kokoro_force_vk_misaligned_view_ops_cpu(kctx, gf);
+            for (ggml_tensor * node : misaligned_nodes) {
+                ggml_backend_sched_set_tensor_backend(kctx->sched, node, kctx->backend_cpu);
+            }
+            alloc_ok = kctx->alloc_graph(gf);
+            if (!alloc_ok) {
+                fprintf(stderr, "[kokoro] Vulkan 对齐回退后分配失败，改用 CPU。\n");
+                kctx->reset_graph();
+                kokoro_force_graph_backend(kctx, gf, kctx->backend_cpu);
+                alloc_ok = kctx->alloc_graph(gf);
+            }
+            if (!alloc_ok) {
+                TTS_ABORT("Kokoro 时长图分配失败。\n");
+            }
+        }
     }
 
     const int64_t t_after_sched_alloc_us = timings ? tts_time_us() : 0;
@@ -2287,7 +2642,7 @@ void kokoro_duration_runner::run(kokoro_ubatch & batch) {
         ggml_backend_cpu_set_n_threads(kctx->backend_cpu, kokoro_duration_threads(kctx));
     }
 
-    const enum ggml_status duration_status = ggml_backend_sched_graph_compute_async(kctx->sched, gf);
+    const enum ggml_status duration_status = kctx->compute_graph_async(gf);
     if (duration_status != GGML_STATUS_SUCCESS) {
         TTS_ABORT("Kokoro 时长计算失败：status=%d。\n", (int) duration_status);
     }
@@ -2300,7 +2655,7 @@ void kokoro_duration_runner::run(kokoro_ubatch & batch) {
 
     kctx->sync();
     // 说明：异步后端需要先同步，避免 reset 释放仍在使用的 buffer。
-    ggml_backend_sched_reset(kctx->sched);
+    kctx->reset_graph();
     const int64_t t_after_sync_us = timings ? tts_time_us() : 0;
     batch.resp->n_outputs = batch.n_tokens;
 
@@ -2352,7 +2707,10 @@ struct ggml_cgraph * kokoro_runner::build_kokoro_graph(kokoro_ubatch & batch) {
     struct ggml_cgraph * gf = ggml_new_graph_custom(ctx, 570000, false);
 
     struct ggml_tensor * voice = model->voices[kctx->voice];
-    struct ggml_tensor * style_half = ggml_view_1d(ctx, voice, voice->ne[0]/2, voice->ne[0] / 2 * voice->nb[0] + (batch.n_tokens - 3) * voice->nb[1]);
+    // 说明：Vulkan 要求 storage buffer offset 对齐，style_half 可能产生未对齐 view；
+    // 这里强制做一次 cont，确保后续 Vulkan 算子读取到对齐地址，避免断言崩溃。
+    struct ggml_tensor * style_half = ggml_cont(ctx, ggml_view_1d(ctx, voice, voice->ne[0]/2,
+                                                                 voice->ne[0] / 2 * voice->nb[0] + (batch.n_tokens - 3) * voice->nb[1]));
     struct ggml_tensor * cur;
 
     kctx->inp_tokens = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, batch.n_tokens);
@@ -2406,7 +2764,7 @@ struct ggml_cgraph * kokoro_runner::build_kokoro_graph(kokoro_ubatch & batch) {
 		cur = ggml_get_rows(ctx, model->text_encoder->embd, kctx->inp_tokens);
 
 		for (auto l : model->text_encoder->conv_layers) {
-			cur = ggml_cont(ctx, ggml_transpose(ctx, ggml_add(ctx, ggml_conv_1d(ctx, l->conv_weight, ggml_cont(ctx, ggml_transpose(ctx, cur)), 1, 2, 1), l->conv_bias)));
+			cur = ggml_cont(ctx, ggml_transpose(ctx, ggml_add(ctx, tts_conv_1d(ctx, l->conv_weight, ggml_cont(ctx, ggml_transpose(ctx, cur)), 1, 2, 1), l->conv_bias)));
 			cur = ggml_norm(ctx, cur, 0.00001);
 			cur = ggml_add(ctx, ggml_mul(ctx, cur, l->norm_gamma), l->norm_beta);
 			cur = ggml_leaky_relu(ctx, cur, 0.2f, false);
@@ -2423,11 +2781,13 @@ struct ggml_cgraph * kokoro_runner::build_kokoro_graph(kokoro_ubatch & batch) {
 	struct ggml_tensor * asr_res;
 	struct ggml_tensor * f0;
 	struct ggml_tensor * n_base;
-	struct ggml_tensor * style_half2 = ggml_view_1d(ctx, voice, voice->ne[0]/2, (batch.n_tokens - 3) * voice->nb[1]);
+    // 说明：同上，style_half2 也可能在 Vulkan 下产生未对齐 view，提前 cont 规避。
+    struct ggml_tensor * style_half2 = ggml_cont(ctx, ggml_view_1d(ctx, voice, voice->ne[0]/2,
+                                                                  (batch.n_tokens - 3) * voice->nb[1]));
 
 	{
-		f0 = ggml_add(ctx, ggml_conv_1d(ctx, model->decoder->f0_conv, f0_curve, 2, 1, 1), model->decoder->f0_conv_bias);
-		n_base = ggml_add(ctx, ggml_conv_1d(ctx, model->decoder->n_conv, n, 2, 1, 1), model->decoder->n_conv_bias);
+		f0 = ggml_add(ctx, tts_conv_1d(ctx, model->decoder->f0_conv, f0_curve, 2, 1, 1), model->decoder->f0_conv_bias);
+		n_base = ggml_add(ctx, tts_conv_1d(ctx, model->decoder->n_conv, n, 2, 1, 1), model->decoder->n_conv_bias);
 		cur = ggml_concat(ctx, ggml_concat(ctx, ggml_cont(ctx, ggml_transpose(ctx, asr)), f0, 1), n_base, 1);
 		cur = build_ada_residual_conv(ctx, cur, model->decoder->encoder_block, style_half2, model->sqrt_tensor);
 		ggml_build_forward_expand(gf, cur);
@@ -2646,7 +3006,7 @@ void kokoro_runner::run(kokoro_ubatch & batch, tts_response & outputs) {
 
     const int64_t t_after_duration_us = timings ? tts_time_us() : 0;
 
-	ggml_backend_sched_reset(kctx->sched);
+    kctx->reset_graph();
     const int64_t t_after_sched_reset_us = timings ? tts_time_us() : 0;
 
     const size_t prev_size = kctx->buf_output ? ggml_backend_buffer_get_size(kctx->buf_output) : 0;
@@ -2690,23 +3050,60 @@ void kokoro_runner::run(kokoro_ubatch & batch, tts_response & outputs) {
             kokoro_force_supported_ops_backend(kctx, gf, kctx->backend);
             kokoro_force_inputs_backend(kctx, gf);
             kokoro_force_vk_stft_istft_cpu_if_needed(kctx, gf, model.get());
+            kokoro_force_vk_misaligned_view_ops_cpu(kctx, gf);
             fprintf(stderr,
                     "[kokoro] Vulkan 后端检测到自定义算子，已固定为 CPU；其余节点仍走 Vulkan。如需强制全部 Vulkan 可设置 TTS_VK_FORCE_GEN=1。\n");
         } else {
             kokoro_force_inputs_backend(kctx, gf);
             kokoro_force_vk_stft_istft_cpu_if_needed(kctx, gf, model.get());
+            kokoro_force_vk_misaligned_view_ops_cpu(kctx, gf);
         }
     }
-    bool alloc_ok = ggml_backend_sched_alloc_graph(kctx->sched, gf);
+    bool alloc_ok = kctx->alloc_graph(gf);
     if (!alloc_ok && tts_backend_is_vulkan(kctx->backend) && kctx->backend_cpu) {
         // 说明：Vulkan 分配失败时回退到 CPU，避免继续使用未分配成功的张量导致崩溃。
         fprintf(stderr, "[kokoro] Vulkan 生成图分配失败，回退 CPU 重新分配。\n");
-        ggml_backend_sched_reset(kctx->sched);
+        kctx->reset_graph();
         kokoro_force_graph_backend(kctx, gf, kctx->backend_cpu);
-        alloc_ok = ggml_backend_sched_alloc_graph(kctx->sched, gf);
+        alloc_ok = kctx->alloc_graph(gf);
     }
     if (!alloc_ok) {
         TTS_ABORT("Kokoro 生成图分配失败。\n");
+    }
+
+    if (tts_backend_is_vulkan(kctx->backend) && kctx->backend_cpu) {
+        std::vector<ggml_tensor *> misaligned_nodes;
+        if (kokoro_collect_vk_misaligned_nodes(kctx, gf, misaligned_nodes)) {
+            fprintf(stderr,
+                    "[kokoro] Vulkan 检测到 %zu 个未对齐节点，回退相关算子并重新分配。\n",
+                    misaligned_nodes.size());
+            kctx->reset_graph();
+            if (has_custom_ops && !force_vulkan_gen) {
+                kokoro_force_custom_ops_cpu(kctx, gf);
+                kokoro_force_custom_views_cpu(kctx, gf);
+                kokoro_force_supported_ops_backend(kctx, gf, kctx->backend);
+                kokoro_force_inputs_backend(kctx, gf);
+                kokoro_force_vk_stft_istft_cpu_if_needed(kctx, gf, model.get());
+                kokoro_force_vk_misaligned_view_ops_cpu(kctx, gf);
+            } else {
+                kokoro_force_inputs_backend(kctx, gf);
+                kokoro_force_vk_stft_istft_cpu_if_needed(kctx, gf, model.get());
+                kokoro_force_vk_misaligned_view_ops_cpu(kctx, gf);
+            }
+            for (ggml_tensor * node : misaligned_nodes) {
+                ggml_backend_sched_set_tensor_backend(kctx->sched, node, kctx->backend_cpu);
+            }
+            alloc_ok = kctx->alloc_graph(gf);
+            if (!alloc_ok) {
+                fprintf(stderr, "[kokoro] Vulkan 对齐回退后分配失败，改用 CPU。\n");
+                kctx->reset_graph();
+                kokoro_force_graph_backend(kctx, gf, kctx->backend_cpu);
+                alloc_ok = kctx->alloc_graph(gf);
+            }
+            if (!alloc_ok) {
+                TTS_ABORT("Kokoro 生成图分配失败。\n");
+            }
+        }
     }
 
     const int64_t t_after_sched_alloc_us = timings ? tts_time_us() : 0;
@@ -2721,19 +3118,19 @@ void kokoro_runner::run(kokoro_ubatch & batch, tts_response & outputs) {
         ggml_backend_cpu_set_n_threads(kctx->backend_cpu, kctx->n_threads);
     }
 
-    enum ggml_status gen_status = ggml_backend_sched_graph_compute_async(kctx->sched, gf);
+    enum ggml_status gen_status = kctx->compute_graph_async(gf);
     if (gen_status != GGML_STATUS_SUCCESS && tts_backend_is_vulkan(kctx->backend) && kctx->backend_cpu) {
         fprintf(stderr, "[kokoro] Vulkan 生成计算失败，回退 CPU 重新计算。\n");
-        ggml_backend_sched_reset(kctx->sched);
+        kctx->reset_graph();
         kokoro_force_graph_backend(kctx, gf, kctx->backend_cpu);
-        bool retry_alloc_ok = ggml_backend_sched_alloc_graph(kctx->sched, gf);
+        bool retry_alloc_ok = kctx->alloc_graph(gf);
         if (!retry_alloc_ok) {
             TTS_ABORT("Kokoro 生成图分配失败。\n");
         }
         t_before_set_inputs_us = timings ? tts_time_us() : 0;
         input_timings = set_inputs(batch, total_length);
         t_after_set_inputs_us = timings ? tts_time_us() : 0;
-        gen_status = ggml_backend_sched_graph_compute_async(kctx->sched, gf);
+        gen_status = kctx->compute_graph_async(gf);
     }
     if (gen_status != GGML_STATUS_SUCCESS) {
         TTS_ABORT("Kokoro 生成计算失败：status=%d。\n", (int) gen_status);
@@ -2745,7 +3142,7 @@ void kokoro_runner::run(kokoro_ubatch & batch, tts_response & outputs) {
 
     kctx->sync();
     // 说明：异步后端需要先同步，避免 reset 释放仍在使用的 buffer。
-    ggml_backend_sched_reset(kctx->sched);
+    kctx->reset_graph();
     const int64_t t_after_sync_us = timings ? tts_time_us() : 0;
     outputs.n_outputs = total_length*model->up_sampling_factor;
     // batch.resp 由 new 分配，必须用 delete 释放（避免潜在堆损坏）。

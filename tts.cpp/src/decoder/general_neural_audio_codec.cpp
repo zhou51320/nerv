@@ -139,11 +139,11 @@ namespace general_neural_audio_codec {
             TTS_ASSERT(unit.in_conv_kernel->ne[1] == 1); 
             cur = ggml_conv_1d_dw(ctx, unit.in_conv_kernel, cur, 1, unit.padding, unit.dilation);
         } else {
-            cur = ggml_conv_1d(ctx, unit.in_conv_kernel, cur, 1, unit.padding, unit.dilation);
+            cur = tts_conv_1d(ctx, unit.in_conv_kernel, cur, 1, unit.padding, unit.dilation);
         }
         cur = ggml_add(ctx, cur, unit.in_conv_bias);
         cur = snake_1d(ctx, unit.out_alpha, cur);
-        cur = ggml_conv_1d(ctx, unit.out_conv_kernel, cur, 1, 0, 1);
+        cur = tts_conv_1d(ctx, unit.out_conv_kernel, cur, 1, 0, 1);
         cur = ggml_add(ctx, cur, unit.out_conv_bias);
         return ggml_add(ctx, cur, residual);
     }
@@ -156,7 +156,7 @@ namespace general_neural_audio_codec {
                                    /*output_padding=*/0, /*groups=*/1);
         cur = ggml_add(ctx, cur, l.in_conv_bias);
         if (l.noise_conv_kernel && noise) {
-            struct ggml_tensor * x = ggml_conv_1d(ctx, l.noise_conv_kernel, cur, 1, 0, 1);
+            struct ggml_tensor * x = tts_conv_1d(ctx, l.noise_conv_kernel, cur, 1, 0, 1);
             x = ggml_mul(ctx, x, noise);
             cur = ggml_add(ctx, cur, x);
         }
@@ -169,7 +169,7 @@ namespace general_neural_audio_codec {
     struct ggml_tensor * build_quantize_layer(ggml_context * ctx, struct ggml_tensor * cur, residual_vector_quantize_layer & l) {
         cur = ggml_get_rows(ctx, l.codebook, cur);
         cur = ggml_cont(ctx, ggml_transpose(ctx, cur));
-        cur = ggml_conv_1d(ctx, l.out_proj_kernel, cur, 1, 0, 1);
+        cur = tts_conv_1d(ctx, l.out_proj_kernel, cur, 1, 0, 1);
         cur = ggml_add(ctx, cur, l.out_proj_bias);
         return cur;
     }

@@ -153,13 +153,13 @@ struct ggml_cgraph * dac_runner::build_dac_graph(dac_ubatch & batch) {
     ggml_set_name(inputs, "quanitzed_inputs");
     
     // everything besides the inputs is just a forward pass
-    cur = ggml_conv_1d(ctx, model->in_conv_kernel, inputs, 1, 3, 1);
+    cur = tts_conv_1d(ctx, model->in_conv_kernel, inputs, 1, 3, 1);
     cur = ggml_add(ctx, cur, model->in_conv_bias);
     for (auto l : model->layers) {
         cur = general_neural_audio_codec::build_layer(ctx, cur, l);
     }
     cur = snake_1d(ctx, model->snake_alpha, cur);
-    cur = ggml_conv_1d(ctx, model->out_conv_kernel, cur, 1, 3, 1);
+    cur = tts_conv_1d(ctx, model->out_conv_kernel, cur, 1, 3, 1);
     cur = ggml_add(ctx, cur, model->out_conv_bias);
     cur = ggml_tanh(ctx, cur);
     ggml_build_forward_expand(gf, cur);
@@ -171,7 +171,7 @@ void dac_runner::run(uint32_t * input_tokens, uint32_t sequence_length, struct t
     dac_ubatch batch;
     batch.input_tokens = input_tokens;
     batch.sequence_length = sequence_length;
-    ggml_backend_sched_reset(dctx->sched);
+    dctx->reset_graph();
     
     const size_t prev_size = dctx->buf_output ? ggml_backend_buffer_get_size(dctx->buf_output) : 0;
     const size_t new_size = model->max_generation_size * model->up_sampling_factor * sizeof(float);
@@ -194,17 +194,22 @@ void dac_runner::run(uint32_t * input_tokens, uint32_t sequence_length, struct t
     
     // the output is always the last tensor in the graph
     struct ggml_tensor * result = gf->nodes[gf->n_nodes - 1];
-    ggml_backend_sched_alloc_graph(dctx->sched, gf);
+    if (!dctx->alloc_graph(gf)) {
+        TTS_ABORT("DAC 图分配失败。");
+    }
     
     ggml_backend_tensor_set(dctx->inp_tokens, batch.input_tokens, 0, batch.sequence_length*model->n_heads*ggml_element_size(dctx->inp_tokens));
 
-    ggml_backend_sched_graph_compute_async(dctx->sched, gf);
+    const enum ggml_status st = dctx->compute_graph_async(gf);
+    if (st != GGML_STATUS_SUCCESS) {
+        TTS_ABORT("DAC 计算失败：status=%d。", (int) st);
+    }
 
     dctx->get_ggml_node_data(result, outputs->data, batch.sequence_length*sizeof(float)*model->up_sampling_factor);
 
     dctx->sync();
     // 说明：异步后端需要先同步，避免 reset 释放仍在使用的 buffer。
-    ggml_backend_sched_reset(dctx->sched);
+    dctx->reset_graph();
     outputs->n_outputs = sequence_length * model->up_sampling_factor;
     return;
 }

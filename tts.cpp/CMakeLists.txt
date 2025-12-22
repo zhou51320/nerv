@@ -30,6 +30,15 @@ include(git-vars)
 
 option(BUILD_SHARED_LIBS "build shared libraries" OFF)
 
+# 指令集（CPU）：
+# 某些 CPU（尤其是部分桌面平台）在执行 AVX-512 指令时会触发更激进的降频/限功耗，
+# 反而导致端到端推理变慢且波动更大。为了让性能更稳定，这里提供一个“全局禁用 AVX-512”的开关。
+#
+# 注意：
+# - 该开关是“编译期”禁用：即便 GGML_NATIVE=ON 使用了 -march=native，也会追加 -mno-avx512f 抑制 __AVX512* 宏与指令生成；
+# - 仅对 GCC/Clang 的 x86/x64 生效；其它编译器/架构会自动忽略。
+option(TTS_DISABLE_AVX512 "TTS.cpp: disable AVX-512 instructions for stable CPU performance" ON)
+
 if (WIN32)
     add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
 endif()
@@ -101,7 +110,13 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/build-info.cmake)
 # override ggml options
 set(GGML_ALL_WARNINGS       ${TTS_ALL_WARNINGS})
 set(GGML_FATAL_WARNINGS     ${TTS_FATAL_WARNINGS})
-
+# Windows (MinGW) 性能提示：
+# ggml 在启用 OpenMP 时会走 OpenMP 的并行路径；但在部分 Windows + MinGW 环境下，
+# OpenMP 的调度/同步开销与缓存争用会显著放大，导致 Kokoro CPU 推理明显变慢且波动大。
+# 因此这里将 MinGW 的默认值改为 OFF（使用 ggml 自带 threadpool），用户仍可通过 -DGGML_OPENMP=ON 显式开启。
+if (MINGW AND NOT DEFINED GGML_OPENMP)
+    set(GGML_OPENMP OFF CACHE BOOL "ggml: enable OpenMP (MinGW default OFF for performance)")
+endif()
 
 # build lib
 add_subdirectory(ggml)

@@ -1,9 +1,15 @@
 #include "util.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <stdarg.h>
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
 #ifdef __APPLE__
 #include <sys/sysctl.h>
 #elif __linux__
@@ -36,6 +42,23 @@ namespace {
         (void) device;
         return nullptr;
 #endif
+    }
+
+    // 说明：判断张量是否位于 Vulkan buffer（用于图构建期的对齐规避）。
+    bool tts_tensor_on_vulkan(const ggml_tensor * t) {
+        if (!t || !t->buffer) {
+            return false;
+        }
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(t->buffer);
+        const char * name = buft ? ggml_backend_buft_name(buft) : nullptr;
+        return name && std::strncmp(name, "Vulkan", 6) == 0;
+    }
+
+    ggml_tensor * tts_vk_cont_view(ggml_context * ctx, ggml_tensor * t, bool use_vk) {
+        if (!use_vk || !t || !t->view_src) {
+            return t;
+        }
+        return ggml_cont(ctx, t);
     }
 }  // namespace
 
@@ -222,18 +245,366 @@ struct ggml_tensor * reciprocal(ggml_context * ctx, struct ggml_tensor * x,
     return ggml_div(ctx, ones, x);
 }
 
+
 // Described in https://arxiv.org/abs/2006.08195
 // Snake1d is a common tunable activation function used in the DAC model.
+namespace {
+
+static bool tts_env_truthy_default(const char * name, bool default_value) {
+    const char * v = std::getenv(name);
+    if (v == nullptr || v[0] == '\0') {
+        return default_value;
+    }
+    return std::strcmp(v, "0") != 0 && std::strcmp(v, "off") != 0 && std::strcmp(v, "false") != 0;
+}
+
+// ------------------------------ Snake1d 统计 ------------------------------
+//
+// 说明：
+// - 该统计用于“确认优化是否真的命中”，默认关闭（避免任何额外开销）。
+// - 仅在设置环境变量 TTS_CPU_SNAKE_STATS=1 时启用，并在进程退出时输出汇总信息。
+// - 统计发生在“建图阶段”（snake_1d 被调用时），不涉及逐元素计算，因此开销极低。
+struct tts_snake_stats {
+    std::atomic<int64_t> calls_total{0};
+    std::atomic<int64_t> calls_custom{0};
+    std::atomic<int64_t> calls_fallback{0};
+
+    // 回退原因统计（互斥并非必要，但使用 atomic 更简单可靠）
+    std::atomic<int64_t> fallback_vulkan{0};        // const_inputs != nullptr
+    std::atomic<int64_t> fallback_disabled{0};      // TTS_CPU_SNAKE_CUSTOM=0
+    std::atomic<int64_t> fallback_null{0};          // alpha/a 为空
+    std::atomic<int64_t> fallback_type_a{0};        // a 不是 F32
+    std::atomic<int64_t> fallback_type_alpha{0};    // alpha 不是 F16/F32
+    std::atomic<int64_t> fallback_non_contig{0};    // alpha/a 非连续
+
+    // alpha 类型分布（只在 custom 路径中计数）
+    std::atomic<int64_t> custom_alpha_f16{0};
+    std::atomic<int64_t> custom_alpha_f32{0};
+};
+
+static tts_snake_stats & tts_snake_stats_state() {
+    static tts_snake_stats s{};
+    return s;
+}
+
+static bool tts_snake_stats_enabled() {
+    return tts_env_truthy_default("TTS_CPU_SNAKE_STATS", false);
+}
+
+static void tts_snake_stats_dump() {
+    const tts_snake_stats & s = tts_snake_stats_state();
+
+    // 说明：输出到 stderr，便于与 bench 日志一起保存/对比。
+    std::fprintf(stderr,
+                 "[tts][snake][stats] calls: total=%lld custom=%lld fallback=%lld\n",
+                 (long long) s.calls_total.load(),
+                 (long long) s.calls_custom.load(),
+                 (long long) s.calls_fallback.load());
+    std::fprintf(stderr,
+                 "[tts][snake][stats] fallback: vulkan=%lld disabled=%lld null=%lld a_type=%lld alpha_type=%lld non_contig=%lld\n",
+                 (long long) s.fallback_vulkan.load(),
+                 (long long) s.fallback_disabled.load(),
+                 (long long) s.fallback_null.load(),
+                 (long long) s.fallback_type_a.load(),
+                 (long long) s.fallback_type_alpha.load(),
+                 (long long) s.fallback_non_contig.load());
+    std::fprintf(stderr,
+                 "[tts][snake][stats] custom alpha type: f16=%lld f32=%lld (fast_sin=%s avx2=%s)\n",
+                 (long long) s.custom_alpha_f16.load(),
+                 (long long) s.custom_alpha_f32.load(),
+                 tts_env_truthy_default("TTS_CPU_SNAKE_FAST", true) ? "on" : "off",
+#if defined(__AVX2__)
+                 "on"
+#else
+                 "off"
+#endif
+    );
+}
+
+static void tts_snake_stats_register_once_if_needed() {
+    static std::once_flag once;
+    std::call_once(once, []() {
+        if (tts_snake_stats_enabled()) {
+            std::atexit(tts_snake_stats_dump);
+        }
+    });
+}
+
+struct tts_snake_1d_op_params {
+    ggml_custom_op_params base;
+    int32_t alpha_kind;   // 0=scalar, 1=[1,C], 2=[C,1], 3=generic
+    int32_t use_fast_sin; // 0/1
+};
+
+// sin 近似（CPU）：使用简单的区间折叠 + 9 阶多项式。
+// 说明：Snake 的输出只依赖 sin^2，容忍一定近似误差；如需更高精度可关闭 TTS_CPU_SNAKE_FAST。
+static constexpr float k_snake_pi         = 3.14159265358979323846f;
+static constexpr float k_snake_two_pi     = 6.28318530717958647692f;
+static constexpr float k_snake_pi_over_2  = 1.57079632679489661923f;
+static constexpr float k_snake_inv_two_pi = 0.15915494309189533577f; // 1/(2*pi)
+static constexpr float k_snake_s1 = -1.6666667163e-1f;
+static constexpr float k_snake_s2 =  8.3333337680e-3f;
+static constexpr float k_snake_s3 = -1.9841270114e-4f;
+static constexpr float k_snake_s4 =  2.7557314297e-6f;
+
+static inline float tts_fast_sin_scalar(float x) {
+    const float k = nearbyintf(x * k_snake_inv_two_pi);
+    x = x - k * k_snake_two_pi;
+
+    if (x > k_snake_pi_over_2) {
+        x = k_snake_pi - x;
+    } else if (x < -k_snake_pi_over_2) {
+        x = -k_snake_pi - x;
+    }
+
+    const float x2 = x * x;
+    const float poly = (k_snake_s1 + x2 * (k_snake_s2 + x2 * (k_snake_s3 + x2 * k_snake_s4)));
+    return x + x * x2 * poly;
+}
+
+#if defined(__AVX2__)
+static inline __m256 tts_fast_sin_ps(__m256 x) {
+    const __m256 inv_two_pi = _mm256_set1_ps(k_snake_inv_two_pi);
+    const __m256 two_pi     = _mm256_set1_ps(k_snake_two_pi);
+    const __m256 pi         = _mm256_set1_ps(k_snake_pi);
+    const __m256 pi_over_2  = _mm256_set1_ps(k_snake_pi_over_2);
+    const __m256 neg_pi_over_2 = _mm256_set1_ps(-k_snake_pi_over_2);
+    const __m256 neg_pi     = _mm256_set1_ps(-k_snake_pi);
+
+    __m256 k = _mm256_round_ps(_mm256_mul_ps(x, inv_two_pi), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+    x = _mm256_sub_ps(x, _mm256_mul_ps(k, two_pi));
+
+    const __m256 mask_pos = _mm256_cmp_ps(x, pi_over_2, _CMP_GT_OQ);
+    const __m256 x_pos = _mm256_sub_ps(pi, x);
+    x = _mm256_blendv_ps(x, x_pos, mask_pos);
+
+    const __m256 mask_neg = _mm256_cmp_ps(x, neg_pi_over_2, _CMP_LT_OQ);
+    const __m256 x_neg = _mm256_sub_ps(neg_pi, x);
+    x = _mm256_blendv_ps(x, x_neg, mask_neg);
+
+    const __m256 x2 = _mm256_mul_ps(x, x);
+    const __m256 s1 = _mm256_set1_ps(k_snake_s1);
+    const __m256 s2 = _mm256_set1_ps(k_snake_s2);
+    const __m256 s3 = _mm256_set1_ps(k_snake_s3);
+    const __m256 s4 = _mm256_set1_ps(k_snake_s4);
+
+    __m256 poly = _mm256_add_ps(s3, _mm256_mul_ps(s4, x2));
+    poly = _mm256_add_ps(s2, _mm256_mul_ps(poly, x2));
+    poly = _mm256_add_ps(s1, _mm256_mul_ps(poly, x2));
+    return _mm256_add_ps(x, _mm256_mul_ps(_mm256_mul_ps(x, x2), poly));
+}
+#endif
+
+static int32_t tts_snake_detect_alpha_kind(const ggml_tensor * alpha, const ggml_tensor * a) {
+    if (alpha == nullptr || a == nullptr) {
+        return 3;
+    }
+    const int64_t a_ne1 = a->ne[1];
+    const int64_t alpha_n = (int64_t) ggml_nelements(alpha);
+    if (alpha_n == 1) {
+        return 0;
+    }
+    if (alpha->ne[0] == 1 && alpha->ne[1] == a_ne1 && alpha->ne[2] == 1 && alpha->ne[3] == 1) {
+        return 1; // [1, C]
+    }
+    if (alpha->ne[0] == a_ne1 && alpha->ne[1] == 1 && alpha->ne[2] == 1 && alpha->ne[3] == 1) {
+        return 2; // [C]
+    }
+    return 3;
+}
+
+static inline float tts_snake_read_alpha_at(const ggml_tensor * alpha, const char * ptr) {
+    GGML_ASSERT(alpha != nullptr);
+    GGML_ASSERT(ptr   != nullptr);
+
+    // 说明：Kokoro 的 alpha 权重通常存为 F16（GGUF），但计算图中的激活张量多为 F32；
+    // 因此这里允许 alpha 为 F16/F32，读取时统一转成 float。
+    if (alpha->type == GGML_TYPE_F32) {
+        return *(const float *) ptr;
+    }
+    if (alpha->type == GGML_TYPE_F16) {
+        const ggml_fp16_t v = *(const ggml_fp16_t *) ptr;
+        return ggml_fp16_to_fp32(v);
+    }
+
+    // 不支持的类型，交由上层回退到纯 ggml 算子实现。
+    GGML_ASSERT(false);
+    return 0.0f;
+}
+
+static void tts_compute_snake_1d_custom(struct ggml_tensor * dst, int ith, int nth, void *) {
+    tts_snake_1d_op_params p{};
+    std::memcpy(&p, dst->op_params, sizeof(p));
+
+    const ggml_tensor * a     = dst->src[0];
+    const ggml_tensor * alpha = dst->src[1];
+
+    GGML_ASSERT(a != nullptr && alpha != nullptr);
+    // 说明：a 必须为 F32（我们在 custom path 只对 F32 激活启用），alpha 允许 F16/F32。
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(alpha->type == GGML_TYPE_F32 || alpha->type == GGML_TYPE_F16);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(a->ne[2] == 1 && a->ne[3] == 1);
+    GGML_ASSERT(dst->ne[0] == a->ne[0] && dst->ne[1] == a->ne[1]);
+    GGML_ASSERT(a->nb[0] == sizeof(float));
+    GGML_ASSERT(dst->nb[0] == sizeof(float));
+
+    const int64_t T = a->ne[0];
+    const int64_t C = a->ne[1];
+
+    const float * in  = (const float *) a->data;
+    float * out = (float *) dst->data;
+
+    static constexpr float k_alpha_eps = 1e-8f;
+
+    const int64_t cpt = (C + nth - 1) / nth;
+    const int64_t c0  = cpt * ith;
+    const int64_t c1  = std::min(c0 + cpt, C);
+
+    const bool use_fast = p.use_fast_sin != 0;
+
+    if (p.alpha_kind == 0 || p.alpha_kind == 1 || p.alpha_kind == 2) {
+        for (int64_t c = c0; c < c1; ++c) {
+            float alpha_c = 0.0f;
+            if (p.alpha_kind == 0) {
+                alpha_c = tts_snake_read_alpha_at(alpha, (const char *) alpha->data);
+            } else if (p.alpha_kind == 1) {
+                alpha_c = tts_snake_read_alpha_at(alpha, (const char *) alpha->data + c * alpha->nb[1]); // [1, C]
+            } else {
+                alpha_c = tts_snake_read_alpha_at(alpha, (const char *) alpha->data + c * alpha->nb[0]); // [C]
+            }
+
+            if (fabsf(alpha_c) < k_alpha_eps) {
+                alpha_c = (alpha_c >= 0.0f) ? k_alpha_eps : -k_alpha_eps;
+            }
+            const float inv_alpha = 1.0f / alpha_c;
+
+            const float * in_c  = in  + c * T;
+            float * out_c = out + c * T;
+
+#if defined(__AVX2__)
+            if (use_fast) {
+                const __m256 alpha_v = _mm256_set1_ps(alpha_c);
+                const __m256 inv_v   = _mm256_set1_ps(inv_alpha);
+                int64_t t = 0;
+                for (; t + 8 <= T; t += 8) {
+                    const __m256 a_v = _mm256_loadu_ps(in_c + t);
+                    const __m256 x_v = _mm256_mul_ps(a_v, alpha_v);
+                    const __m256 s_v = tts_fast_sin_ps(x_v);
+                    const __m256 s2_v = _mm256_mul_ps(s_v, s_v);
+                    const __m256 term = _mm256_mul_ps(s2_v, inv_v);
+                    const __m256 y_v  = _mm256_add_ps(a_v, term);
+                    _mm256_storeu_ps(out_c + t, y_v);
+                }
+                for (; t < T; ++t) {
+                    const float av = in_c[t];
+                    const float sv = tts_fast_sin_scalar(av * alpha_c);
+                    out_c[t] = av + (sv * sv) * inv_alpha;
+                }
+                continue;
+            }
+#endif
+
+            for (int64_t t = 0; t < T; ++t) {
+                const float av = in_c[t];
+                const float sv = sinf(av * alpha_c);
+                out_c[t] = av + (sv * sv) * inv_alpha;
+            }
+        }
+        return;
+    }
+
+    for (int64_t c = c0; c < c1; ++c) {
+        const float * in_c  = in  + c * T;
+        float * out_c = out + c * T;
+        for (int64_t t = 0; t < T; ++t) {
+            const int64_t ai0 = (alpha->ne[0] == 1) ? 0 : t;
+            const int64_t ai1 = (alpha->ne[1] == 1) ? 0 : c;
+            float alpha_c = tts_snake_read_alpha_at(alpha, (const char *) alpha->data + ai0 * alpha->nb[0] + ai1 * alpha->nb[1]);
+            if (fabsf(alpha_c) < k_alpha_eps) {
+                alpha_c = (alpha_c >= 0.0f) ? k_alpha_eps : -k_alpha_eps;
+            }
+            const float inv_alpha = 1.0f / alpha_c;
+            const float av = in_c[t];
+            const float sv = (use_fast ? tts_fast_sin_scalar(av * alpha_c) : sinf(av * alpha_c));
+            out_c[t] = av + (sv * sv) * inv_alpha;
+        }
+    }
+}
+
+} // namespace
+
 struct ggml_tensor * snake_1d(ggml_context * ctx, struct ggml_tensor * alpha, struct ggml_tensor * a,
                               std::vector<tts_graph_const_input> * const_inputs) {
     assert(a->ne[2] == 1 && a->ne[3] == 1);
     // 说明：
     // Snake1d(a, alpha) = a + (sin(alpha * a)^2) / alpha
     //
-    // 这里故意使用 “/ alpha” 而不是先算 reciprocal(alpha) 再乘：
-    // - 可避免 Vulkan 路径下对标量常量的 repeat 广播（见 reciprocal() 的说明）；
-    // - 算子更少（少一次 reciprocal 分支），在 Vulkan 下也更稳定。
-    (void) const_inputs; // 当前实现不再需要通过 const_inputs 注入常量
+    // 这里做一个“CPU-only 融合优化”：
+    // - 原图实现需要 mul/sin/sqr/div/add 5 个逐元素算子，会对同一大张量反复读写，CPU 下容易受内存带宽与调度开销影响；
+    // - 自定义算子可将这 5 步融合为单次遍历，显著减少中间张量与内存往返；
+    // - Vulkan 路径（const_inputs != nullptr）必须保持纯 ggml 算子，以确保整图可在 Vulkan 后端执行。
+    //
+    // 开关：
+    // - TTS_CPU_SNAKE_CUSTOM=0：禁用自定义融合，回退到纯 ggml 算子（便于回归/对比）。
+    // - TTS_CPU_SNAKE_FAST=0：自定义融合中使用标准 sinf（更高精度）；默认启用近似 sin（更快，便于达成 CPU 延迟目标）。
+
+    if (tts_snake_stats_enabled()) {
+        tts_snake_stats_register_once_if_needed();
+        tts_snake_stats_state().calls_total.fetch_add(1);
+    }
+
+    const bool allow_custom = (const_inputs == nullptr) && tts_env_truthy_default("TTS_CPU_SNAKE_CUSTOM", true);
+    if (allow_custom && alpha && a &&
+        a->type == GGML_TYPE_F32 &&
+        (alpha->type == GGML_TYPE_F32 || alpha->type == GGML_TYPE_F16) &&
+        ggml_is_contiguous(alpha) && ggml_is_contiguous(a)) {
+        if (tts_snake_stats_enabled()) {
+            tts_snake_stats_state().calls_custom.fetch_add(1);
+            if (alpha->type == GGML_TYPE_F16) {
+                tts_snake_stats_state().custom_alpha_f16.fetch_add(1);
+            } else {
+                tts_snake_stats_state().custom_alpha_f32.fetch_add(1);
+            }
+        }
+
+        tts_snake_1d_op_params p{};
+        p.base.fun = tts_compute_snake_1d_custom;
+        p.base.n_tasks = GGML_N_TASKS_MAX;
+        p.base.userdata = nullptr;
+        p.alpha_kind = tts_snake_detect_alpha_kind(alpha, a);
+        p.use_fast_sin = tts_env_truthy_default("TTS_CPU_SNAKE_FAST", true) ? 1 : 0;
+
+        ggml_tensor * out = ggml_dup_tensor(ctx, a);
+        out->op = GGML_OP_CUSTOM;
+        out->src[0] = a;
+        out->src[1] = alpha;
+        ggml_set_op_params(out, &p, sizeof(p));
+        return out;
+    }
+
+    if (tts_snake_stats_enabled()) {
+        tts_snake_stats_state().calls_fallback.fetch_add(1);
+        if (const_inputs != nullptr) {
+            tts_snake_stats_state().fallback_vulkan.fetch_add(1);
+        } else if (!tts_env_truthy_default("TTS_CPU_SNAKE_CUSTOM", true)) {
+            tts_snake_stats_state().fallback_disabled.fetch_add(1);
+        } else if (alpha == nullptr || a == nullptr) {
+            tts_snake_stats_state().fallback_null.fetch_add(1);
+        } else if (a->type != GGML_TYPE_F32) {
+            tts_snake_stats_state().fallback_type_a.fetch_add(1);
+        } else if (!(alpha->type == GGML_TYPE_F32 || alpha->type == GGML_TYPE_F16)) {
+            tts_snake_stats_state().fallback_type_alpha.fetch_add(1);
+        } else if (!ggml_is_contiguous(alpha) || !ggml_is_contiguous(a)) {
+            tts_snake_stats_state().fallback_non_contig.fetch_add(1);
+        }
+    }
+
+    // 回退实现（兼容 Vulkan/非连续张量等）：使用标准 ggml 算子组合。
+    // 说明：
+    // - 这里故意使用 “/ alpha” 而不是先算 reciprocal(alpha) 再乘：
+    //   - 可避免 Vulkan 路径下对标量常量的 repeat 广播（见 reciprocal() 的说明）；
+    //   - 算子更少（少一次 reciprocal 分支），在 Vulkan 下也更稳定。
     ggml_tensor * sin_sq = ggml_sqr(ctx, ggml_sin(ctx, ggml_mul(ctx, a, alpha)));
     ggml_tensor * term   = ggml_div(ctx, sin_sq, alpha);
     return ggml_add(ctx, a, term);
@@ -1116,7 +1487,7 @@ struct ggml_tensor * stft_graph(
     padded = ggml_cont(ctx, padded); // 说明：conv_1d 更偏好连续输入
 
     // 2) conv_1d 得到实部/虚部（channels = 2 * cutoff）
-    ggml_tensor * stft_raw = ggml_conv_1d(ctx, forward_basis, padded, (int) hop, 0, 1);
+    ggml_tensor * stft_raw = tts_conv_1d(ctx, forward_basis, padded, (int) hop, 0, 1);
     if (stft_raw->ne[1] != cutoff * 2) {
         TTS_ABORT("stft_graph: conv 输出通道数不匹配（got=%d expected=%d）。\n",
                   (int) stft_raw->ne[1], (int) (cutoff * 2));
@@ -1141,6 +1512,13 @@ struct ggml_tensor * stft_graph(
     ggml_tensor * imag_f = ggml_view_3d(ctx, stft_4d,
                                         stft_4d->ne[0], stft_4d->ne[1], stft_4d->ne[2],
                                         stft_4d->nb[1], stft_4d->nb[2], stft_4d->nb[3]);
+    const bool vk_backend = tts_tensor_on_vulkan(forward_basis);
+    if (vk_backend) {
+        // 说明：ABS/STEP 属于 GGML_OP_UNARY，Vulkan 要求 view 偏移对齐；
+        // 这里提前做 cont，避免后续断言并保持 STFT 图完整在 Vulkan 上运行。
+        real_f = tts_vk_cont_view(ctx, real_f, vk_backend);
+        imag_f = tts_vk_cont_view(ctx, imag_f, vk_backend);
+    }
 
     ggml_tensor * real_sq = ggml_mul(ctx, real_f, real_f);
     ggml_tensor * imag_sq = ggml_mul(ctx, imag_f, imag_f);
@@ -1212,6 +1590,37 @@ struct ggml_tensor * istft_graph(
 
     // 去掉窗函数影响
     return ggml_div(ctx, out, window_squared_sum);
+}
+
+struct ggml_tensor * tts_conv_1d(
+    ggml_context * ctx,
+    struct ggml_tensor * a,
+    struct ggml_tensor * b,
+    int s0,
+    int p0,
+    int d0) {
+    if (!a || !b) {
+        TTS_ABORT("For #tts_conv_1d kernel/input must be valid.\n");
+    }
+    if (b->type != GGML_TYPE_F32) {
+        TTS_ABORT("For #tts_conv_1d input must be GGML_TYPE_F32.\n");
+    }
+    if (a->type != GGML_TYPE_F16 && a->type != GGML_TYPE_F32) {
+        TTS_ABORT("For #tts_conv_1d kernel must be GGML_TYPE_F16 or GGML_TYPE_F32.\n");
+    }
+
+    // 说明：ggml_conv_1d 固定使用 F16 im2col，CPU 路径会断言 kernel 为 F16。
+    // 这里按 kernel 类型选择 im2col 输出类型，既保留 F16 快路径，也让 F32 权重可用。
+    const ggml_type im2col_type = (a->type == GGML_TYPE_F16) ? GGML_TYPE_F16 : GGML_TYPE_F32;
+    ggml_tensor * im2col = ggml_im2col(ctx, a, b, s0, 0, p0, 0, d0, 0, false, im2col_type); // [N, OL, IC * K]
+
+    ggml_tensor * result =
+        ggml_mul_mat(ctx,
+                     ggml_reshape_2d(ctx, im2col, im2col->ne[0], (im2col->ne[2] * im2col->ne[1])), // [N, OL, IC * K] => [N*OL, IC * K]
+                     ggml_reshape_2d(ctx, a, (a->ne[0] * a->ne[1]), a->ne[2]));                    // [OC，IC, K] => [OC, IC * K]
+
+    result = ggml_reshape_3d(ctx, result, im2col->ne[1], a->ne[2], im2col->ne[2]); // [N, OC, OL]
+    return result;
 }
 
 struct ggml_tensor * tts_conv_transpose_1d(

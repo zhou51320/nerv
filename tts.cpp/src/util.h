@@ -150,6 +150,15 @@ ggml_backend_t tts_backend_init_accel();
  * - 对于 groups>1（主要是 Kokoro 的 depthwise 转置卷积）：
  *   在项目侧用 GGML_OP_CUSTOM 补齐一个 CPU 版本实现，保证功能正确。
  */
+// 一维卷积（项目侧封装，补齐 F32 卷积核支持）。
+struct ggml_tensor * tts_conv_1d(
+    ggml_context * ctx,
+    struct ggml_tensor * a,  // kernel
+    struct ggml_tensor * b,  // input
+    int s0,                  // stride
+    int p0,                  // padding
+    int d0);                 // dilation
+
 struct ggml_tensor * tts_conv_transpose_1d(
     ggml_context * ctx,
     struct ggml_tensor * a,  // kernel

@@ -138,7 +138,7 @@ struct ggml_cgraph * snac_runner::build_snac_graph(size_t sequence_length) {
     inputs = snac_build_audio_inputs(ctx, sctx, sequence_length, model->quantizer_layers);
     cur = ggml_conv_1d_dw(ctx, model->in_conv_kernel, inputs, 1, 3, 1);
     cur = ggml_add(ctx, cur, model->in_conv_bias);
-    cur = ggml_conv_1d(ctx, model->up_conv_kernel, cur, 1, 0, 1);
+    cur = tts_conv_1d(ctx, model->up_conv_kernel, cur, 1, 0, 1);
     cur = ggml_add(ctx, cur, model->up_conv_bias);
     size_t noise_offset = 0;
     for (int l = 0; l < model->layers.size(); l++) {
@@ -148,7 +148,7 @@ struct ggml_cgraph * snac_runner::build_snac_graph(size_t sequence_length) {
         cur = general_neural_audio_codec::build_layer(ctx, cur, layer, noise);
     }
     cur = snake_1d(ctx, model->snake_alpha, cur);
-    cur = ggml_conv_1d(ctx, model->out_conv_kernel, cur, 1, 3, 1);
+    cur = tts_conv_1d(ctx, model->out_conv_kernel, cur, 1, 3, 1);
     cur = ggml_add(ctx, cur, model->out_conv_bias);
     cur = ggml_tanh(ctx, cur);
     ggml_build_forward_expand(gf, cur);
@@ -178,7 +178,7 @@ void snac_runner::set_inputs(std::vector<std::vector<uint32_t>> & tokens) {
 
 void snac_runner::run(std::vector<std::vector<uint32_t>> & tokens, struct tts_response * outputs) {
     size_t sequence_length = tokens[2].size();
-    ggml_backend_sched_reset(sctx->sched);
+    sctx->reset_graph();
     
     sctx->prep_output_buffer(model->max_generation_size * model->up_sampling_factor * sizeof(float));
     
@@ -190,17 +190,22 @@ void snac_runner::run(std::vector<std::vector<uint32_t>> & tokens, struct tts_re
     
     // the output is always the last tensor in the graph
     struct ggml_tensor * result = gf->nodes[gf->n_nodes - 1];
-    ggml_backend_sched_alloc_graph(sctx->sched, gf);
+    if (!sctx->alloc_graph(gf)) {
+        TTS_ABORT("SNAC 图分配失败。");
+    }
 
     set_inputs(tokens);
 
-    ggml_backend_sched_graph_compute_async(sctx->sched, gf);
+    const enum ggml_status st = sctx->compute_graph_async(gf);
+    if (st != GGML_STATUS_SUCCESS) {
+        TTS_ABORT("SNAC 计算失败：status=%d。", (int) st);
+    }
 
     sctx->get_ggml_node_data(result, outputs->data, sequence_length*sizeof(float)*model->up_sampling_factor);
 
     sctx->sync();
     // 说明：异步后端需要先同步，避免 reset 释放仍在使用的 buffer。
-    ggml_backend_sched_reset(sctx->sched);
+    sctx->reset_graph();
     outputs->n_outputs = sequence_length * model->up_sampling_factor;
     return;
 }

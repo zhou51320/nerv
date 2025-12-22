@@ -641,11 +641,14 @@ void parler_tts_runner::set_inputs(parler_ubatch & batch) {
 
 }
 void parler_tts_runner::parler_graph_compute(ggml_cgraph * gf) {
-    ggml_backend_sched_graph_compute_async(pctx->sched, gf);
+    const enum ggml_status st = pctx->compute_graph_async(gf);
+    if (st != GGML_STATUS_SUCCESS) {
+        TTS_ABORT("Parler 计算失败：status=%d。", (int) st);
+    }
 }
 
 int parler_tts_runner::decode(parler_ubatch & batch) {
-    ggml_backend_sched_reset(pctx->sched);
+    pctx->reset_graph();
     
     pctx->output_tokens.reserve(model->max_generation_size);
     
@@ -670,7 +673,9 @@ int parler_tts_runner::decode(parler_ubatch & batch) {
 
     // the output is always the last tensor in the graph
     struct ggml_tensor * res = gf->nodes[gf->n_nodes - 1];
-    ggml_backend_sched_alloc_graph(pctx->sched, gf);
+    if (!pctx->alloc_graph(gf)) {
+        TTS_ABORT("Parler 图分配失败。");
+    }
     
     // use the sequence_length variable here so that audio input tokens are handled correctly.
     size_t n_outputs_new = batch.sequence_length;
@@ -686,7 +691,7 @@ int parler_tts_runner::decode(parler_ubatch & batch) {
 
     pctx->sync();
     // 说明：异步后端需要先同步，避免 reset 释放仍在使用的 buffer。
-    ggml_backend_sched_reset(pctx->sched);
+    pctx->reset_graph();
 
     return 0;
 }

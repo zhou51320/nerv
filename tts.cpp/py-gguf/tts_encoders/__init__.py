@@ -27,3 +27,8 @@ try:
     from .orpheus_gguf_encoder import *
 except Exception:
     pass
+
+try:
+    from .cosyvoice3_gguf_encoder import *
+except Exception:
+    pass

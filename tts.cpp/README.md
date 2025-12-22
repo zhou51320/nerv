@@ -83,7 +83,11 @@ python .\py-gguf\convert_kokoro_to_gguf `
   --phonemizer-repo D:\EVA_MODELS\text2speech\TTS_ipa_en_us_phonemizer_F16.gguf
 ```
 
-`--phonemizer-repo` 用于指定 phonemizer 配置来源（本地 `.gguf` 文件/目录或 HF repo id），转换脚本会将 `phonemizer.*` 相关键值拷贝进新 GGUF，运行时无需额外 phonemizer 依赖。
+`--phonemizer-repo` 用于指定 phonemizer 配置来源（本地 `.gguf` 文件/目录或 HF repo id），转换脚本会将 `phonemizer.*` 相关键值拷贝进新 GGUF，运行时无需额外 phonemizer 依赖。可以在这里下载 https://hf-mirror.com/mmwillet2/TTS_ipa_en_us_phonemizer/tree/main
+
+
+- 例如 python .\py-gguf\convert_kokoro_to_gguf  --repo-id .\参考项目\kokoro-zh  --save-path D:\EVA_MODELS\text2speech\Kokoro-82M-v1_1-zh2.gguf --phonemizer-repo "D:\原始模型\kokoro-zh\tts_en_us_phonemizer.gguf"
+
 
 ## 量化/低精度（Kokoro）
 

@@ -79,7 +79,17 @@ void runner_context::get_ggml_node_data(struct ggml_tensor * output_node, float 
     } else if (ggml_nbytes(output_node) < output_size) {
         TTS_ABORT("Output node, '%s', with %d bytes is too small for #ggml_backend_tensor_get_async with size of %d.\n", ggml_get_name(output_node), ggml_nbytes(output_node), output_size);
     }
-    ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched, output_node);
+    ggml_backend_t backend_res = nullptr;
+    if (sched) {
+        backend_res = ggml_backend_sched_get_tensor_backend(sched, output_node);
+    } else {
+        // 说明：CPU-only 使用 galloc 时，不存在 sched；输出张量一定位于 CPU 后端。
+        // 兼容兜底：若存在 backend（加速后端）但没有 sched，则优先使用 backend。
+        backend_res = backend ? backend : backend_cpu;
+    }
+    if (!backend_res) {
+        TTS_ABORT("get_ggml_node_data: backend_res is null (sched=%p backend=%p backend_cpu=%p)", (void *) sched, (void *) backend, (void *) backend_cpu);
+    }
     ggml_backend_tensor_get_async(backend_res, output_node, output, 0, output_size);
 }
 
@@ -102,6 +112,32 @@ void runner_context::set_threads() {
 
 void runner_context::build_schedule(size_t max_nodes) {
     backend_cpu_buffer = ggml_backend_cpu_buffer_type();
+
+    // ------------------------- CPU-only：绕开 scheduler -------------------------
+    // 说明：
+    // - ggml_backend_sched_new(graph_size) 会按 graph_size 预分配/管理一批内部数组与 context buffer；
+    // - 对于 Kokoro 这种图规模较大的模型，graph_size 往往会被设置得很保守，导致 scheduler 试图申请“十几 GB”的连续内存；
+    // - 在 ARM Linux 等无 swap 或严格 overcommit 的机器上，这会在“模型加载阶段”直接触发 ENOMEM，进而 ggml_init 断言崩溃。
+    // - CPU-only 场景其实不需要 scheduler（没有多后端拆图/拷贝需求），用 ggml_gallocr 按实际图分配即可。
+    if (backend == nullptr) {
+        if (sched) {
+            ggml_backend_sched_free(sched);
+            sched = nullptr;
+        }
+        if (!galloc) {
+            galloc = ggml_gallocr_new(backend_cpu_buffer);
+            if (!galloc) {
+                TTS_ABORT("CPU-only 创建 ggml_gallocr 失败。");
+            }
+        }
+        return;
+    }
+
+    // 加速后端（Metal/Vulkan）：仍使用 scheduler 负责拆图/多 buffer 分配与同步
+    if (galloc) {
+        ggml_gallocr_free(galloc);
+        galloc = nullptr;
+    }
     if (backend != nullptr) {
         // 说明：无论是 Metal 还是 Vulkan（以及未来更多后端），都通过通用接口获取默认 buffer type。
         backend_buffer = ggml_backend_get_default_buffer_type(backend);
@@ -120,7 +156,42 @@ void runner_context::build_schedule(size_t max_nodes) {
 }
 
 bool runner_context::prep_schedule(struct ggml_cgraph * gf) {
+    // ------------------------- CPU-only：galloc 预分配（可选） -------------------------
+    // 说明：该函数主要用于 “prepare_post_load” 阶段对 worst-case 图做一次可选预分配，减少首次推理时的 realloc。
+    // CPU-only 下我们不使用 scheduler，因此在这里改为使用 ggml_gallocr_reserve(_n_size)。
     if (!sched) {
+        if (backend == nullptr && backend_cpu != nullptr && galloc != nullptr) {
+            const bool cpu_prealloc = tts_env_truthy_default_local("TTS_CPU_PREALLOC", /*default_value=*/true);
+            if (!cpu_prealloc) {
+                return true;
+            }
+
+            size_t sizes[1] = {0};
+            ggml_gallocr_reserve_n_size(galloc, gf, /*node_buffer_ids=*/nullptr, /*leaf_buffer_ids=*/nullptr, sizes);
+            const size_t cpu_need = sizes[0];
+
+            const double max_gib = tts_env_double_default_local("TTS_CPU_PREALLOC_MAX_GIB", 2.0);
+            if (max_gib > 0.0) {
+                const double gib = 1024.0 * 1024.0 * 1024.0;
+                const size_t limit = (size_t) (max_gib * gib);
+                if (cpu_need > limit) {
+                    fprintf(stderr,
+                            "[tts] CPU 预分配需求 %.2f GiB 超过阈值 %.2f GiB，跳过预分配并在运行时按实际图分配。\n",
+                            cpu_need / gib,
+                            max_gib);
+                    return true;
+                }
+            }
+
+            const bool ok = ggml_gallocr_reserve(galloc, gf);
+            if (!ok) {
+                // 说明：worst-case 预分配失败并不致命，后续运行时仍可按实际输入图重新分配。
+                fprintf(stderr,
+                        "[tts] CPU 预分配失败，跳过并在运行时按实际图分配。\n");
+                return true;
+            }
+            return true;
+        }
         return false;
     }
 
@@ -227,6 +298,37 @@ bool runner_context::prep_schedule(struct ggml_cgraph * gf) {
     return ok;
 }
 
+void runner_context::reset_graph() {
+    // 说明：scheduler 在每次推理前/后通常会 reset，避免下次推理时状态不一致。
+    // CPU-only + galloc 不需要显式 reset（alloc_graph 内部会 reset vbuffer），这里做成统一封装便于调用方不分支。
+    if (sched) {
+        ggml_backend_sched_reset(sched);
+    }
+}
+
+bool runner_context::alloc_graph(struct ggml_cgraph * gf) {
+    if (sched) {
+        return ggml_backend_sched_alloc_graph(sched, gf);
+    }
+    if (galloc) {
+        return ggml_gallocr_alloc_graph(galloc, gf);
+    }
+    return false;
+}
+
+enum ggml_status runner_context::compute_graph_async(struct ggml_cgraph * gf) {
+    if (sched) {
+        return ggml_backend_sched_graph_compute_async(sched, gf);
+    }
+
+    // 说明：CPU-only 使用 galloc 分配图张量后，直接用 CPU backend 执行即可。
+    ggml_backend_t exec_backend = backend ? backend : backend_cpu;
+    if (!exec_backend) {
+        return GGML_STATUS_ALLOC_FAILED;
+    }
+    return ggml_backend_graph_compute_async(exec_backend, gf);
+}
+
 void runner_context::prep_output_buffer(size_t new_size) {
     const size_t prev_size = buf_output ? ggml_backend_buffer_get_size(buf_output) : 0;
     if (!buf_output || prev_size < new_size) {
@@ -241,12 +343,20 @@ void runner_context::prep_output_buffer(size_t new_size) {
 }
 
 void runner_context::sync() {
-    if (!sched) {
+    if (sched) {
+        // 说明：异步后端（如 Vulkan/Metal）在 compute_async / tensor_get_async 后可能仍在执行，
+        // 必须先同步，避免 reset 释放仍在使用的 buffer 引发崩溃或数据未就绪。
+        ggml_backend_sched_synchronize(sched);
         return;
     }
-    // 说明：异步后端（如 Vulkan/Metal）在 compute_async / tensor_get_async 后可能仍在执行，
-    // 必须先同步，避免 reset 释放仍在使用的 buffer 引发崩溃或数据未就绪。
-    ggml_backend_sched_synchronize(sched);
+
+    // 说明：CPU-only（galloc）同样走统一的同步接口；CPU backend 通常是同步执行，但这里保持一致性与安全性。
+    if (backend != nullptr) {
+        ggml_backend_synchronize(backend);
+    }
+    if (backend_cpu != nullptr) {
+        ggml_backend_synchronize(backend_cpu);
+    }
 }
 
 void tts_runner::init_build(std::vector<uint8_t>* buf_compute_meta) {

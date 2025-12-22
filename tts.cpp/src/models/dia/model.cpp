@@ -743,7 +743,7 @@ int dia_runner::decode(dia_ubatch & batch) {
         dctx->prompt_size = batch.sentence_length;
         dctx->output_tokens.reserve(dctx->max_generation_size * model->n_output_heads);
     }
-    ggml_backend_sched_reset(dctx->sched);
+    dctx->reset_graph();
         
     const size_t logits_size = model->output_vocab_size * dctx->max_generation_size * model->n_output_heads;
     const size_t prev_size = dctx->buf_output ? ggml_backend_buffer_get_size(dctx->buf_output) : 0;
@@ -766,18 +766,23 @@ int dia_runner::decode(dia_ubatch & batch) {
     // the output is always the last tensor in the graph
     struct ggml_tensor * res = gf->nodes[gf->n_nodes - 1];
     std::string resname = ggml_get_name(res);
-    ggml_backend_sched_alloc_graph(dctx->sched, gf);
+    if (!dctx->alloc_graph(gf)) {
+        TTS_ABORT("Dia 图分配失败。");
+    }
 
     set_inputs(batch);
 
-    ggml_backend_sched_graph_compute_async(dctx->sched, gf);
+    const enum ggml_status st = dctx->compute_graph_async(gf);
+    if (st != GGML_STATUS_SUCCESS) {
+        TTS_ABORT("Dia 计算失败：status=%d。", (int) st);
+    }
 
     float * logits_out = dctx->logits + dctx->current_position * model->output_vocab_size * model->n_output_heads;
     dctx->get_ggml_node_data(res, logits_out, model->output_vocab_size * model->n_output_heads * sizeof(float));
 
     dctx->sync();
     // 说明：异步后端需要先同步，避免 reset 释放仍在使用的 buffer。
-    ggml_backend_sched_reset(dctx->sched);
+    dctx->reset_graph();
 
     return 0;
 }

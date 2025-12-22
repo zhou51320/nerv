@@ -321,7 +321,7 @@ void t5_runner::run(uint32_t * input_tokens, uint32_t sequence_length, struct tt
 	t5_ubatch batch;
     batch.input_tokens = input_tokens;
     batch.n_tokens = sequence_length;
-    ggml_backend_sched_reset(t5ctx->sched);
+    t5ctx->reset_graph();
 
     const size_t prev_size = t5ctx->buf_output ? ggml_backend_buffer_get_size(t5ctx->buf_output) : 0;
     const size_t new_size = model->max_context_length * model->output_size * sizeof(float);
@@ -342,16 +342,21 @@ void t5_runner::run(uint32_t * input_tokens, uint32_t sequence_length, struct tt
     gf = build_t5_graph(batch);
     // the output is always the last tensor in the graph
     struct ggml_tensor * result = gf->nodes[gf->n_nodes - 1];
-    ggml_backend_sched_alloc_graph(t5ctx->sched, gf);
+    if (!t5ctx->alloc_graph(gf)) {
+        TTS_ABORT("T5 图分配失败。");
+    }
     set_inputs(batch);
 
-    ggml_backend_sched_graph_compute_async(t5ctx->sched, gf);
+    const enum ggml_status st = t5ctx->compute_graph_async(gf);
+    if (st != GGML_STATUS_SUCCESS) {
+        TTS_ABORT("T5 计算失败：status=%d。", (int) st);
+    }
 
     t5ctx->get_ggml_node_data(result, outputs->data, batch.n_tokens*sizeof(float)*model->output_size);
 
     t5ctx->sync();
     // 说明：异步后端需要先同步，避免 reset 释放仍在使用的 buffer。
-    ggml_backend_sched_reset(t5ctx->sched);
+    t5ctx->reset_graph();
     outputs->n_outputs = sequence_length;
     outputs->hidden_size = model->output_size;
     return;
