@@ -9,54 +9,15 @@ This simple example cli tool can be used to generate speach from a text prompt a
 
 ### Usage
 
-In order to get a detailed breakdown the functionality currently available you can call the cli with the `--help` parameter. This will return a breakdown of all parameters:
+For a concise user-facing help message, run:
 ```bash
 ./tts-cli --help
+```
 
---temperature (-t):
-    The temperature to use when generating outputs. Defaults to 1.0.
---repetition-penalty (-r):
-    The by channel repetition penalty to be applied the sampled output of the model. defaults to 1.0.
---top-p (tp):
-    (OPTIONAL) the sum of probabilities to sample over. Must be a value between 0.0 and 1.0. Defaults to 1.0.
---n-threads (-nt):
-    The number of cpu threads to run generation with. Defaults to hardware concurrency. If hardware concurrency cannot be determined then it defaults to 1.
---topk (-tk):
-    (OPTIONAL) When set to an integer value greater than 0 generation uses nucleus sampling over topk nucleaus size. Defaults to 50.
---max-tokens (-mt):
-    (OPTIONAL) The max audio tokens or token batches to generate where each represents approximates 11 ms of audio. Only applied to Dia generation. If set to zero as is its default then the default max generation size. Warning values under 15 are not supported.
---device (-d):
-    (OPTIONAL) Compute device/backend for testing: cpu/metal/vulkan[:N]/auto. Empty=build default.
---use-metal (-m):
-    (DEPRECATED) Use '--device metal' instead.
---use-vulkan (-vk):
-    (DEPRECATED) Use '--device vulkan' instead.
---vulkan-device (-vd):
-    (OPTIONAL) Vulkan device index (default: 0).
---no-cross-attn (-ca):
-    (OPTIONAL) Whether to not include cross attention
---vad (-va):
-    (OPTIONAL) whether to apply voice inactivity detection (VAD) and strip silence form the end of the output (particularly useful for Parler TSS). By default, no VAD is applied.
---play:
-    (OPTIONAL) Whether to play back the audio immediately instead of saving it to file.
---model-path (-mp):
-    (REQUIRED) The local path of the gguf model file for Parler TTS mini or large v1, Dia, or Kokoro.
---prompt (-p):
-    (REQUIRED unless --bench) The text prompt for which to generate audio in quotation markers.
---bench (-b):
-    (OPTIONAL) Use the built-in mixed zh/en benchmark prompt and ignore '--prompt'/'-p'.
---save-path (-sp):
-    (OPTIONAL) The path to save the audio output to in a .wav format. Defaults to TTS.cpp.wav
---conditional-prompt (-cp):
-    (OPTIONAL) A distinct conditional prompt to use for generating. If none is provided the preencoded prompt is used. '--text-encoder-path' must be set to use conditional generation.
---text-encoder-path (-tep):
-    (OPTIONAL) The local path of the text encoder gguf model for conditional generaiton.
---voice (-v):
-    (OPTIONAL) The voice to use to generate the audio. This is only used for models with voice packs.
---lang (-l):
-    (OPTIONAL) Language preference for digit reading / CJK frontend: zh, en, ja. Defaults to zh.
---zh-dict-dir (-zd):
-    (OPTIONAL) Kokoro zh dict directory (pinyin_phrase.txt/pinyin.txt). Empty=auto (try ./dict then builtin if enabled); ':builtin' forces builtin; '-' disables.
+For the full list of advanced/tuning parameters, run:
+
+```bash
+./tts-cli --help-all
 ```
 
 General usage should follow from these possible parameters. E.G. The following command will save generated speech to the `/tmp/test.wav` file.
@@ -68,7 +29,7 @@ General usage should follow from these possible parameters. E.G. The following c
 Or, to run a built-in mixed zh/en benchmark prompt (ignores `--prompt` / `-p`):
 
 ```bash
-./tts-cli --model-path /model/path/to/gguf_file.gguf --bench --save-path /tmp/bench.wav
+./tts-cli --model-path /model/path/to/gguf_file.gguf --bench --save-path /tmp/bench_zf_001.wav
 ```
 
 #### Dia and Orpheus Generation Arguments

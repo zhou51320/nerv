@@ -882,6 +882,73 @@ static const tts_fft_twiddles & tts_get_fft_twiddles(size_t n_fft) {
     return cache;
 }
 
+// ----------------------------- 小规模 DFT 预计算 -----------------------------
+// 说明：
+// - Kokoro 的 n_fft 很小（默认 20，且不是 2 的幂），走递归 FFT 会频繁调用 trig；
+// - 这里为“小规模非 2 幂 FFT”预计算 DFT 基矩阵（cos/sin），以换取更低的运行时开销；
+// - 仅对 n_fft 较小的场景启用，避免大规模 DFT 造成过高内存占用。
+struct tts_dft_cache {
+    size_t n_fft = 0;
+    std::vector<float> cos;
+    std::vector<float> sin;
+};
+
+static const tts_dft_cache & tts_get_dft_cache(size_t n_fft) {
+    static thread_local tts_dft_cache cache{};
+    if (cache.n_fft == n_fft) {
+        return cache;
+    }
+
+    cache = {};
+    cache.n_fft = n_fft;
+    cache.cos.resize(n_fft * n_fft);
+    cache.sin.resize(n_fft * n_fft);
+
+    const float k = -TTS_TWO_PI_F / (float) n_fft;
+    for (size_t i = 0; i < n_fft; ++i) {
+        for (size_t j = 0; j < n_fft; ++j) {
+            const float ang = k * (float) (i * j);
+            cache.cos[i * n_fft + j] = cosf(ang);
+            cache.sin[i * n_fft + j] = sinf(ang);
+        }
+    }
+
+    return cache;
+}
+
+static bool tts_fft_use_precomputed_dft(size_t n_fft) {
+    // 经验阈值：小尺寸（<=64）用 DFT 表更快，超出则继续走递归 FFT
+    return n_fft > 0 && n_fft <= 64;
+}
+
+static void tts_dft_cached(float * real, float * imag, float * scratch, size_t n_fft, size_t step) {
+    const tts_dft_cache & tbl = tts_get_dft_cache(n_fft);
+
+    // scratch 写入顺序：real/imag 交错，便于复用调用方传入的缓冲
+    for (size_t i = 0; i < n_fft; ++i) {
+        const float * cos_row = tbl.cos.data() + i * n_fft;
+        const float * sin_row = tbl.sin.data() + i * n_fft;
+
+        float acc_r = 0.0f;
+        float acc_i = 0.0f;
+        for (size_t j = 0; j < n_fft; ++j) {
+            const float xr = real[j * step];
+            const float xi = imag[j * step];
+            const float c  = cos_row[j];
+            const float s  = sin_row[j];
+            acc_r += xr * c - xi * s;
+            acc_i += xr * s + xi * c;
+        }
+        scratch[i * 2 + 0] = acc_r;
+        scratch[i * 2 + 1] = acc_i;
+    }
+
+    for (size_t i = 0; i < n_fft; ++i) {
+        real[i * step] = scratch[i * 2 + 0];
+        imag[i * step] = scratch[i * 2 + 1];
+    }
+}
+
 // 慢路径：递归 Radix-2 FFT（会调用 trig），用于非 2 的幂长度（或极端兼容场景）。
 static void tts_radix2_fft_slow(float * real, float * imag, float * scratch, size_t n_fft, size_t step) {
     if (n_fft == 1) {
@@ -1008,6 +1075,12 @@ static void tts_radix2_fft(float * real, float * imag, float * scratch, size_t n
             tts_radix2_fft_twiddled(real, imag, scratch, step, level, tw);
             return;
         }
+    }
+
+    // 小规模非 2 幂 FFT：优先使用预计算 DFT 表，减少 trig 调用
+    if (tts_fft_use_precomputed_dft(n_fft)) {
+        tts_dft_cached(real, imag, scratch, n_fft, step);
+        return;
     }
 
     // 非 2 的幂但仍可继续二分：走慢路径（内部同样会在必要时回退 DFT）。

@@ -94,17 +94,11 @@ python .\py-gguf\convert_kokoro_to_gguf `
 Kokoro 可用 `examples/quantize` 生成 F16/Q8/Q4 等版本：
 
 ```powershell
-.\quantize.exe --model-path D:\EVA_MODELS\text2speech\Kokoro-82M-v1_1-zh.gguf `
-  --quantized-model-path D:\EVA_MODELS\text2speech\Kokoro-82M-v1_1-zh_F16.gguf `
-  --quantized-type F16 --convert-non-quantized-to-f16
+.\quantize.exe --model-path D:\EVA_MODELS\text2speech\Kokoro-82M-v1_1-zh.gguf --quantized-model-path D:\EVA_MODELS\text2speech\Kokoro-82M-v1_1-zh_F16.gguf --quantized-type F16 --convert-non-quantized-to-f16
 
-.\quantize.exe --model-path D:\EVA_MODELS\text2speech\Kokoro-82M-v1_1-zh.gguf `
-  --quantized-model-path D:\EVA_MODELS\text2speech\Kokoro-82M-v1_1-zh_Q8_0.gguf `
-  --quantized-type Q8_0 --convert-non-quantized-to-f16
+.\quantize.exe --model-path D:\EVA_MODELS\text2speech\Kokoro-82M-v1_1-zh.gguf --quantized-model-path D:\EVA_MODELS\text2speech\Kokoro-82M-v1_1-zh_Q8_0.gguf --quantized-type Q8_0 --convert-non-quantized-to-f16
 
-.\quantize.exe --model-path D:\EVA_MODELS\text2speech\Kokoro-82M-v1_1-zh.gguf `
-  --quantized-model-path D:\EVA_MODELS\text2speech\Kokoro-82M-v1_1-zh_Q4_0.gguf `
-  --quantized-type Q4_0 --convert-non-quantized-to-f16
+.\quantize.exe --model-path D:\EVA_MODELS\text2speech\Kokoro-82M-v1_1-zh.gguf --quantized-model-path D:\EVA_MODELS\text2speech\Kokoro-82M-v1_1-zh_Q4_0.gguf --quantized-type Q4_0 --convert-non-quantized-to-f16zed-to-f16
 ```
 
 注意：Kokoro 当前量化策略只覆盖部分张量，且 `voice_tensors` 不参与量化（会保留 FP32），所以 Q8/Q4 相比 F16 的体积下降幅度有限。

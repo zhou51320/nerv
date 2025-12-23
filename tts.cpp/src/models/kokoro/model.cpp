@@ -1475,15 +1475,25 @@ static struct ggml_tensor * build_generator(ggml_context * ctx, kokoro_model * m
 	struct ggml_tensor * sing = build_sin_gen(ctx, model, kctx, f0_curve, model->harmonic_num + 1, f0_curve->ne[0] * 300, model->voice_threshold, model->sin_amp, model->noise_std);
 	struct ggml_tensor * har = ggml_tanh(ctx, ggml_add(ctx, ggml_mul_mat(ctx, generator->m_source_weight, sing), generator->m_source_bias));
 
-    // 说明：Vulkan 路径默认启用 conv 版 STFT/ISTFT（完整图执行更快）。
-    // 若遇到明显音质劣化（如“金属音”），可用环境变量回退到自定义 STFT/ISTFT：
-    // - TTS_VK_GRAPH_STFT=0：har 的 STFT 回退到自定义算子（CPU）
-    // - TTS_VK_GRAPH_ISTFT=0：末端 ISTFT 回退到自定义算子（CPU）
+    // 说明：
+    // - Vulkan 路径默认启用 conv 版 STFT/ISTFT（完整图执行更快）。
+    //   如遇明显音质劣化（如“金属音”），可回退到自定义 STFT/ISTFT：
+    //   - TTS_VK_GRAPH_STFT=0：har 的 STFT 回退到自定义算子（CPU）
+    //   - TTS_VK_GRAPH_ISTFT=0：末端 ISTFT 回退到自定义算子（CPU）
+    // - CPU 路径也支持按需启用 conv 版 STFT/ISTFT（默认关闭，便于保留自定义算子性能）：
+    //   - TTS_CPU_GRAPH_STFT=1：CPU 启用 conv 版 STFT
+    //   - TTS_CPU_GRAPH_ISTFT=1：CPU 启用 conv 版 ISTFT
     const bool vk_backend = tts_backend_is_vulkan(kctx->backend);
-    const bool graph_stft_allowed = vk_backend && model->stft_forward_basis && model->stft_inverse_basis;
-    const bool use_graph_stft = graph_stft_allowed && tts_env_truthy_default("TTS_VK_GRAPH_STFT", /*default_value=*/true);
-    const bool use_graph_istft = graph_stft_allowed && tts_env_truthy_default("TTS_VK_GRAPH_ISTFT", /*default_value=*/true);
-    const bool use_graph_consts = use_graph_stft; // 目前常量输入仅用于 stft_graph 内的 atan2 近似
+    const bool has_stft_basis = model->stft_forward_basis && model->stft_inverse_basis;
+    const bool cpu_graph_stft = !vk_backend && has_stft_basis && tts_env_truthy_default("TTS_CPU_GRAPH_STFT", /*default_value=*/false);
+    const bool cpu_graph_istft = !vk_backend && has_stft_basis && tts_env_truthy_default("TTS_CPU_GRAPH_ISTFT", /*default_value=*/false);
+    const bool use_graph_stft = vk_backend
+                                    ? (has_stft_basis && tts_env_truthy_default("TTS_VK_GRAPH_STFT", /*default_value=*/true))
+                                    : cpu_graph_stft;
+    const bool use_graph_istft = vk_backend
+                                     ? (has_stft_basis && tts_env_truthy_default("TTS_VK_GRAPH_ISTFT", /*default_value=*/true))
+                                     : cpu_graph_istft;
+    const bool use_graph_consts = use_graph_stft && vk_backend; // 常量输入仅用于 Vulkan 的 stft_graph
     std::vector<tts_graph_const_input> * const_inputs = use_graph_consts ? &kctx->graph_const_inputs : nullptr;
 
     // 说明：质量兜底/排查开关：可选择仅让 STFT/ISTFT 在 CPU 上执行（避免某些 Vulkan 实现导致的音质问题）。

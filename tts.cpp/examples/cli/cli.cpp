@@ -17,6 +17,7 @@
 #    include <shellapi.h>
 #endif
 
+#include "../../src/models/kokoro/zh_frontend.h"
 #include "../../src/models/loaders.h"
 #include "args.h"
 #include "common.h"
@@ -83,29 +84,89 @@ static std::filesystem::path tts_cli_self_exe_dir(const char * argv0) {
     return p.parent_path();
 }
 
-static std::string tts_cli_resolve_zh_dict_dir(const std::string & user_value, const char * argv0) {
-    // 说明：
-    // - 用户显式传入 --zh-dict-dir 时，完全尊重其值；
-    // - 未传时：优先 ./dict（工作目录），若不存在则尝试 exe 同目录的 dict/（便于随 exe 打包）。
-    if (!user_value.empty()) {
-        return user_value;
-    }
+struct tts_cli_zh_dict_resolution {
+    // 传给库侧的值：
+    // - ""        ：自动模式（库侧会尝试 "dict" 并在失败时回退内置词典）
+    // - "<path>"  ：显式指定外部目录
+    // - ":builtin"：强制内置（若编译时启用）
+    // - "-"       ：禁用词典
+    std::string dir;
+    // 打印到日志里的描述（便于用户确认“到底用的是哪份词典”）。
+    std::string desc;
+};
 
+static bool tts_cli_has_zh_phrase_dict(const std::filesystem::path & dict_dir) {
+    // 说明：仅用短语词典是否存在作为判定条件（pinyin_phrase.txt 是 DP 分词 + 多音字消歧的关键）。
     std::error_code ec;
-    if (std::filesystem::exists(std::filesystem::path("dict") / "pinyin_phrase.txt", ec) && !ec) {
-        // 保持空字符串：让库侧继续走 “auto: ./dict -> builtin” 的逻辑。
-        return "";
+    return std::filesystem::exists(dict_dir / "pinyin_phrase.txt", ec) && !ec;
+}
+
+static std::filesystem::path tts_cli_find_zh_dict_near_exe(const std::filesystem::path & exe_dir) {
+    // 说明：优先支持“随 exe 打包”的目录结构，但也兼容开发态：
+    // - 发行版/便携包：<exe_dir>/dict/pinyin_phrase.txt
+    // - 开发构建：build/bin/tts-cli.exe，而词典在仓库根目录 dict/（即 <exe_dir>/../../dict）
+    //
+    // 实现策略：从 exe_dir 开始向上查找（最多几层）是否存在 dict/。
+    if (exe_dir.empty()) {
+        return {};
     }
 
-    const std::filesystem::path exe_dir = tts_cli_self_exe_dir(argv0);
-    if (!exe_dir.empty()) {
-        ec.clear();
-        if (std::filesystem::exists(exe_dir / "dict" / "pinyin_phrase.txt", ec) && !ec) {
-            return (exe_dir / "dict").u8string();
+    constexpr int kMaxSearchParents = 8;
+    std::filesystem::path cur = exe_dir;
+    for (int depth = 0; depth <= kMaxSearchParents && !cur.empty(); ++depth) {
+        const std::filesystem::path candidate = cur / "dict";
+        if (tts_cli_has_zh_phrase_dict(candidate)) {
+            return candidate;
         }
+
+        const std::filesystem::path parent = cur.parent_path();
+        if (parent == cur) {
+            break;
+        }
+        cur = parent;
+    }
+    return {};
+}
+
+static tts_cli_zh_dict_resolution tts_cli_resolve_zh_dict_dir(const std::string & user_value, const char * argv0) {
+    // 说明：
+    // - 用户显式传入 --zh-dict-dir 时：完全尊重其值；
+    // - 未传时（自动）：优先 ./dict（工作目录），否则在 exe_dir 及其父目录中查找 dict/，最后回退内置词典（若启用）。
+    tts_cli_zh_dict_resolution res{};
+
+    if (!user_value.empty()) {
+        res.dir = user_value;
+        if (user_value == "-") {
+            res.desc = "(disabled)";
+        } else if (user_value == ":builtin") {
+            res.desc = "(builtin)";
+        } else {
+            res.desc = user_value;
+        }
+        return res;
     }
 
-    return "";
+    // 1) 工作目录 ./dict（保持空字符串：让库侧继续走“auto: ./dict -> builtin”的逻辑）
+    if (tts_cli_has_zh_phrase_dict(std::filesystem::path("dict"))) {
+        res.dir = "";
+        res.desc = "(auto: ./dict)";
+        return res;
+    }
+
+    // 2) exe_dir 及其父目录查找 dict/（兼容 build/bin 与便携包结构）
+    const std::filesystem::path exe_dir = tts_cli_self_exe_dir(argv0);
+    const std::filesystem::path found = tts_cli_find_zh_dict_near_exe(exe_dir);
+    if (!found.empty()) {
+        res.dir = found.u8string();
+        // 说明：为避免误导，这里直接打印“找到的实际路径”，不再强行标注为 exe_dir/dict。
+        res.desc = "(auto: found) " + res.dir;
+        return res;
+    }
+
+    // 3) 找不到外部词典：交给库侧回退内置词典（若启用）
+    res.dir = "";
+    res.desc = "(auto: ./dict -> builtin)";
+    return res;
 }
 
 static double tts_cli_us_to_ms(const int64_t us) {
@@ -124,7 +185,7 @@ static const char * tts_cli_bench_prompt() {
     // - 中文：停顿/语速/数字读法/单位（℃）
     // - 英文：常见单词与缩写（OpenAI/GPU/Vulkan/C++17）
     // 注意：当 CLI 传入 --bench 时，会强制使用该文本进行推理，并忽略用户通过 -p/--prompt 传入的内容。
-    return u8"你好，这是 tts.cpp 的中英混合语音测试的行为，用来检查停顿、重音和数字读法。今天是2025年12月21日，温度23.5°C；请读：一二三四五，七八九零。Now in English: Hello world! This is a quick benchmark for Kokoro TTS. Please pronounce OpenAI, GPU, Vulkan, and C++17 clearly. Thanks.";
+    return u8"你好，这是 tts.cpp 的中英混合语音测试，用来检查停顿、重音和数字读法。今天是2025年12月21日，温度23.5°C；1+1=2。Now in English: Hello world! This is a quick benchmark for Kokoro TTS. Please pronounce OpenAI, GPU, Vulkan, and C++17 clearly. Thanks.";
 }
 
 static bool tts_cli_try_parse_int(const std::string & text, int & out) {
@@ -235,6 +296,87 @@ static const char * tts_cli_language_name(tts_language lang) {
     return "zh";
 }
 
+static void tts_cli_print_help_short(const char * argv0) {
+    // 说明：面向普通用户的“简洁帮助”，避免把大量调参项一次性全部打印出来。
+    // 若需要查看完整/高级参数，请使用 --help-all。
+    const char * exe = (argv0 != nullptr && argv0[0] != '\0') ? argv0 : "tts-cli";
+    std::fprintf(stdout,
+                 "用法：\n"
+                 "  %s --model-path <模型.gguf> --prompt \"文本\" [选项]\n"
+                 "  %s --model-path <模型.gguf> --bench [选项]\n"
+                 "  %s --model-path <模型.gguf> --list-voices\n"
+                 "\n"
+                 "常用选项：\n"
+                 "  -sp, --save-path <out.wav>                 输出 wav 路径（默认：TTS.cpp.wav）\n"
+                 "  -v,  --voice <name>                        音色（仅支持 voice packs 的模型）\n"
+                 "  -l,  --lang <zh|en|ja>                     语言偏好（默认：zh）\n"
+                 "  -d,  --device <cpu|vulkan[:N]|metal|auto>  推理后端/设备（默认：跟随编译配置）\n"
+                 "  -nt, --n-threads <N>                       CPU 线程数（默认：硬件并发数）\n"
+                 "  -zd, --zh-dict-dir <dir|:builtin|->        中文词典目录（默认自动查找）\n"
+                 "  --help-all                                 显示完整/高级参数\n"
+                 "\n"
+                 "示例：\n"
+                 "  %s --model-path model.gguf -p \"好好学习\"\n"
+                 "  %s --model-path model.gguf -p \"Hello\" --device cpu\n",
+                 exe,
+                 exe,
+                 exe,
+                 exe,
+                 exe);
+    std::fflush(stdout);
+}
+
+static bool tts_cli_is_ascii_space_only(const std::string & s) {
+    // 说明：调试输出里避免对纯空白加括号，保持可读性。
+    if (s.empty()) {
+        return false;
+    }
+    for (char c : s) {
+        if (c != ' ' && c != '\t' && c != '\r' && c != '\n') {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool tts_cli_is_ascii_wordish(const std::string & s) {
+    // 说明：用于识别英文/数字片段，避免调试输出出现一个字母一个括号的噪声。
+    if (s.empty()) {
+        return false;
+    }
+    for (char c : s) {
+        const unsigned char uc = static_cast<unsigned char>(c);
+        if (uc >= 0x80) {
+            return false;
+        }
+        const bool is_alpha = (uc >= 'A' && uc <= 'Z') || (uc >= 'a' && uc <= 'z');
+        const bool is_digit = (uc >= '0' && uc <= '9');
+        if (!is_alpha && !is_digit && uc != '_') {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool tts_cli_is_ascii_digit_only(const std::string & s) {
+    // 说明：用于判断是否为纯数字片段，避免把小数点当作“词内点号”发音。
+    if (s.empty()) {
+        return false;
+    }
+    for (char c : s) {
+        const unsigned char uc = static_cast<unsigned char>(c);
+        if (uc < '0' || uc > '9') {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool tts_cli_is_dot_symbol(const std::string & s) {
+    // 说明：识别 ASCII 点号与全角点号。
+    return s == "." || s == "．";
+}
+
 static void tts_cli_print_phoneme_debug(tts_generation_runner * runner,
                                         const std::string & prompt,
                                         const generation_configuration & config) {
@@ -257,17 +399,82 @@ static void tts_cli_print_phoneme_debug(tts_generation_runner * runner,
 
     std::string pretty;
     pretty.reserve(phonemes.size() + segments.size() * 6);
-    for (const auto & seg : segments) {
+    std::string pending_ascii_word;
+    std::string pending_ascii_phonemes;
+    std::string dot_phonemes;
+    std::string at_phonemes;
+    auto flush_ascii_word = [&] {
+        if (pending_ascii_word.empty()) {
+            return;
+        }
+        pretty.append(pending_ascii_word);
+        if (!pending_ascii_phonemes.empty()) {
+            pretty.push_back('(');
+            pretty.append(pending_ascii_phonemes);
+            pretty.push_back(')');
+        }
+        pending_ascii_word.clear();
+        pending_ascii_phonemes.clear();
+    };
+    for (size_t i = 0; i < segments.size(); ++i) {
+        const auto & seg = segments[i];
         if (seg.is_boundary) {
+            // 说明：连续英文/数字边界段合并为“词级括号”，标点/空白直接原样输出。
+            if (tts_cli_is_ascii_wordish(seg.text)) {
+                pending_ascii_word.append(seg.text);
+                if (!seg.phonemes.empty()) {
+                    pending_ascii_phonemes.append(seg.phonemes);
+                } else {
+                    pending_ascii_phonemes.append(seg.text);
+                }
+                continue;
+            }
+            const bool prev_wordish = (i > 0) &&
+                                      segments[i - 1].is_boundary &&
+                                      tts_cli_is_ascii_wordish(segments[i - 1].text);
+            const bool next_wordish = (i + 1 < segments.size()) &&
+                                      segments[i + 1].is_boundary &&
+                                      tts_cli_is_ascii_wordish(segments[i + 1].text);
+            const bool prev_digit = prev_wordish && tts_cli_is_ascii_digit_only(segments[i - 1].text);
+            const bool next_digit = next_wordish && tts_cli_is_ascii_digit_only(segments[i + 1].text);
+            const bool should_read_dot = (config.language == tts_language::ZH) &&
+                                         tts_cli_is_dot_symbol(seg.text) &&
+                                         prev_wordish &&
+                                         next_wordish &&
+                                         !(prev_digit && next_digit);
+            const bool should_read_at = (config.language == tts_language::ZH) && seg.text == "@";
+
+            flush_ascii_word();
             pretty.append(seg.text);
+            if (should_read_at) {
+                if (at_phonemes.empty()) {
+                    at_phonemes = kokoro_zh::text_to_zh_phonemes("艾特", config.zh_dict_dir);
+                }
+                if (!at_phonemes.empty()) {
+                    pretty.push_back('(');
+                    pretty.append(at_phonemes);
+                    pretty.push_back(')');
+                }
+            } else if (should_read_dot) {
+                if (dot_phonemes.empty()) {
+                    dot_phonemes = kokoro_zh::text_to_zh_phonemes("点", config.zh_dict_dir);
+                }
+                if (!dot_phonemes.empty()) {
+                    pretty.push_back('(');
+                    pretty.append(dot_phonemes);
+                    pretty.push_back(')');
+                }
+            }
             continue;
         }
+        flush_ascii_word();
         pretty.append(seg.text);
         pretty.push_back('(');
         pretty.append(seg.phonemes);
         pretty.push_back(')');
         pretty.push_back(' ');
     }
+    flush_ascii_word();
     if (!pretty.empty() && pretty.back() == ' ') {
         pretty.pop_back();
     }
@@ -294,23 +501,22 @@ static int main_impl(int argc, const char ** argv) {
 
     const tts_timing_printer _{};
     float default_temperature = 1.0f;
-    // 默认线程数改为“硬件并发的一半”（最少 1）。
-    // 说明：很多 CPU 的 hardware_concurrency() 返回的是“逻辑核数”（含超线程），
-    // 直接拉满线程在部分平台上反而会增加调度/缓存竞争开销，端到端延迟更差；
-    // 取一半通常更接近“物理核数”，对推理更稳。
-    int default_n_threads = std::max((int) std::thread::hardware_concurrency() / 2, 1);
+    // 默认线程数改为“硬件并发数”（最少 1）。
+    // 说明：Kokoro CPU 推理主要由卷积/矩阵运算主导，通常能更好地利用全部逻辑核；
+    // 若需降低资源占用，可通过 --n-threads 显式设置较小值。
+    int default_n_threads = std::max((int) std::thread::hardware_concurrency(), 1);
     int default_top_k = 50;
     int default_max_tokens = 0;
     float default_repetition_penalty = 1.0f;
     float default_top_p = 1.0f;
-    int default_vulkan_device = 0;
     arg_list args;
+    args.add_argument(bool_arg("--help-all", "(OPTIONAL) Print full/advanced help and exit."));
     args.add_argument(string_arg("--model-path", "(REQUIRED) The local path of the gguf model file for Parler TTS mini or large v1, Dia, or Kokoro.", "-mp", true));
     args.add_argument(string_arg("--prompt", "(REQUIRED unless --bench) The text prompt for which to generate audio in quotation markers.", "-p", false));
     args.add_argument(bool_arg("--bench", "(OPTIONAL) Use the built-in mixed zh/en benchmark prompt and ignore '--prompt'/'-p'.", "-b"));
     args.add_argument(string_arg("--save-path", "(OPTIONAL) The path to save the audio output to in a .wav format. Defaults to TTS.cpp.wav", "-sp", false, "TTS.cpp.wav"));
     args.add_argument(float_arg("--temperature", "The temperature to use when generating outputs. Defaults to 1.0.", "-t", false, &default_temperature));
-    args.add_argument(int_arg("--n-threads", "The number of cpu threads to run generation with. Defaults to half of hardware concurrency (min 1). If hardware concurrency cannot be determined then it defaults to 1.", "-nt", false, &default_n_threads));
+    args.add_argument(int_arg("--n-threads", "The number of cpu threads to run generation with. Defaults to hardware concurrency (min 1). If hardware concurrency cannot be determined then it defaults to 1.", "-nt", false, &default_n_threads));
     args.add_argument(int_arg("--topk", "(OPTIONAL) When set to an integer value greater than 0 generation uses nucleus sampling over topk nucleaus size. Defaults to 50.", "-tk", false, &default_top_k));
     args.add_argument(float_arg("--repetition-penalty", "The by channel repetition penalty to be applied the sampled output of the model. defaults to 1.0.", "-r", false, &default_repetition_penalty));
     args.add_argument(string_arg("--device",
@@ -318,17 +524,13 @@ static int main_impl(int argc, const char ** argv) {
                                  "-d",
                                  false,
                                  ""));
-    // 兼容旧参数（已弃用）：建议统一使用 --device
-    args.add_argument(bool_arg("--use-metal", "(DEPRECATED) Use '--device metal' instead.", "-m"));
-    args.add_argument(bool_arg("--use-vulkan", "(DEPRECATED) Use '--device vulkan' instead.", "-vk"));
-    args.add_argument(int_arg("--vulkan-device", "(OPTIONAL) Vulkan device index (default: 0).", "-vd", false, &default_vulkan_device));
     args.add_argument(bool_arg("--no-cross-attn", "(OPTIONAL) Whether to not include cross attention", "-ca"));
     args.add_argument(string_arg("--conditional-prompt", "(OPTIONAL) A distinct conditional prompt to use for generating. If none is provided the preencoded prompt is used. '--text-encoder-path' must be set to use conditional generation.", "-cp", false));
     args.add_argument(string_arg("--text-encoder-path", "(OPTIONAL) The local path of the text encoder gguf model for conditional generaiton.", "-tep", false));
     args.add_argument(string_arg("--voice", "(OPTIONAL) The voice to use to generate the audio. This is only used for models with voice packs.", "-v", false, ""));
     args.add_argument(string_arg("--lang", "(OPTIONAL) Language preference for digit reading / CJK frontend: zh, en, ja. Defaults to zh.", "-l", false, "zh"));
     args.add_argument(string_arg("--zh-dict-dir",
-                                 "(OPTIONAL) Kokoro zh dict directory (pinyin_phrase.txt/pinyin.txt). Empty=auto (try ./dict then builtin if enabled); ':builtin' forces builtin; '-' disables.",
+                                 "(OPTIONAL) Kokoro zh dict directory (pinyin_phrase.txt/pinyin.txt). Empty=auto (try ./dict; else search exe_dir/parents for dict/; then builtin if enabled); ':builtin' forces builtin; '-' disables.",
                                  "-zd",
                                  false,
                                  ""));
@@ -341,7 +543,12 @@ static int main_impl(int argc, const char ** argv) {
     const int64_t t_parse_start_us = ggml_time_us();
     args.parse(argc, argv);
     if (args.for_help) {
-        tts_cli_log("检测到 --help：打印帮助并退出");
+        tts_cli_log("检测到 --help：打印简洁帮助并退出（如需完整参数用 --help-all）");
+        tts_cli_print_help_short((argc > 0) ? argv[0] : nullptr);
+        exit(0);
+    }
+    if (args.get_bool_param("--help-all")) {
+        tts_cli_log("检测到 --help-all：打印完整帮助并退出");
         args.help();
         exit(0);
     }
@@ -374,8 +581,8 @@ static int main_impl(int argc, const char ** argv) {
         exit(1);
     }
 
-    const std::string zh_dict_dir_raw = args.get_string_param("--zh-dict-dir");
-    const std::string zh_dict_dir = tts_cli_resolve_zh_dict_dir(zh_dict_dir_raw, (argc > 0) ? argv[0] : nullptr);
+    const std::string                zh_dict_dir_raw = args.get_string_param("--zh-dict-dir");
+    const tts_cli_zh_dict_resolution zh_dict_dir = tts_cli_resolve_zh_dict_dir(zh_dict_dir_raw, (argc > 0) ? argv[0] : nullptr);
 
     const generation_configuration config{
         args.get_string_param("--voice"),
@@ -387,7 +594,7 @@ static int main_impl(int argc, const char ** argv) {
         *args.get_float_param("--top-p"),
         true,
         language,
-        zh_dict_dir};
+        zh_dict_dir.dir};
 
     // ----------------------------
     // 选择推理后端（CPU / Metal / Vulkan）
@@ -395,35 +602,17 @@ static int main_impl(int argc, const char ** argv) {
     // 说明：
     // - `--device` 仅用于测试/对比，日常用户无需关注；
     // - 未指定时，默认值跟随“编译时启用的后端”（编译启用 Vulkan 则默认 Vulkan，启用 Metal 则默认 Metal）；
-    // - 兼容旧参数：--use-metal / --use-vulkan（已弃用）。
-    tts_backend_config backend{};
-    backend.device = *args.get_int_param("--vulkan-device");
+    const int default_vulkan_device = 0;
+    tts_backend_config backend = tts_cli_default_backend_config(default_vulkan_device);
 
     const std::string device_arg = args.get_string_param("--device");
-    const bool        use_metal  = args.get_bool_param("--use-metal");
-    const bool        use_vulkan = args.get_bool_param("--use-vulkan");
-
     if (!device_arg.empty()) {
-        if (use_metal || use_vulkan) {
-            fprintf(stderr, "参数冲突：--device 与 --use-metal/--use-vulkan 不能同时使用。\n");
-            exit(1);
-        }
-        if (!tts_cli_parse_device_arg(device_arg, backend.device, backend)) {
+        if (!tts_cli_parse_device_arg(device_arg, default_vulkan_device, backend)) {
             fprintf(stderr, "argument '--device' must be one of: cpu/metal/vulkan[:N]/auto.\n");
             exit(1);
         }
     } else {
-        if (use_metal && use_vulkan) {
-            fprintf(stderr, "参数冲突：--use-metal 与 --use-vulkan 不能同时使用。\n");
-            exit(1);
-        }
-        if (use_metal) {
-            backend.backend = tts_compute_backend::METAL;
-        } else if (use_vulkan) {
-            backend.backend = tts_compute_backend::VULKAN;
-        } else {
-            backend = tts_cli_default_backend_config(backend.device);
-        }
+        backend = tts_cli_default_backend_config(default_vulkan_device);
     }
 
     {
@@ -442,25 +631,13 @@ static int main_impl(int argc, const char ** argv) {
         const bool has_size = !model_path.empty() && model_path.rfind("test:", 0) != 0 &&
                               tts_cli_try_file_size(model_path, model_bytes);
 
-        std::string zh_dict_desc;
-        if (zh_dict_dir_raw.empty() && !zh_dict_dir.empty()) {
-            zh_dict_desc = "(auto: exe_dir/dict) " + zh_dict_dir;
-        } else if (zh_dict_dir_raw.empty()) {
-            zh_dict_desc = "(auto: ./dict -> builtin)";
-        } else if (zh_dict_dir_raw == "-") {
-            zh_dict_desc = "(disabled)";
-        } else if (zh_dict_dir_raw == ":builtin") {
-            zh_dict_desc = "(builtin)";
-        } else {
-            zh_dict_desc = zh_dict_dir_raw;
-        }
         tts_cli_log("运行配置：threads=%d device=%s vad=%s list_voices=%s lang=%s zh_dict=%s",
                     *args.get_int_param("--n-threads"),
                     device_name.c_str(),
                     args.get_bool_param("--vad") ? "on" : "off",
                     list_voices ? "yes" : "no",
                     tts_cli_language_name(language),
-                    zh_dict_desc.c_str());
+                    zh_dict_dir.desc.c_str());
         if (has_size) {
             tts_cli_log("模型文件：%s (%.2f MiB)", model_path.c_str(), model_bytes / 1024.0 / 1024.0);
         } else {

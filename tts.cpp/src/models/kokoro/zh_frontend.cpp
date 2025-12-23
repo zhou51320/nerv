@@ -110,6 +110,10 @@ static bool is_ascii_digit(uint32_t cp) {
     return cp >= '0' && cp <= '9';
 }
 
+static bool is_ascii_alpha(uint32_t cp) {
+    return (cp >= 'A' && cp <= 'Z') || (cp >= 'a' && cp <= 'z');
+}
+
 static bool is_fullwidth_digit(uint32_t cp) {
     return cp >= 0xFF10 && cp <= 0xFF19;
 }
@@ -136,9 +140,122 @@ static bool is_minus_sign(uint32_t cp) {
     return cp == '-' || cp == 0xFF0D || cp == 0x2212;
 }
 
+static bool is_plus_sign(uint32_t cp) {
+    return cp == '+' || cp == 0xFF0B;
+}
+
+static bool is_equal_sign(uint32_t cp) {
+    return cp == '=' || cp == 0xFF1D;
+}
+
+static bool is_multiply_sign(uint32_t cp) {
+    return cp == '*' || cp == 0x00D7 || cp == 0xFF0A;
+}
+
+static bool is_divide_sign(uint32_t cp) {
+    return cp == '/' || cp == 0x00F7 || cp == 0xFF0F;
+}
+
 static bool is_ascii_space(uint32_t cp) {
     // 说明：数字归一化仅需要处理常见 ASCII 空白即可。
     return cp == ' ' || cp == '\t' || cp == '\r' || cp == '\n';
+}
+
+static size_t skip_ascii_spaces(const std::string & text, size_t offset) {
+    // 说明：数字规则仅需跳过 ASCII 空白，避免误吞其它符号。
+    while (offset < text.size()) {
+        const char c = text[offset];
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+            ++offset;
+            continue;
+        }
+        break;
+    }
+    return offset;
+}
+
+static bool is_time_separator(uint32_t cp) {
+    return cp == ':' || cp == 0xFF1A;
+}
+
+static bool is_percent_sign(uint32_t cp) {
+    return cp == '%' || cp == 0xFF05;
+}
+
+static bool is_zh_number_cp(uint32_t cp) {
+    // 说明：用于识别中文数字/数词，辅助判断“运算符是否处于数字之间”。
+    switch (cp) {
+        case 0x3007: // 〇
+        case 0x96F6: // 零
+        case 0x4E00: // 一
+        case 0x4E8C: // 二
+        case 0x4E09: // 三
+        case 0x56DB: // 四
+        case 0x4E94: // 五
+        case 0x516D: // 六
+        case 0x4E03: // 七
+        case 0x516B: // 八
+        case 0x4E5D: // 九
+        case 0x5341: // 十
+        case 0x767E: // 百
+        case 0x5343: // 千
+        case 0x4E07: // 万
+        case 0x4EBF: // 亿
+        case 0x4E24: // 两
+        case 0x70B9: // 点
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool lookahead_is_number(const std::string & text, size_t offset) {
+    // 说明：跳过空白，查看后续是否出现数字（ASCII/全角/中文数词）。
+    size_t lookahead = offset;
+    while (lookahead < text.size()) {
+        const size_t saved = lookahead;
+        uint32_t cp = 0;
+        if (!utf8_decode_next(text, lookahead, cp)) {
+            lookahead = saved;
+            break;
+        }
+        if (is_ascii_space(cp)) {
+            continue;
+        }
+        return is_digit_cp(cp) || is_zh_number_cp(cp);
+    }
+    return false;
+}
+
+static bool lookahead_is_math_token(const std::string & text, size_t offset) {
+    // 说明：跳过空白，查看后续是否出现“数学项”（数字或单字母变量）。
+    size_t lookahead = offset;
+    while (lookahead < text.size()) {
+        const size_t saved = lookahead;
+        uint32_t cp = 0;
+        if (!utf8_decode_next(text, lookahead, cp)) {
+            lookahead = saved;
+            break;
+        }
+        if (is_ascii_space(cp)) {
+            continue;
+        }
+        if (is_digit_cp(cp) || is_zh_number_cp(cp)) {
+            return true;
+        }
+        if (is_ascii_alpha(cp)) {
+            if (lookahead < text.size()) {
+                const unsigned char next = static_cast<unsigned char>(text[lookahead]);
+                const bool next_is_alpha = (next >= 'A' && next <= 'Z') || (next >= 'a' && next <= 'z');
+                if (next_is_alpha) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        return false;
+    }
+    return false;
 }
 
 static char normalize_number_separator(uint32_t cp) {
@@ -280,6 +397,46 @@ static std::string digits_to_zh_series(const std::string & digits) {
     return out;
 }
 
+static bool is_all_ascii_digits(const std::string & s) {
+    if (s.empty()) {
+        return false;
+    }
+    for (char c : s) {
+        if (c < '0' || c > '9') {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool should_read_as_zh_year_digits(const std::string & token, const std::string & text, size_t next_offset) {
+    // 说明：年份（YYYY年）通常按“逐位读”更自然：
+    // - 2025年 -> 二零二五年（更口语）
+    // - 若按普通整数读法会变成 二千零二十五年（更像“数量/跨度”）
+    //
+    // 这里做一个轻量启发式：
+    // - token 为 4 位纯数字
+    // - token 之后（允许夹少量 ASCII 空格）紧跟 “年”
+    if (token.size() != 4 || !is_all_ascii_digits(token)) {
+        return false;
+    }
+
+    size_t lookahead = next_offset;
+    while (lookahead < text.size()) {
+        const size_t saved = lookahead;
+        uint32_t cp = 0;
+        if (!utf8_decode_next(text, lookahead, cp)) {
+            lookahead = saved;
+            return false;
+        }
+        if (is_ascii_space(cp)) {
+            continue;
+        }
+        return cp == 0x5E74; // 年
+    }
+    return false;
+}
+
 static std::string convert_four_digits(const std::string & digits) {
     // 说明：将 1-4 位数字转换为中文读法（千/百/十/个），内部处理“零”衔接。
     std::string out;
@@ -371,6 +528,43 @@ static std::string number_token_to_zh(const std::string & token) {
     if (token.empty()) {
         return "";
     }
+    size_t dot_count = 0;
+    for (char c : token) {
+        if (c == '.') {
+            dot_count += 1;
+        }
+    }
+    if (dot_count > 1) {
+        // 说明：多点号（如版本号/序列号）按“分段读数字 + 点”处理，避免误判为小数。
+        std::string out;
+        std::string seg_digits;
+        for (char c : token) {
+            if (c >= '0' && c <= '9') {
+                seg_digits.push_back(c);
+                continue;
+            }
+            if (c == '.') {
+                if (!seg_digits.empty()) {
+                    if (!out.empty()) {
+                        out.append("点");
+                    }
+                    out.append(digits_to_zh_series(seg_digits));
+                    seg_digits.clear();
+                }
+                continue;
+            }
+        }
+        if (!seg_digits.empty()) {
+            if (!out.empty()) {
+                out.append("点");
+            }
+            out.append(digits_to_zh_series(seg_digits));
+        }
+        if (!out.empty()) {
+            return out;
+        }
+    }
+
     const bool has_dot = token.find('.') != std::string::npos;
     const bool has_comma = token.find(',') != std::string::npos;
     size_t decimal_pos = std::string::npos;
@@ -431,6 +625,8 @@ static std::string normalize_zh_numbers(const std::string & text) {
     std::string out;
     out.reserve(text.size() * 2);
     size_t offset = 0;
+    bool prev_is_number = false;
+    bool prev_is_math_token = false;
     while (offset < text.size()) {
         const size_t start = offset;
         uint32_t cp = 0;
@@ -438,7 +634,51 @@ static std::string normalize_zh_numbers(const std::string & text) {
             break;
         }
 
+        if (is_ascii_space(cp)) {
+            // 说明：空白不会打断“数字相邻”判断。
+            out.append(text.substr(start, offset - start));
+            continue;
+        }
+
+        if (is_plus_sign(cp) || is_equal_sign(cp) || is_multiply_sign(cp) || is_divide_sign(cp)) {
+            // 说明：仅在“数学项 + 运算符 + 数学项”时读作“加/等于/乘/除”，避免影响 C++/URL 等场景。
+            const bool next_is_math = lookahead_is_math_token(text, offset);
+            if (prev_is_math_token && next_is_math) {
+                if (is_plus_sign(cp)) {
+                    out.append("加");
+                } else if (is_equal_sign(cp)) {
+                    out.append("等于");
+                } else if (is_multiply_sign(cp)) {
+                    out.append("乘");
+                } else {
+                    out.append("除");
+                }
+                prev_is_number = false;
+                prev_is_math_token = false;
+                continue;
+            }
+            out.append(text.substr(start, offset - start));
+            prev_is_number = false;
+            prev_is_math_token = false;
+            continue;
+        }
+
+        if ((cp == 'x' || cp == 'X') && prev_is_number && lookahead_is_number(text, offset)) {
+            // 说明：数字之间的 x/X 视作“乘”。
+            out.append("乘");
+            prev_is_number = false;
+            prev_is_math_token = false;
+            continue;
+        }
+
         if (is_minus_sign(cp)) {
+            const bool next_is_math = lookahead_is_math_token(text, offset);
+            if (prev_is_math_token && next_is_math) {
+                out.append("减");
+                prev_is_number = false;
+                prev_is_math_token = false;
+                continue;
+            }
             size_t lookahead = offset;
             uint32_t next_cp = 0;
             if (utf8_decode_next(text, lookahead, next_cp) && is_digit_cp(next_cp)) {
@@ -450,11 +690,15 @@ static std::string normalize_zh_numbers(const std::string & text) {
                         out.append("负");
                         out.append(zh);
                         offset = next_offset;
+                        prev_is_number = true;
+                        prev_is_math_token = true;
                         continue;
                     }
                 }
             }
             out.append(text.substr(start, offset - start));
+            prev_is_number = false;
+            prev_is_math_token = false;
             continue;
         }
 
@@ -462,16 +706,81 @@ static std::string normalize_zh_numbers(const std::string & text) {
             std::string token;
             size_t next_offset = start;
             if (collect_number_token(text, start, token, next_offset)) {
-                const std::string zh = number_token_to_zh(token);
+                std::string zh;
+                if (should_read_as_zh_year_digits(token, text, next_offset)) {
+                    zh = digits_to_zh_series(token);
+                } else {
+                    zh = number_token_to_zh(token);
+                }
                 if (!zh.empty()) {
+                    // 说明：识别 HH:MM 写法，将 ':' 读作“点”，避免时间读音缺失。
+                    if (is_all_ascii_digits(token) && token.size() <= 2) {
+                        size_t look = skip_ascii_spaces(text, next_offset);
+                        size_t sep_offset = look;
+                        uint32_t sep_cp = 0;
+                        if (utf8_decode_next(text, sep_offset, sep_cp) && is_time_separator(sep_cp)) {
+                            const size_t minute_start = skip_ascii_spaces(text, sep_offset);
+                            std::string minute_token;
+                            size_t minute_end = minute_start;
+                            if (collect_number_token(text, minute_start, minute_token, minute_end) &&
+                                is_all_ascii_digits(minute_token) && minute_token.size() <= 2) {
+                                const std::string zh_minute = number_token_to_zh(minute_token);
+                                if (!zh_minute.empty()) {
+                                    out.append(zh);
+                                    out.append("点");
+                                    out.append(zh_minute);
+                                    offset = minute_end;
+                                    prev_is_number = true;
+                                    prev_is_math_token = true;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+
+                    // 说明：数字后紧跟 %/％ 时读作“百分之”，避免符号被跳过。
+                    size_t look = skip_ascii_spaces(text, next_offset);
+                    size_t pct_offset = look;
+                    uint32_t pct_cp = 0;
+                    if (utf8_decode_next(text, pct_offset, pct_cp) && is_percent_sign(pct_cp)) {
+                        out.append("百分之");
+                        out.append(zh);
+                        offset = pct_offset;
+                        prev_is_number = true;
+                        prev_is_math_token = true;
+                        continue;
+                    }
                     out.append(zh);
                     offset = next_offset;
+                    prev_is_number = true;
+                    prev_is_math_token = true;
                     continue;
                 }
             }
         }
 
+        if (is_ascii_alpha(cp)) {
+            // 说明：把连续字母当作一个英文 token；仅单字母视作数学变量。
+            size_t run_end = start + 1;
+            while (run_end < text.size()) {
+                const unsigned char b = static_cast<unsigned char>(text[run_end]);
+                if ((b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z')) {
+                    run_end += 1;
+                    continue;
+                }
+                break;
+            }
+            out.append(text.substr(start, run_end - start));
+            offset = run_end;
+            const bool is_single_letter = (run_end - start == 1);
+            prev_is_number = false;
+            prev_is_math_token = is_single_letter;
+            continue;
+        }
+
         out.append(text.substr(start, offset - start));
+        prev_is_number = is_digit_cp(cp) || is_zh_number_cp(cp);
+        prev_is_math_token = prev_is_number;
     }
     return out;
 }
@@ -1247,7 +1556,9 @@ static void apply_three_sandhi(std::vector<zh_syllable> & syllables) {
     }
 }
 
-static void apply_neutral_tone(const std::u16string & word, std::vector<zh_syllable> & syllables) {
+static void apply_neutral_tone(const std::u16string & word,
+                               std::vector<zh_syllable> & syllables,
+                               bool allow_reduplication_neutral) {
     if (syllables.empty()) {
         return;
     }
@@ -1256,10 +1567,15 @@ static void apply_neutral_tone(const std::u16string & word, std::vector<zh_sylla
         return;
     }
 
-    // 叠词：相邻重复字 -> 后一个轻声（不依赖 POS 的近似规则）
-    for (size_t i = 1; i < word.size() && i < syllables.size(); ++i) {
-        if (word[i] == word[i - 1]) {
-            syllables[i].tone = 5;
+    // 叠词轻声（启发式规则）：
+    // - 常见 AA 形式（如“看看/试试/想想”）里，后一个字往往读轻声；
+    // - 但也存在大量例外（如“好好(学习)”通常不读轻声），并且短语词典可能已显式标注了例外读音。
+    // 因此：当外部短语词典命中并提供完整拼音时，应以词典为准，避免把词典里精确标注的声调再次“强行改写”。
+    if (allow_reduplication_neutral) {
+        for (size_t i = 1; i < word.size() && i < syllables.size(); ++i) {
+            if (word[i] == word[i - 1]) {
+                syllables[i].tone = 5;
+            }
         }
     }
 
@@ -1364,10 +1680,19 @@ static void build_word_syllables(const std::u16string & word,
         }
     }
 
+    // 说明：当“短语词典”为该词提供了完整的拼音序列（含声调）时，默认认为词典已经给出了最终读音，
+    // 不再对其应用自动变调/轻声等启发式规则（例如三声连读 3-3->2-3、叠词轻声、"一/不" 变调等）。
+    // 这样可以让用户通过词典精确控制例外读法，避免前端规则再次覆盖词典标注。
+    if (use_pinyin) {
+        // 儿化属于“发音形态”而非声调覆盖：仍然尝试把词尾“儿”的 er 音节合并为 Kokoro 的 'R' 标记。
+        apply_erhua(word, out);
+        return;
+    }
+
     // 规则顺序：不/一 → 轻声 → 三声连读 → 儿化（参考 ToneSandhi + ZHFrontend）。
     apply_bu_sandhi(word, out);
     apply_yi_sandhi(word, out);
-    apply_neutral_tone(word, out);
+    apply_neutral_tone(word, out, /*allow_reduplication_neutral*/ !use_pinyin);
     apply_three_sandhi(out);
     apply_erhua(word, out);
 }
@@ -1418,7 +1743,11 @@ static void append_hanzi_segment_with_dict(const std::u16string & segment,
             }
 
             const int cost = dp[i + k] + ((k == 1) ? 1 : 0);
-            if (cost < best_cost) {
+            // 说明：DP 的目标是“尽量减少逐字（len=1）兜底”的数量，让短语词典尽可能覆盖文本。
+            // 在最小 cost 相同的情况下，我们希望“更偏向长短语”：
+            // - 例如词典同时存在“好好”“学习”“好好学习”时，如果不做 tie-break，会因为 k 从小到大遍历而优先选短的；
+            // - 这会导致分词更碎，并且让更长短语里提供的读音/消歧信息失去作用。
+            if (cost < best_cost || (cost == best_cost && k > best_len)) {
                 best_cost = cost;
                 best_len = static_cast<uint8_t>(k);
             }

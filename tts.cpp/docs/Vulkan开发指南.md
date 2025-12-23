@@ -9,7 +9,7 @@
 
 ## 当前实现概览
 
-- 后端选择：CLI 通过 `--device` 指定 `cpu/metal/vulkan[:N]/auto`；未指定时默认使用编译时启用的后端（启用 Vulkan 则默认 Vulkan），Vulkan 设备索引也可用 `--vulkan-device/-vd`。
+- 后端选择：CLI 通过 `--device` 指定 `cpu/metal/vulkan[:N]/auto`；未指定时默认使用编译时启用的后端（启用 Vulkan 则默认 Vulkan），Vulkan 设备索引用 `--device vulkan:N` 指定。
 - 回退策略：
   - 生成图若检测到自定义算子（`GGML_OP_CUSTOM` 等）且未强制 Vulkan，会固定自定义算子到 CPU，其余尽量走 Vulkan。
   - 分配/计算失败会回退到 CPU 重新分配/计算。
