@@ -169,6 +169,12 @@ struct ggml_tensor * tts_conv_transpose_1d(
     int output_padding = 0,
     int groups = 1);
 
+// 说明：可选注册/查询 1D 卷积权重的量化版本（用于 CPU 加速）。
+// - src 为原始卷积权重（保持原始 shape），qweight 为量化后的 2D 权重。
+void tts_register_conv1d_quant_weight(const struct ggml_tensor * src, struct ggml_tensor * qweight);
+void tts_unregister_conv1d_quant_weight(const struct ggml_tensor * src);
+struct ggml_tensor * tts_get_conv1d_quant_weight(const struct ggml_tensor * src);
+
 bool has_suffix(std::string value, std::string suffix);
 bool has_prefix(std::string value, std::string prefix);
 

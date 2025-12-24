@@ -148,6 +148,17 @@ static bool kokoro_env_cpu_lstm_set_output() {
     return tts_env_truthy_default("TTS_CPU_LSTM_SET_OUTPUT", true);
 }
 
+static bool kokoro_env_cpu_q8_weights() {
+    // 默认关闭；如需启用可设置：TTS_CPU_KOKORO_Q8=1（可能影响音质）
+    return tts_env_truthy_default("TTS_CPU_KOKORO_Q8", false);
+}
+
+static bool kokoro_env_cpu_q8_conv1d() {
+    // 说明：conv1d 专用 Q8 开关，默认跟随 TTS_CPU_KOKORO_Q8；
+    // 若显式设置 TTS_CPU_KOKORO_Q8_CONV1D，可单独启用/关闭。
+    return tts_env_truthy_default("TTS_CPU_KOKORO_Q8_CONV1D", kokoro_env_cpu_q8_weights());
+}
+
 static void kokoro_tensor_get_bytes(const ggml_tensor * t, void * dst, size_t bytes) {
     if (!t || !dst || bytes == 0) {
         return;
@@ -362,6 +373,162 @@ static void kokoro_copy_to_f32(const ggml_tensor * src, float * dst, size_t n) {
     for (size_t i = 0; i < n; ++i) {
         dst[i] = ggml_fp16_to_fp32(raw[i]);
     }
+}
+
+// 说明：CPU 推理可选将部分权重压到 Q8_0，加速 mul_mat。
+// - 仅支持 F16/F32 且连续存储的 2D 权重。
+// - Q8_0 要求每行元素数能被 block size 整除；不满足则回退到原始权重。
+static ggml_tensor * kokoro_make_q8_weight(kokoro_model * model, const ggml_tensor * src, const char * name) {
+    if (!model || !src) {
+        return nullptr;
+    }
+    if (!kokoro_env_cpu_q8_weights() || kokoro_use_vk_weights(model)) {
+        return nullptr;
+    }
+    if (src->type != GGML_TYPE_F16 && src->type != GGML_TYPE_F32) {
+        return nullptr;
+    }
+    if (!ggml_is_contiguous(src)) {
+        return nullptr;
+    }
+    const int dims = ggml_n_dims(src);
+    if (dims != 2) {
+        // 说明：量化仅覆盖 2D 权重，避免 3D 卷积权重 reshape 触发量化 block 对齐问题。
+        return nullptr;
+    }
+
+    const int64_t n_per_row = src->ne[0];
+    const int64_t nrows     = src->ne[1];
+    const int64_t blck      = ggml_blck_size(GGML_TYPE_Q8_0);
+    if (n_per_row <= 0 || nrows <= 0 || (blck > 0 && (n_per_row % blck) != 0)) {
+        return nullptr;
+    }
+
+    const size_t row_bytes = (size_t) src->nb[1];
+    const size_t src_bytes = ggml_nbytes(src);
+    if (row_bytes * (size_t) nrows > src_bytes) {
+        return nullptr;
+    }
+
+    std::vector<uint8_t> raw(src_bytes);
+    kokoro_tensor_get_bytes(src, raw.data(), src_bytes);
+
+    ggml_tensor * dst = kokoro_new_tensor_like(model->ctx, GGML_TYPE_Q8_0, src);
+    model->alloc_tensor(dst, name && *name ? name : ggml_get_name(src));
+
+    std::vector<float> row_f32((size_t) n_per_row);
+    const size_t dst_row_bytes = ggml_row_size(GGML_TYPE_Q8_0, n_per_row);
+
+    for (int64_t row = 0; row < nrows; ++row) {
+        const uint8_t * src_row = raw.data() + row * row_bytes;
+        if (src->type == GGML_TYPE_F32) {
+            std::memcpy(row_f32.data(), src_row, (size_t) n_per_row * sizeof(float));
+        } else {
+            ggml_fp16_to_fp32_row((const ggml_fp16_t *) src_row, row_f32.data(), n_per_row);
+        }
+        ggml_quantize_chunk(GGML_TYPE_Q8_0,
+                            row_f32.data(),
+                            (uint8_t *) dst->data + (size_t) row * dst_row_bytes,
+                            /*start=*/0,
+                            /*nrows=*/1,
+                            n_per_row,
+                            /*imatrix=*/nullptr);
+    }
+    return dst;
+}
+
+// 说明：为 conv1d 生成量化权重（Q8_0，2D 视图：[K*IC, OC]）。
+// - 只在 CPU 后端且开启 TTS_CPU_KOKORO_Q8 时启用；
+// - 量化权重放在 extra buffer 中，不占用主权重 buffer；
+// - 原始权重仍保留，用于 im2col 形状与兼容性。
+static ggml_tensor * kokoro_make_q8_conv1d_weight(kokoro_model * model, const ggml_tensor * src, const char * name) {
+    if (!model || !src) {
+        return nullptr;
+    }
+    if (!kokoro_env_cpu_q8_conv1d() || kokoro_use_vk_weights(model)) {
+        return nullptr;
+    }
+    if (src->type != GGML_TYPE_F16 && src->type != GGML_TYPE_F32) {
+        return nullptr;
+    }
+    if (!ggml_is_contiguous(src)) {
+        return nullptr;
+    }
+    if (ggml_n_dims(src) != 3 || src->ne[3] != 1) {
+        return nullptr;
+    }
+
+    const int64_t K  = src->ne[0];
+    const int64_t IC = src->ne[1];
+    const int64_t OC = src->ne[2];
+    const int64_t n_per_row = K * IC;
+    const int64_t nrows     = OC;
+    const int64_t blck      = ggml_blck_size(GGML_TYPE_Q8_0);
+    if (n_per_row <= 0 || nrows <= 0 || (blck > 0 && (n_per_row % blck) != 0)) {
+        return nullptr;
+    }
+
+    const size_t row_bytes = (size_t) src->nb[2];
+    const size_t src_bytes = ggml_nbytes(src);
+    if (row_bytes * (size_t) nrows > src_bytes) {
+        return nullptr;
+    }
+
+    std::vector<uint8_t> raw(src_bytes);
+    kokoro_tensor_get_bytes(src, raw.data(), src_bytes);
+
+    ggml_tensor * dst = ggml_new_tensor_2d(model->ctx, GGML_TYPE_Q8_0, n_per_row, nrows);
+    std::string qname = (name && *name) ? (std::string(name) + ".q8") : "kokoro.conv1d.q8";
+    ggml_set_name(dst, qname.c_str());
+
+    ggml_backend_buffer_t buf = kokoro_alloc_extra_buffer(model, ggml_nbytes(dst), qname.c_str());
+    dst->buffer = buf;
+    dst->data = ggml_backend_buffer_get_base(buf);
+
+    std::vector<float> row_f32((size_t) n_per_row);
+    const size_t dst_row_bytes = ggml_row_size(GGML_TYPE_Q8_0, n_per_row);
+
+    for (int64_t row = 0; row < nrows; ++row) {
+        const uint8_t * src_row = raw.data() + row * row_bytes;
+        if (src->type == GGML_TYPE_F32) {
+            std::memcpy(row_f32.data(), src_row, (size_t) n_per_row * sizeof(float));
+        } else {
+            ggml_fp16_to_fp32_row((const ggml_fp16_t *) src_row, row_f32.data(), n_per_row);
+        }
+        ggml_quantize_chunk(GGML_TYPE_Q8_0,
+                            row_f32.data(),
+                            (uint8_t *) dst->data + (size_t) row * dst_row_bytes,
+                            /*start=*/0,
+                            /*nrows=*/1,
+                            n_per_row,
+                            /*imatrix=*/nullptr);
+    }
+
+    return dst;
+}
+
+static ggml_tensor * kokoro_dup_or_q8_weight(kokoro_model * model, ggml_tensor * src, const char * name) {
+    if (ggml_n_dims(src) == 3) {
+        ggml_tensor * dst = ggml_dup_tensor(model->ctx, src);
+        model->set_tensor(dst, src);
+        if (name && *name) {
+            ggml_set_name(dst, name);
+        }
+        if (ggml_tensor * q = kokoro_make_q8_conv1d_weight(model, dst, name)) {
+            tts_register_conv1d_quant_weight(dst, q);
+            model->conv1d_qweights.push_back({dst, q});
+        }
+        return dst;
+    }
+    if (ggml_tensor * q = kokoro_make_q8_weight(model, src, name)) {
+        return q;
+    }
+    ggml_tensor * dst = ggml_dup_tensor(model->ctx, src);
+    model->set_tensor(dst, src);
+    if (name && *name) {
+        ggml_set_name(dst, name);
+    }
+    return dst;
 }
 
 // 说明：为 Vulkan 生成 F32 权重拷贝（用于 conv_transpose_1d 等仅支持 F32 的算子）。
@@ -1485,8 +1652,8 @@ static struct ggml_tensor * build_generator(ggml_context * ctx, kokoro_model * m
     //   - TTS_CPU_GRAPH_ISTFT=1：CPU 启用 conv 版 ISTFT
     const bool vk_backend = tts_backend_is_vulkan(kctx->backend);
     const bool has_stft_basis = model->stft_forward_basis && model->stft_inverse_basis;
-    const bool cpu_graph_stft = !vk_backend && has_stft_basis && tts_env_truthy_default("TTS_CPU_GRAPH_STFT", /*default_value=*/false);
-    const bool cpu_graph_istft = !vk_backend && has_stft_basis && tts_env_truthy_default("TTS_CPU_GRAPH_ISTFT", /*default_value=*/false);
+    const bool cpu_graph_stft = !vk_backend && has_stft_basis && tts_env_truthy_default("TTS_CPU_GRAPH_STFT", /*default_value=*/true);
+    const bool cpu_graph_istft = !vk_backend && has_stft_basis && tts_env_truthy_default("TTS_CPU_GRAPH_ISTFT", /*default_value=*/true);
     const bool use_graph_stft = vk_backend
                                     ? (has_stft_basis && tts_env_truthy_default("TTS_VK_GRAPH_STFT", /*default_value=*/true))
                                     : cpu_graph_stft;
@@ -1865,14 +2032,12 @@ void kokoro_model::assign_weight(const char * name, ggml_tensor & tensor) {
 
 void kokoro_model::assign_generator_weight(kokoro_generator * generator, std::string name, ggml_tensor * tensor) {
 	if (name == "m_source_weight") {
-		generator->m_source_weight = ggml_dup_tensor(ctx, tensor);
-		set_tensor(generator->m_source_weight, tensor);
+		generator->m_source_weight = kokoro_dup_or_q8_weight(this, tensor, ggml_get_name(tensor));
 	} else if (name == "m_source_bias") {
 		generator->m_source_bias = ggml_dup_tensor(ctx, tensor);
 		set_tensor(generator->m_source_bias, tensor);
 	} else if (name == "conv_post_weight") {
-		generator->out_conv_weight = ggml_dup_tensor(ctx, tensor);
-		set_tensor(generator->out_conv_weight, tensor);
+		generator->out_conv_weight = kokoro_dup_or_q8_weight(this, tensor, ggml_get_name(tensor));
 	} else if (name == "conv_post_bias") {
 		generator->out_conv_bias = ggml_dup_tensor(ctx, ggml_transpose(ctx, tensor));
 		set_tensor(generator->out_conv_bias, tensor);
@@ -1881,8 +2046,7 @@ void kokoro_model::assign_generator_weight(kokoro_generator * generator, std::st
 		int i = std::stoi(parts[1]);
 		if (parts[0] == "noise_blocks") {
 			if (parts[2] == "conv_weight") {
-				generator->noise_blocks[i]->input_conv = ggml_dup_tensor(ctx, tensor);
-				set_tensor(generator->noise_blocks[i]->input_conv, tensor);
+				generator->noise_blocks[i]->input_conv = kokoro_dup_or_q8_weight(this, tensor, ggml_get_name(tensor));
 			} else if (parts[2] == "conv_bias") {
 				generator->noise_blocks[i]->input_conv_bias = ggml_dup_tensor(ctx, ggml_transpose(ctx, tensor));
 				set_tensor(generator->noise_blocks[i]->input_conv_bias, tensor);
@@ -1914,11 +2078,9 @@ void kokoro_model::assign_gen_resblock(kokoro_generator_residual_block * block, 
 	std::vector<std::string> parts = split(name, ".");
 	int i = std::stoi(parts[0]);
 	if (parts[1] == "gamma1_weight") {
-		block->adain1d_1_gamma_weights[i] = ggml_dup_tensor(ctx, tensor);
-		set_tensor(block->adain1d_1_gamma_weights[i], tensor);
+		block->adain1d_1_gamma_weights[i] = kokoro_dup_or_q8_weight(this, tensor, ggml_get_name(tensor));
 	} else if (parts[1] == "gamma2_weight") {
-		block->adain1d_2_gamma_weights[i] = ggml_dup_tensor(ctx, tensor);
-		set_tensor(block->adain1d_2_gamma_weights[i], tensor);
+		block->adain1d_2_gamma_weights[i] = kokoro_dup_or_q8_weight(this, tensor, ggml_get_name(tensor));
 	} else if (parts[1] == "gamma1_bias") {
 		block->adain1d_1_gamma_biases[i] = ggml_dup_tensor(ctx, tensor);
 		set_tensor(block->adain1d_1_gamma_biases[i], tensor);
@@ -1926,11 +2088,9 @@ void kokoro_model::assign_gen_resblock(kokoro_generator_residual_block * block, 
 		block->adain1d_2_gamma_biases[i] = ggml_dup_tensor(ctx, tensor);
 		set_tensor(block->adain1d_2_gamma_biases[i], tensor);
 	} else if (parts[1] == "beta1_weight") {
-		block->adain1d_1_beta_weights[i] = ggml_dup_tensor(ctx, tensor);
-		set_tensor(block->adain1d_1_beta_weights[i], tensor);
+		block->adain1d_1_beta_weights[i] = kokoro_dup_or_q8_weight(this, tensor, ggml_get_name(tensor));
 	} else if (parts[1] == "beta2_weight") {
-		block->adain1d_2_beta_weights[i] = ggml_dup_tensor(ctx, tensor);
-		set_tensor(block->adain1d_2_beta_weights[i], tensor);
+		block->adain1d_2_beta_weights[i] = kokoro_dup_or_q8_weight(this, tensor, ggml_get_name(tensor));
 	} else if (parts[1] == "beta1_bias") {
 		block->adain1d_1_beta_biases[i] = ggml_dup_tensor(ctx, tensor);
 		set_tensor(block->adain1d_1_beta_biases[i], tensor);
@@ -1938,11 +2098,9 @@ void kokoro_model::assign_gen_resblock(kokoro_generator_residual_block * block, 
 		block->adain1d_2_beta_biases[i] = ggml_dup_tensor(ctx, tensor);
 		set_tensor(block->adain1d_2_beta_biases[i], tensor);
 	} else if (parts[1] == "convs1_weight") {
-		block->convs1_weights[i] = ggml_dup_tensor(ctx, tensor);
-		set_tensor(block->convs1_weights[i], tensor);
+		block->convs1_weights[i] = kokoro_dup_or_q8_weight(this, tensor, ggml_get_name(tensor));
 	} else if (parts[1] == "convs2_weight") {
-		block->convs2_weights[i] = ggml_dup_tensor(ctx, tensor);
-		set_tensor(block->convs2_weights[i], tensor);
+		block->convs2_weights[i] = kokoro_dup_or_q8_weight(this, tensor, ggml_get_name(tensor));
 	} else if (parts[1] == "convs1_bias") {
 		block->convs1_biases[i] = ggml_dup_tensor(ctx, ggml_transpose(ctx, tensor));
 		set_tensor(block->convs1_biases[i], tensor);
@@ -1970,11 +2128,9 @@ static ggml_tensor * squeeze_3d_2d_e0(ggml_context * ctx, ggml_tensor * x) {
 
 void kokoro_model::assign_ada_res_block(ada_residual_conv_block * block, std::string name, ggml_tensor * tensor) {
 	if (name == "norm1_gamma_weight") {
-		block->norm1_gamma = ggml_dup_tensor(ctx, tensor);
-		set_tensor(block->norm1_gamma, tensor);
+		block->norm1_gamma = kokoro_dup_or_q8_weight(this, tensor, ggml_get_name(tensor));
 	} else if (name == "norm2_gamma_weight") {
-		block->norm2_gamma = ggml_dup_tensor(ctx, tensor);
-		set_tensor(block->norm2_gamma, tensor);
+		block->norm2_gamma = kokoro_dup_or_q8_weight(this, tensor, ggml_get_name(tensor));
 	} else if (name == "norm1_gamma_bias") {
 		block->norm1_gamma_bias = ggml_dup_tensor(ctx, tensor);
 		set_tensor(block->norm1_gamma_bias, tensor);
@@ -1982,11 +2138,9 @@ void kokoro_model::assign_ada_res_block(ada_residual_conv_block * block, std::st
 		block->norm2_gamma_bias = ggml_dup_tensor(ctx, tensor);
 		set_tensor(block->norm2_gamma_bias, tensor);
 	} else if (name == "norm1_beta_weight") {
-		block->norm1_beta = ggml_dup_tensor(ctx, tensor);
-		set_tensor(block->norm1_beta, tensor);
+		block->norm1_beta = kokoro_dup_or_q8_weight(this, tensor, ggml_get_name(tensor));
 	} else if (name == "norm2_beta_weight") {
-		block->norm2_beta = ggml_dup_tensor(ctx, tensor);
-		set_tensor(block->norm2_beta, tensor);
+		block->norm2_beta = kokoro_dup_or_q8_weight(this, tensor, ggml_get_name(tensor));
 	} else if (name == "norm1_beta_bias") {
 		block->norm1_beta_bias = ggml_dup_tensor(ctx, tensor);
 		set_tensor(block->norm1_beta_bias, tensor);
@@ -1994,11 +2148,9 @@ void kokoro_model::assign_ada_res_block(ada_residual_conv_block * block, std::st
 		block->norm2_beta_bias = ggml_dup_tensor(ctx, tensor);
 		set_tensor(block->norm2_beta_bias, tensor);
 	} else if (name == "conv1_weight") {
-		block->conv1 = ggml_dup_tensor(ctx, tensor);
-		set_tensor(block->conv1, tensor);
+		block->conv1 = kokoro_dup_or_q8_weight(this, tensor, ggml_get_name(tensor));
 	} else if (name == "conv2_weight") {
-		block->conv2 = ggml_dup_tensor(ctx, tensor);
-		set_tensor(block->conv2, tensor);
+		block->conv2 = kokoro_dup_or_q8_weight(this, tensor, ggml_get_name(tensor));
 	} else if (name == "conv1_bias") {
 		block->conv1_bias = ggml_dup_tensor(ctx, ggml_transpose(ctx, tensor));
 		set_tensor(block->conv1_bias, tensor);
@@ -2022,8 +2174,7 @@ void kokoro_model::assign_ada_res_block(ada_residual_conv_block * block, std::st
 		set_tensor(block->pool_bias, tensor);
 	} else if (name == "conv1x1_weight") {
 		tensor = squeeze_3d_2d_e0(ctx, tensor);
-		block->upsample = ggml_dup_tensor(ctx, tensor);
-		set_tensor(block->upsample, tensor);
+		block->upsample = kokoro_dup_or_q8_weight(this, tensor, ggml_get_name(tensor));
 	} else if (name == "conv1x1_bias") {
 		block->upsample_bias = ggml_dup_tensor(ctx, ggml_transpose(ctx, tensor));
 		set_tensor(block->upsample_bias, tensor);
@@ -2032,21 +2183,18 @@ void kokoro_model::assign_ada_res_block(ada_residual_conv_block * block, std::st
 
 void kokoro_model::assign_decoder_weight(std::string name, ggml_tensor * tensor) {
 	if (name == "f0_conv_weight") {
-		decoder->f0_conv = ggml_dup_tensor(ctx, tensor);
-		set_tensor(decoder->f0_conv, tensor);
+		decoder->f0_conv = kokoro_dup_or_q8_weight(this, tensor, ggml_get_name(tensor));
 	} else if (name == "f0_conv_bias") {
 		decoder->f0_conv_bias = ggml_dup_tensor(ctx, ggml_transpose(ctx, tensor));
 		set_tensor(decoder->f0_conv_bias, tensor);
 	} else if (name == "n_conv_weight") {
-		decoder->n_conv = ggml_dup_tensor(ctx, tensor);
-		set_tensor(decoder->n_conv, tensor);
+		decoder->n_conv = kokoro_dup_or_q8_weight(this, tensor, ggml_get_name(tensor));
 	} else if (name == "n_conv_bias") {
 		decoder->n_conv_bias = ggml_dup_tensor(ctx, ggml_transpose(ctx, tensor));
 		set_tensor(decoder->n_conv_bias, tensor);
 	} else if (name == "asr_conv_weight") {
 		tensor = squeeze_3d_2d_e0(ctx, tensor);
-		decoder->asr_conv = ggml_dup_tensor(ctx, tensor);
-		set_tensor(decoder->asr_conv, tensor);
+		decoder->asr_conv = kokoro_dup_or_q8_weight(this, tensor, ggml_get_name(tensor));
 	} else if (name == "asr_conv_bias") {
 		decoder->asr_conv_bias = ggml_dup_tensor(ctx, ggml_transpose(ctx, tensor));
 		set_tensor(decoder->asr_conv_bias, tensor);
@@ -2527,6 +2675,13 @@ void kokoro_duration_runner::set_inputs(kokoro_ubatch & batch) {
 }
 
 void kokoro_model::free() {
+    for (const auto & entry : conv1d_qweights) {
+        if (entry.src) {
+            tts_unregister_conv1d_quant_weight(entry.src);
+        }
+    }
+    conv1d_qweights.clear();
+
     for (ggml_backend_buffer_t buf : extra_buffers) {
         if (buf) {
             ggml_backend_buffer_free(buf);

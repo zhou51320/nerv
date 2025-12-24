@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
+#include <unordered_map>
 #include <stdarg.h>
 #if defined(__AVX2__)
 #include <immintrin.h>
@@ -256,6 +257,16 @@ static bool tts_env_truthy_default(const char * name, bool default_value) {
         return default_value;
     }
     return std::strcmp(v, "0") != 0 && std::strcmp(v, "off") != 0 && std::strcmp(v, "false") != 0;
+}
+
+static bool tts_env_cpu_conv1d_custom() {
+    // 默认关闭；如需启用可设置：TTS_CPU_CONV1D_CUSTOM=1
+    return tts_env_truthy_default("TTS_CPU_CONV1D_CUSTOM", false);
+}
+
+static bool tts_env_cpu_tconv_custom() {
+    // 默认关闭；如需启用可设置：TTS_CPU_TCONV_CUSTOM=1
+    return tts_env_truthy_default("TTS_CPU_TCONV_CUSTOM", false);
 }
 
 // ------------------------------ Snake1d 统计 ------------------------------
@@ -635,15 +646,6 @@ struct tts_conv_transpose_1d_op_params {
     int32_t groups;
 };
 
-static inline float tts_read_kernel_val_3d_f32(const ggml_tensor * t, int64_t i0, int64_t i1, int64_t i2) {
-    return *(const float *) ((const char *) t->data + i0 * t->nb[0] + i1 * t->nb[1] + i2 * t->nb[2]);
-}
-
-static inline float tts_read_kernel_val_3d_f16(const ggml_tensor * t, int64_t i0, int64_t i1, int64_t i2) {
-    const ggml_fp16_t v = *(const ggml_fp16_t *) ((const char *) t->data + i0 * t->nb[0] + i1 * t->nb[1] + i2 * t->nb[2]);
-    return ggml_fp16_to_fp32(v);
-}
-
 static void tts_compute_conv_transpose_1d_custom(struct ggml_tensor * dst, int ith, int nth, void *) {
     tts_conv_transpose_1d_op_params p{};
     std::memcpy(&p, dst->op_params, sizeof(p));
@@ -701,6 +703,9 @@ static void tts_compute_conv_transpose_1d_custom(struct ggml_tensor * dst, int i
     GGML_ASSERT(dst->ne[2] == N);
     GGML_ASSERT(dst->ne[3] == 1);
 
+    std::vector<float> wbuf;
+    wbuf.resize((size_t) K);
+
     // 任务划分：按输出通道（ne1）切片，避免写冲突。
     const int64_t ocpt = (OC_total + nth - 1) / nth; // out channels per task
     const int64_t oc0  = ocpt * ith;
@@ -720,6 +725,17 @@ static void tts_compute_conv_transpose_1d_custom(struct ggml_tensor * dst, int i
             for (int64_t ic = ic_begin; ic < ic_end; ++ic) {
                 const float * in_row = (const float *) ((const char *) input->data + ic * input->nb[1] + n * input->nb[2]);
 
+                const char * wbase = (const char *) kernel->data + oc * kernel->nb[1] + ic * kernel->nb[2];
+                if (kernel->type == GGML_TYPE_F32) {
+                    for (int64_t k = 0; k < K; ++k) {
+                        wbuf[(size_t) k] = *(const float *) (wbase + k * kernel->nb[0]);
+                    }
+                } else {
+                    for (int64_t k = 0; k < K; ++k) {
+                        wbuf[(size_t) k] = ggml_fp16_to_fp32(*(const ggml_fp16_t *) (wbase + k * kernel->nb[0]));
+                    }
+                }
+
                 for (int64_t x = 0; x < L_in; ++x) {
                     const float xv = in_row[x];
                     if (xv == 0.0f) {
@@ -734,10 +750,7 @@ static void tts_compute_conv_transpose_1d_custom(struct ggml_tensor * dst, int i
                             continue;
                         }
 
-                        const float w = (kernel->type == GGML_TYPE_F32)
-                                            ? tts_read_kernel_val_3d_f32(kernel, k, oc, ic)
-                                            : tts_read_kernel_val_3d_f16(kernel, k, oc, ic);
-                        out_row[y] += xv * w;
+                        out_row[y] += xv * wbuf[(size_t) k];
                     }
                 }
             }
@@ -1665,6 +1678,154 @@ struct ggml_tensor * istft_graph(
     return ggml_div(ctx, out, window_squared_sum);
 }
 
+namespace {
+// 说明：计算 1D 卷积输出长度（与 ggml_conv_1d 规则保持一致）。
+static int64_t tts_conv_1d_out_len(const int64_t in_len, const int64_t k, const int s0, const int p0, const int d0) {
+    if (in_len <= 0 || k <= 0 || s0 <= 0 || d0 <= 0) {
+        return -1;
+    }
+    return (in_len + 2 * (int64_t) p0 - (int64_t) d0 * (k - 1) - 1) / (int64_t) s0 + 1;
+}
+
+struct tts_conv_1d_op_params {
+    ggml_custom_op_params base;
+    int32_t s0;
+    int32_t p0;
+    int32_t d0;
+};
+
+static void tts_compute_conv_1d_custom(struct ggml_tensor * dst, int ith, int nth, void *) {
+    tts_conv_1d_op_params p{};
+    std::memcpy(&p, dst->op_params, sizeof(p));
+
+    const ggml_tensor * kernel = dst->src[0];
+    const ggml_tensor * input  = dst->src[1];
+
+    GGML_ASSERT(kernel != nullptr);
+    GGML_ASSERT(input  != nullptr);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(input->type == GGML_TYPE_F32);
+    GGML_ASSERT(kernel->type == GGML_TYPE_F16 || kernel->type == GGML_TYPE_F32);
+
+    const int64_t K  = kernel->ne[0];
+    const int64_t IC = kernel->ne[1];
+    const int64_t OC = kernel->ne[2];
+    const int64_t L  = input->ne[0];
+    const int64_t N  = input->ne[2];
+    const int64_t OL = dst->ne[0];
+
+    GGML_ASSERT(kernel->ne[3] == 1);
+    GGML_ASSERT(input->ne[1] == IC);
+    GGML_ASSERT(input->ne[3] == 1);
+    GGML_ASSERT(dst->ne[1] == OC);
+    GGML_ASSERT(dst->ne[2] == N);
+    GGML_ASSERT(dst->ne[3] == 1);
+    GGML_ASSERT(input->nb[0] == sizeof(float));
+    GGML_ASSERT(dst->nb[0] == sizeof(float));
+
+    const int32_t s0 = p.s0;
+    const int32_t p0 = p.p0;
+    const int32_t d0 = p.d0;
+    GGML_ASSERT(s0 > 0 && d0 > 0);
+
+    const int64_t ocpt = (OC + nth - 1) / nth;
+    const int64_t oc0 = ocpt * ith;
+    const int64_t oc1 = std::min(oc0 + ocpt, OC);
+    if (oc0 >= oc1) {
+        return;
+    }
+
+    std::vector<float> wbuf;
+    wbuf.resize((size_t) K);
+
+    const int64_t k_tail = (K - 1) * (int64_t) d0;
+
+    for (int64_t n = 0; n < N; ++n) {
+        for (int64_t oc = oc0; oc < oc1; ++oc) {
+            float * out_row = (float *) ((char *) dst->data + oc * dst->nb[1] + n * dst->nb[2]);
+            std::memset(out_row, 0, (size_t) OL * sizeof(float));
+
+            for (int64_t ic = 0; ic < IC; ++ic) {
+                const float * in_row = (const float *) ((const char *) input->data + ic * input->nb[1] + n * input->nb[2]);
+                const char * wbase = (const char *) kernel->data + ic * kernel->nb[1] + oc * kernel->nb[2];
+
+                if (kernel->type == GGML_TYPE_F32) {
+                    for (int64_t k = 0; k < K; ++k) {
+                        wbuf[(size_t) k] = *(const float *) (wbase + k * kernel->nb[0]);
+                    }
+                } else {
+                    for (int64_t k = 0; k < K; ++k) {
+                        wbuf[(size_t) k] = ggml_fp16_to_fp32(*(const ggml_fp16_t *) (wbase + k * kernel->nb[0]));
+                    }
+                }
+
+                for (int64_t t = 0; t < OL; ++t) {
+                    const int64_t base = t * (int64_t) s0 - (int64_t) p0;
+                    float sum = out_row[t];
+
+                    if (base >= 0 && base + k_tail < L) {
+                        for (int64_t k = 0; k < K; ++k) {
+                            sum += wbuf[(size_t) k] * in_row[base + k * (int64_t) d0];
+                        }
+                    } else {
+                        int64_t k_start = 0;
+                        if (base < 0) {
+                            k_start = (-base + d0 - 1) / d0;
+                        }
+                        int64_t k_end = K;
+                        if (base + k_tail >= L) {
+                            k_end = (L - base + d0 - 1) / d0;
+                        }
+                        for (int64_t k = k_start; k < k_end; ++k) {
+                            const int64_t x = base + k * (int64_t) d0;
+                            if (x < 0 || x >= L) {
+                                continue;
+                            }
+                            sum += wbuf[(size_t) k] * in_row[x];
+                        }
+                    }
+
+                    out_row[t] = sum;
+                }
+            }
+        }
+    }
+}
+} // namespace
+
+// 说明：缓存 conv1d 的量化权重映射（key=原始权重指针，value=量化 2D 权重）。
+// - 仅用于 CPU 推理加速；Vulkan 不使用此映射。
+// - 权重由模型加载阶段注册，模型释放时注销。
+namespace {
+    std::mutex g_conv1d_quant_mutex;
+    std::unordered_map<const ggml_tensor *, ggml_tensor *> g_conv1d_quant_weights;
+} // namespace
+
+void tts_register_conv1d_quant_weight(const ggml_tensor * src, ggml_tensor * qweight) {
+    if (!src || !qweight) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_conv1d_quant_mutex);
+    g_conv1d_quant_weights[src] = qweight;
+}
+
+void tts_unregister_conv1d_quant_weight(const ggml_tensor * src) {
+    if (!src) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_conv1d_quant_mutex);
+    g_conv1d_quant_weights.erase(src);
+}
+
+ggml_tensor * tts_get_conv1d_quant_weight(const ggml_tensor * src) {
+    if (!src) {
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(g_conv1d_quant_mutex);
+    const auto it = g_conv1d_quant_weights.find(src);
+    return it != g_conv1d_quant_weights.end() ? it->second : nullptr;
+}
+
 struct ggml_tensor * tts_conv_1d(
     ggml_context * ctx,
     struct ggml_tensor * a,
@@ -1678,14 +1839,72 @@ struct ggml_tensor * tts_conv_1d(
     if (b->type != GGML_TYPE_F32) {
         TTS_ABORT("For #tts_conv_1d input must be GGML_TYPE_F32.\n");
     }
-    if (a->type != GGML_TYPE_F16 && a->type != GGML_TYPE_F32) {
-        TTS_ABORT("For #tts_conv_1d kernel must be GGML_TYPE_F16 or GGML_TYPE_F32.\n");
+    const bool a_quant = ggml_is_quantized(a->type);
+    if (!a_quant && a->type != GGML_TYPE_F16 && a->type != GGML_TYPE_F32) {
+        TTS_ABORT("For #tts_conv_1d kernel must be GGML_TYPE_F16/F32 or quantized.\n");
+    }
+
+    const ggml_tensor * qweight = a_quant ? a : tts_get_conv1d_quant_weight(a);
+    bool use_quant = qweight && ggml_is_quantized(qweight->type);
+    ggml_tensor * w2d = nullptr;
+    if (use_quant) {
+        const int64_t kic = a->ne[0] * a->ne[1];
+        if (ggml_n_dims(qweight) == 2 && qweight->ne[0] == kic && qweight->ne[1] == a->ne[2]) {
+            w2d = (ggml_tensor *) qweight;
+        } else if (a_quant && ggml_is_contiguous(qweight)) {
+            w2d = ggml_reshape_2d(ctx, (ggml_tensor *) qweight, kic, a->ne[2]);
+        }
+        if (!w2d) {
+            use_quant = false;
+        }
+    }
+    if (a_quant && !use_quant) {
+        TTS_ABORT("For #tts_conv_1d quantized kernel shape is not supported.\n");
+    }
+
+    if (tts_env_cpu_conv1d_custom() &&
+        !use_quant &&
+        !tts_tensor_on_vulkan(a) &&
+        !tts_tensor_on_vulkan(b) &&
+        ggml_is_contiguous(a)) {
+        ggml_tensor * b_cont = ggml_is_contiguous(b) ? b : ggml_cont(ctx, b);
+        if (b_cont->ne[1] == a->ne[1] && b_cont->ne[3] == 1 && a->ne[3] == 1) {
+            const int64_t out_len = tts_conv_1d_out_len(b_cont->ne[0], a->ne[0], s0, p0, d0);
+            if (out_len > 0) {
+                ggml_tensor * out = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, out_len, a->ne[2], b_cont->ne[2]);
+                out->op = GGML_OP_CUSTOM;
+                out->src[0] = a;
+                out->src[1] = b_cont;
+
+                tts_conv_1d_op_params p{};
+                p.base.fun = tts_compute_conv_1d_custom;
+                p.base.n_tasks = GGML_N_TASKS_MAX;
+                p.base.userdata = nullptr;
+                p.s0 = (int32_t) s0;
+                p.p0 = (int32_t) p0;
+                p.d0 = (int32_t) d0;
+                ggml_set_op_params(out, &p, sizeof(p));
+                return out;
+            }
+        }
     }
 
     // 说明：ggml_conv_1d 固定使用 F16 im2col，CPU 路径会断言 kernel 为 F16。
-    // 这里按 kernel 类型选择 im2col 输出类型，既保留 F16 快路径，也让 F32 权重可用。
-    const ggml_type im2col_type = (a->type == GGML_TYPE_F16) ? GGML_TYPE_F16 : GGML_TYPE_F32;
+    // 这里按 kernel 类型选择 im2col 输出类型，既保留 F16 快路径，也允许 F32/量化权重。
+    // 注意：ggml 的量化 mul_mat 要求 src1 为 F32，因此量化权重路径必须使用 F32 im2col。
+    const ggml_type im2col_type = use_quant
+                                      ? GGML_TYPE_F32
+                                      : (a->type == GGML_TYPE_F16 ? GGML_TYPE_F16 : GGML_TYPE_F32);
     ggml_tensor * im2col = ggml_im2col(ctx, a, b, s0, 0, p0, 0, d0, 0, false, im2col_type); // [N, OL, IC * K]
+
+    if (use_quant) {
+        // 说明：权重量化时交换 mul_mat 的输入顺序，让量化权重作为 src0，以走 ggml 的量化向量点积路径。
+        ggml_tensor * x2d = ggml_reshape_2d(ctx, im2col, im2col->ne[0], (im2col->ne[2] * im2col->ne[1])); // [K*IC, N*OL]
+        ggml_tensor * result = ggml_mul_mat(ctx, w2d, x2d); // [OC, N*OL]
+        result = ggml_cont(ctx, ggml_transpose(ctx, result)); // [N*OL, OC]，保证后续按时间维连续
+        result = ggml_reshape_3d(ctx, result, im2col->ne[1], a->ne[2], im2col->ne[2]); // [N, OC, OL]
+        return result;
+    }
 
     ggml_tensor * result =
         ggml_mul_mat(ctx,
@@ -1718,8 +1937,12 @@ struct ggml_tensor * tts_conv_transpose_1d(
         TTS_ABORT("For #tts_conv_transpose_1d padding/output_padding must be >= 0.\n");
     }
 
-    // groups==1：尽量复用 ggml 内置实现（其目前只支持 p0==0 且 d0==1）
-    if (groups == 1) {
+    const bool use_custom = tts_env_cpu_tconv_custom() &&
+                            !tts_tensor_on_vulkan(a) &&
+                            !tts_tensor_on_vulkan(b);
+
+    // groups==1：优先走 ggml 内置实现（其目前只支持 p0==0 且 d0==1）；如启用自定义则跳过。
+    if (groups == 1 && !use_custom) {
         if (d0 != 1) {
             TTS_ABORT("For #tts_conv_transpose_1d (groups==1) ggml 0.9.4 only supports dilation==1.\n");
         }
@@ -1758,12 +1981,12 @@ struct ggml_tensor * tts_conv_transpose_1d(
         return ggml_cont(ctx, view);
     }
 
-    // groups>1：项目侧 CPU 自定义实现（用于 Kokoro depthwise 转置卷积）。
+    // CPU 自定义实现（默认用于 groups>1；groups==1 且启用 TTS_CPU_TCONV_CUSTOM 时也会走这里）。
     if (b->type != GGML_TYPE_F32) {
-        TTS_ABORT("For #tts_conv_transpose_1d (groups>1) input must be GGML_TYPE_F32.\n");
+        TTS_ABORT("For #tts_conv_transpose_1d custom path input must be GGML_TYPE_F32.\n");
     }
     if (a->type != GGML_TYPE_F16 && a->type != GGML_TYPE_F32) {
-        TTS_ABORT("For #tts_conv_transpose_1d (groups>1) kernel must be GGML_TYPE_F16 or GGML_TYPE_F32.\n");
+        TTS_ABORT("For #tts_conv_transpose_1d custom path kernel must be GGML_TYPE_F16 or GGML_TYPE_F32.\n");
     }
     if (a->ne[3] != 1 || b->ne[3] != 1) {
         TTS_ABORT("For #tts_conv_transpose_1d only ne[3]==1 tensors are supported.\n");

@@ -197,6 +197,12 @@ struct albert_layer {
 	struct ggml_tensor * attn_norm_bias;
 };
 
+// 说明：conv1d 量化权重映射条目（用于 CPU 推理加速）。
+struct kokoro_conv1d_quant_entry {
+	const struct ggml_tensor * src = nullptr; // 原始卷积权重（图中引用的 tensor）
+	struct ggml_tensor * qweight = nullptr;   // 量化后的 2D 权重
+};
+
 struct kokoro_model : tts_model {
 	// standard configruation for Kokoro's Albert model
 	// tokenization
@@ -294,6 +300,8 @@ struct kokoro_model : tts_model {
 	// 说明：Vulkan 下部分权重需要在模型外额外分配（例如 F32 拷贝/展开后的 depthwise kernel），
 	// 这些 buffer 不在基类的主权重 buffer 中，需在 free() 时额外释放。
 	std::vector<ggml_backend_buffer_t> extra_buffers;
+	// 说明：CPU conv1d 量化权重缓存（仅在启用 TTS_CPU_KOKORO_Q8 时生成）。
+	std::vector<kokoro_conv1d_quant_entry> conv1d_qweights;
 
 	size_t duration_node_counter = 0;
 	size_t generation_node_counter = 0;
