@@ -23,7 +23,6 @@ $script:GlobalCMakeConfigureArgs = @(
   # 禁用 GGML AVX512 加速，避免在硬件/工具链不匹配时出问题
   '-D', 'GGML_AVX512=OFF'
 )
-
 $Compiler = if ($Compiler) { $Compiler.Trim() } else { 'auto' }
 $Compiler = $Compiler.ToLowerInvariant()
 switch ($Compiler) {
@@ -53,6 +52,15 @@ function Resolve-Arch {
 }
 
 function Test-Cmd([string]$name) { return [bool](Get-Command $name -ErrorAction SilentlyContinue) }
+
+function Resolve-CudaArchs {
+  $override = [Environment]::GetEnvironmentVariable('EVA_CUDA_ARCHS')
+  if ($override) {
+    $override = $override.Trim()
+    if ($override) { return $override }
+  }
+  return '75;86;89'
+}
 
 function Can-Vulkan {
   if ($env:VULKAN_SDK) { return $true }
@@ -505,6 +513,12 @@ $BUILD = Join-Path $ROOT ("build-$arch-$buildOsTag")
 $devs = Resolve-Devices $Devices
 $devs = Filter-DevicesForCompiler $devs $CompilerMode
 $script:AllDevices = $devs
+if ($devs -contains 'cuda') {
+  $cudaArchs = Resolve-CudaArchs
+  if ($cudaArchs) {
+    $script:GlobalCMakeConfigureArgs += @('-D', "CMAKE_CUDA_ARCHITECTURES=$cudaArchs")
+  }
+}
 if ($Projects -eq 'all') { $projs = @('llama','whisper','sd','tts') } else { $projs = $Projects.Split(',') }
 Write-Host "==> OS=$OS_ID ARCH=$arch COMPILER=$CompilerMode OUT_OS=$OutOsId GENERATOR=$($GeneratorSpec.G) BUILD_DIR=$BUILD DEVICES=$($devs -join ',') PROJECTS=$($projs -join ',')"
 
