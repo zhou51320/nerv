@@ -15,6 +15,7 @@ if (CUDAToolkit_FOUND)
         # 80     == Ampere, asynchronous data loading, faster tensor core instructions
         # 86     == RTX 3000, needs CUDA v11.1
         # 89     == RTX 4000, needs CUDA v11.8
+        # 120    == Blackwell, needs CUDA v12.8, FP4 tensor cores
         #
         # XX-virtual == compile CUDA code as PTX, do JIT compilation to binary code on first run
         # XX-real    == compile CUDA code as device code for this specific architecture
@@ -34,11 +35,51 @@ if (CUDAToolkit_FOUND)
             if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "11.8")
                 list(APPEND CMAKE_CUDA_ARCHITECTURES 89-real)
             endif()
+
+            if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12.8")
+                # The CUDA architecture 120f-virtual would in principle work for Blackwell support
+                #     but the newly added "f" suffix conflicted with a preexising regex for validating CUDA architectures in CMake.
+                # So either a recent CMake version or one with the backported fix is needed.
+                # The following versions should work:
+                #   - CMake >= v3.31.8 && CMake < v4.0.0
+                #   - CMake >= v4.0.2
+                # This is NOT documented in the CMake release notes,
+                #     check Modules/Internal/CMakeCUDAArchitecturesValidate.cmake in the CMake git repository instead.
+                # However, the architectures 120a-real and 121a-real should work with basically any CMake version and
+                #     until the release of e.g. Rubin there is no benefit to shipping virtual architectures for Blackwell.
+                list(APPEND CMAKE_CUDA_ARCHITECTURES 120a-real 121a-real)
+            endif()
         endif()
     endif()
     message(STATUS "Using CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
 
     enable_language(CUDA)
+
+    # Replace any 12x-real architectures with 12x{a}-real. FP4 ptx instructions are not available in just 12x
+    if (GGML_NATIVE)
+        set(PROCESSED_ARCHITECTURES "")
+        if (CMAKE_CUDA_ARCHITECTURES_NATIVE)
+            set(ARCH_LIST ${CMAKE_CUDA_ARCHITECTURES_NATIVE})
+        else()
+            set(ARCH_LIST ${CMAKE_CUDA_ARCHITECTURES})
+        endif()
+        foreach(ARCH ${ARCH_LIST})
+            if (ARCH MATCHES "^12[0-9](-real|-virtual)?$")
+                string(REGEX REPLACE "^(12[0-9]).*$" "\\1" BASE_ARCH ${ARCH})
+                message(STATUS "Replacing ${ARCH} with ${BASE_ARCH}a-real")
+                list(APPEND PROCESSED_ARCHITECTURES "${BASE_ARCH}a-real")
+            else()
+                list(APPEND PROCESSED_ARCHITECTURES ${ARCH})
+            endif()
+        endforeach()
+        set(CMAKE_CUDA_ARCHITECTURES ${PROCESSED_ARCHITECTURES})
+    else()
+        foreach(ARCH ${CMAKE_CUDA_ARCHITECTURES})
+            if(ARCH MATCHES "^12[0-9](-real|-virtual)?$")
+                message(FATAL_ERROR "Compute capability ${ARCH} used, use ${ARCH}a or ${ARCH}f for Blackwell-specific optimizations")
+            endif()
+        endforeach()
+    endif()
 
     file(GLOB   GGML_HEADERS_CUDA "*.cuh")
     list(APPEND GGML_HEADERS_CUDA "../../include/ggml-cuda.h")

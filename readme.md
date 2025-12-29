@@ -36,7 +36,7 @@ if (WIN32)
     target_link_libraries(${TARGET} PUBLIC ws2_32)
 endif()
 ```
-    - 搜索 inline bool mmap::open(const char *path) 替换
+    - 搜索 bool mmap::open(const char *path) 替换
 ```cpp
 
 inline bool mmap::open(const char *path) {
