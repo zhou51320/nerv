@@ -28,7 +28,7 @@ public:
         if (vae_downsample) {
             auto conv = std::dynamic_pointer_cast<Conv2d>(blocks["conv"]);
 
-            x = ggml_pad(ctx->ggml_ctx, x, 1, 1, 0, 0);
+            x = ggml_ext_pad(ctx->ggml_ctx, x, 1, 1, 0, 0, ctx->circular_x_enabled, ctx->circular_y_enabled);
             x = conv->forward(ctx, x);
         } else {
             auto conv = std::dynamic_pointer_cast<Conv2d>(blocks["op"]);
@@ -194,9 +194,11 @@ public:
         auto proj = std::dynamic_pointer_cast<Linear>(blocks["proj"]);
 
         x          = proj->forward(ctx, x);  // [ne3, ne2, ne1, dim_out*2]
-        auto x_vec = ggml_ext_chunk(ctx->ggml_ctx, x, 2, 0);
+        auto x_vec = ggml_ext_chunk(ctx->ggml_ctx, x, 2, 0, false);
         x          = x_vec[0];  // [ne3, ne2, ne1, dim_out]
         auto gate  = x_vec[1];  // [ne3, ne2, ne1, dim_out]
+
+        gate = ggml_cont(ctx->ggml_ctx, gate);
 
         gate = ggml_gelu_inplace(ctx->ggml_ctx, gate);
 

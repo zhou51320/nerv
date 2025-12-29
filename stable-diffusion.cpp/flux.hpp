@@ -134,6 +134,54 @@ namespace Flux {
         }
     };
 
+    struct MLP : public UnaryBlock {
+        bool use_mlp_silu_act;
+
+    public:
+        MLP(int64_t hidden_size, int64_t intermediate_size, bool use_mlp_silu_act = false, bool bias = false)
+            : use_mlp_silu_act(use_mlp_silu_act) {
+            int64_t mlp_mult_factor = use_mlp_silu_act ? 2 : 1;
+            blocks["0"]             = std::make_shared<Linear>(hidden_size, intermediate_size * mlp_mult_factor, bias);
+            blocks["2"]             = std::make_shared<Linear>(intermediate_size, hidden_size, bias);
+        }
+
+        struct ggml_tensor* forward(GGMLRunnerContext* ctx, struct ggml_tensor* x) {
+            auto mlp_0 = std::dynamic_pointer_cast<Linear>(blocks["0"]);
+            auto mlp_2 = std::dynamic_pointer_cast<Linear>(blocks["2"]);
+
+            x = mlp_0->forward(ctx, x);
+            if (use_mlp_silu_act) {
+                x = ggml_ext_silu_act(ctx->ggml_ctx, x);
+            } else {
+                x = ggml_gelu_inplace(ctx->ggml_ctx, x);
+            }
+            x = mlp_2->forward(ctx, x);
+            return x;
+        }
+    };
+
+    struct YakMLP : public UnaryBlock {
+    public:
+        YakMLP(int64_t hidden_size, int64_t intermediate_size, bool bias = true) {
+            blocks["gate_proj"] = std::make_shared<Linear>(hidden_size, intermediate_size, bias);
+            blocks["up_proj"]   = std::make_shared<Linear>(hidden_size, intermediate_size, bias);
+            blocks["down_proj"] = std::make_shared<Linear>(intermediate_size, hidden_size, bias);
+        }
+
+        struct ggml_tensor* forward(GGMLRunnerContext* ctx, struct ggml_tensor* x) {
+            auto gate_proj = std::dynamic_pointer_cast<Linear>(blocks["gate_proj"]);
+            auto up_proj   = std::dynamic_pointer_cast<Linear>(blocks["up_proj"]);
+            auto down_proj = std::dynamic_pointer_cast<Linear>(blocks["down_proj"]);
+
+            auto gate = gate_proj->forward(ctx, x);
+            gate      = ggml_silu_inplace(ctx->ggml_ctx, gate);
+            x         = up_proj->forward(ctx, x);
+            x         = ggml_mul(ctx->ggml_ctx, x, gate);
+            x         = down_proj->forward(ctx, x);
+            return x;
+        }
+    };
+
     struct ModulationOut {
         ggml_tensor* shift = nullptr;
         ggml_tensor* scale = nullptr;
@@ -185,21 +233,23 @@ namespace Flux {
     __STATIC_INLINE__ struct ggml_tensor* modulate(struct ggml_context* ctx,
                                                    struct ggml_tensor* x,
                                                    struct ggml_tensor* shift,
-                                                   struct ggml_tensor* scale) {
+                                                   struct ggml_tensor* scale,
+                                                   bool skip_reshape = false) {
         // x: [N, L, C]
         // scale: [N, C]
         // shift: [N, C]
-        scale = ggml_reshape_3d(ctx, scale, scale->ne[0], 1, scale->ne[1]);  // [N, 1, C]
-        shift = ggml_reshape_3d(ctx, shift, shift->ne[0], 1, shift->ne[1]);  // [N, 1, C]
-        x     = ggml_add(ctx, x, ggml_mul(ctx, x, scale));
-        x     = ggml_add(ctx, x, shift);
+        if (!skip_reshape) {
+            scale = ggml_reshape_3d(ctx, scale, scale->ne[0], 1, scale->ne[1]);  // [N, 1, C]
+            shift = ggml_reshape_3d(ctx, shift, shift->ne[0], 1, shift->ne[1]);  // [N, 1, C]
+        }
+        x = ggml_add(ctx, x, ggml_mul(ctx, x, scale));
+        x = ggml_add(ctx, x, shift);
         return x;
     }
 
     struct DoubleStreamBlock : public GGMLBlock {
         bool prune_mod;
         int idx = 0;
-        bool use_mlp_silu_act;
 
     public:
         DoubleStreamBlock(int64_t hidden_size,
@@ -210,10 +260,10 @@ namespace Flux {
                           bool prune_mod        = false,
                           bool share_modulation = false,
                           bool mlp_proj_bias    = true,
+                          bool use_yak_mlp      = false,
                           bool use_mlp_silu_act = false)
-            : idx(idx), prune_mod(prune_mod), use_mlp_silu_act(use_mlp_silu_act) {
-            int64_t mlp_hidden_dim  = hidden_size * mlp_ratio;
-            int64_t mlp_mult_factor = use_mlp_silu_act ? 2 : 1;
+            : idx(idx), prune_mod(prune_mod) {
+            int64_t mlp_hidden_dim = hidden_size * mlp_ratio;
 
             if (!prune_mod && !share_modulation) {
                 blocks["img_mod"] = std::shared_ptr<GGMLBlock>(new Modulation(hidden_size, true));
@@ -222,9 +272,11 @@ namespace Flux {
             blocks["img_attn"]  = std::shared_ptr<GGMLBlock>(new SelfAttention(hidden_size, num_heads, qkv_bias, mlp_proj_bias));
 
             blocks["img_norm2"] = std::shared_ptr<GGMLBlock>(new LayerNorm(hidden_size, 1e-6f, false));
-            blocks["img_mlp.0"] = std::shared_ptr<GGMLBlock>(new Linear(hidden_size, mlp_hidden_dim * mlp_mult_factor, mlp_proj_bias));
-            // img_mlp.1 is nn.GELU(approximate="tanh")
-            blocks["img_mlp.2"] = std::shared_ptr<GGMLBlock>(new Linear(mlp_hidden_dim, hidden_size, mlp_proj_bias));
+            if (use_yak_mlp) {
+                blocks["img_mlp"] = std::shared_ptr<GGMLBlock>(new YakMLP(hidden_size, mlp_hidden_dim, mlp_proj_bias));
+            } else {
+                blocks["img_mlp"] = std::shared_ptr<GGMLBlock>(new MLP(hidden_size, mlp_hidden_dim, use_mlp_silu_act, mlp_proj_bias));
+            }
 
             if (!prune_mod && !share_modulation) {
                 blocks["txt_mod"] = std::shared_ptr<GGMLBlock>(new Modulation(hidden_size, true));
@@ -233,9 +285,11 @@ namespace Flux {
             blocks["txt_attn"]  = std::shared_ptr<GGMLBlock>(new SelfAttention(hidden_size, num_heads, qkv_bias, mlp_proj_bias));
 
             blocks["txt_norm2"] = std::shared_ptr<GGMLBlock>(new LayerNorm(hidden_size, 1e-6f, false));
-            blocks["txt_mlp.0"] = std::shared_ptr<GGMLBlock>(new Linear(hidden_size, mlp_hidden_dim * mlp_mult_factor, mlp_proj_bias));
-            // img_mlp.1 is nn.GELU(approximate="tanh")
-            blocks["txt_mlp.2"] = std::shared_ptr<GGMLBlock>(new Linear(mlp_hidden_dim, hidden_size, mlp_proj_bias));
+            if (use_yak_mlp) {
+                blocks["txt_mlp"] = std::shared_ptr<GGMLBlock>(new YakMLP(hidden_size, mlp_hidden_dim, mlp_proj_bias));
+            } else {
+                blocks["txt_mlp"] = std::shared_ptr<GGMLBlock>(new MLP(hidden_size, mlp_hidden_dim, use_mlp_silu_act, mlp_proj_bias));
+            }
         }
 
         std::vector<ModulationOut> get_distil_img_mod(GGMLRunnerContext* ctx, struct ggml_tensor* vec) {
@@ -272,15 +326,13 @@ namespace Flux {
             auto img_attn  = std::dynamic_pointer_cast<SelfAttention>(blocks["img_attn"]);
 
             auto img_norm2 = std::dynamic_pointer_cast<LayerNorm>(blocks["img_norm2"]);
-            auto img_mlp_0 = std::dynamic_pointer_cast<Linear>(blocks["img_mlp.0"]);
-            auto img_mlp_2 = std::dynamic_pointer_cast<Linear>(blocks["img_mlp.2"]);
+            auto img_mlp   = std::dynamic_pointer_cast<UnaryBlock>(blocks["img_mlp"]);
 
             auto txt_norm1 = std::dynamic_pointer_cast<LayerNorm>(blocks["txt_norm1"]);
             auto txt_attn  = std::dynamic_pointer_cast<SelfAttention>(blocks["txt_attn"]);
 
             auto txt_norm2 = std::dynamic_pointer_cast<LayerNorm>(blocks["txt_norm2"]);
-            auto txt_mlp_0 = std::dynamic_pointer_cast<Linear>(blocks["txt_mlp.0"]);
-            auto txt_mlp_2 = std::dynamic_pointer_cast<Linear>(blocks["txt_mlp.2"]);
+            auto txt_mlp   = std::dynamic_pointer_cast<UnaryBlock>(blocks["txt_mlp"]);
 
             if (img_mods.empty()) {
                 if (prune_mod) {
@@ -348,27 +400,15 @@ namespace Flux {
             // calculate the img bloks
             img = ggml_add(ctx->ggml_ctx, img, ggml_mul(ctx->ggml_ctx, img_attn->post_attention(ctx, img_attn_out), img_mod1.gate));
 
-            auto img_mlp_out = img_mlp_0->forward(ctx, Flux::modulate(ctx->ggml_ctx, img_norm2->forward(ctx, img), img_mod2.shift, img_mod2.scale));
-            if (use_mlp_silu_act) {
-                img_mlp_out = ggml_ext_silu_act(ctx->ggml_ctx, img_mlp_out);
-            } else {
-                img_mlp_out = ggml_gelu_inplace(ctx->ggml_ctx, img_mlp_out);
-            }
-            img_mlp_out = img_mlp_2->forward(ctx, img_mlp_out);
+            auto img_mlp_out = img_mlp->forward(ctx, Flux::modulate(ctx->ggml_ctx, img_norm2->forward(ctx, img), img_mod2.shift, img_mod2.scale));
 
             img = ggml_add(ctx->ggml_ctx, img, ggml_mul(ctx->ggml_ctx, img_mlp_out, img_mod2.gate));
 
             // calculate the txt bloks
             txt = ggml_add(ctx->ggml_ctx, txt, ggml_mul(ctx->ggml_ctx, txt_attn->post_attention(ctx, txt_attn_out), txt_mod1.gate));
 
-            auto txt_mlp_out = txt_mlp_0->forward(ctx, Flux::modulate(ctx->ggml_ctx, txt_norm2->forward(ctx, txt), txt_mod2.shift, txt_mod2.scale));
-            if (use_mlp_silu_act) {
-                txt_mlp_out = ggml_ext_silu_act(ctx->ggml_ctx, txt_mlp_out);
-            } else {
-                txt_mlp_out = ggml_gelu_inplace(ctx->ggml_ctx, txt_mlp_out);
-            }
-            txt_mlp_out = txt_mlp_2->forward(ctx, txt_mlp_out);
-            txt         = ggml_add(ctx->ggml_ctx, txt, ggml_mul(ctx->ggml_ctx, txt_mlp_out, txt_mod2.gate));
+            auto txt_mlp_out = txt_mlp->forward(ctx, Flux::modulate(ctx->ggml_ctx, txt_norm2->forward(ctx, txt), txt_mod2.shift, txt_mod2.scale));
+            txt              = ggml_add(ctx->ggml_ctx, txt, ggml_mul(ctx->ggml_ctx, txt_mlp_out, txt_mod2.gate));
 
             return {img, txt};
         }
@@ -381,6 +421,7 @@ namespace Flux {
         int64_t mlp_hidden_dim;
         bool prune_mod;
         int idx = 0;
+        bool use_yak_mlp;
         bool use_mlp_silu_act;
         int64_t mlp_mult_factor;
 
@@ -393,8 +434,9 @@ namespace Flux {
                           bool prune_mod        = false,
                           bool share_modulation = false,
                           bool mlp_proj_bias    = true,
+                          bool use_yak_mlp      = false,
                           bool use_mlp_silu_act = false)
-            : hidden_size(hidden_size), num_heads(num_heads), idx(idx), prune_mod(prune_mod), use_mlp_silu_act(use_mlp_silu_act) {
+            : hidden_size(hidden_size), num_heads(num_heads), idx(idx), prune_mod(prune_mod), use_yak_mlp(use_yak_mlp), use_mlp_silu_act(use_mlp_silu_act) {
             int64_t head_dim = hidden_size / num_heads;
             float scale      = qk_scale;
             if (scale <= 0.f) {
@@ -402,7 +444,7 @@ namespace Flux {
             }
             mlp_hidden_dim  = hidden_size * mlp_ratio;
             mlp_mult_factor = 1;
-            if (use_mlp_silu_act) {
+            if (use_yak_mlp || use_mlp_silu_act) {
                 mlp_mult_factor = 2;
             }
 
@@ -481,7 +523,9 @@ namespace Flux {
             k                = norm->key_norm(ctx, k);
             auto attn        = Rope::attention(ctx, q, k, v, pe, mask);  // [N, n_token, hidden_size]
 
-            if (use_mlp_silu_act) {
+            if (use_yak_mlp) {
+                mlp = ggml_ext_silu_act(ctx->ggml_ctx, mlp, false);
+            } else if (use_mlp_silu_act) {
                 mlp = ggml_ext_silu_act(ctx->ggml_ctx, mlp);
             } else {
                 mlp = ggml_gelu_inplace(ctx->ggml_ctx, mlp);
@@ -703,6 +747,8 @@ namespace Flux {
         int64_t nerf_mlp_ratio   = 4;
         int64_t nerf_depth       = 4;
         int64_t nerf_max_freqs   = 8;
+        bool use_x0              = false;
+        bool use_patch_size_32   = false;
     };
 
     struct FluxParams {
@@ -726,6 +772,8 @@ namespace Flux {
         int64_t in_dim              = 64;
         bool disable_bias           = false;
         bool share_modulation       = false;
+        bool semantic_txt_norm      = false;
+        bool use_yak_mlp            = false;
         bool use_mlp_silu_act       = false;
         float ref_index_scale       = 1.f;
         ChromaRadianceParams chroma_radiance_params;
@@ -738,7 +786,7 @@ namespace Flux {
         Flux(FluxParams params)
             : params(params) {
             if (params.version == VERSION_CHROMA_RADIANCE) {
-                std::pair<int, int> kernel_size = {(int)params.patch_size, (int)params.patch_size};
+                std::pair<int, int> kernel_size = {16, 16};
                 std::pair<int, int> stride      = kernel_size;
 
                 blocks["img_in_patch"] = std::make_shared<Conv2d>(params.in_channels,
@@ -759,6 +807,9 @@ namespace Flux {
                     blocks["guidance_in"] = std::make_shared<MLPEmbedder>(256, params.hidden_size, !params.disable_bias);
                 }
             }
+            if (params.semantic_txt_norm) {
+                blocks["txt_norm"] = std::make_shared<RMSNorm>(params.context_in_dim);
+            }
             blocks["txt_in"] = std::make_shared<Linear>(params.context_in_dim, params.hidden_size, !params.disable_bias);
 
             for (int i = 0; i < params.depth; i++) {
@@ -770,6 +821,7 @@ namespace Flux {
                                                                                                    params.is_chroma,
                                                                                                    params.share_modulation,
                                                                                                    !params.disable_bias,
+                                                                                                   params.use_yak_mlp,
                                                                                                    params.use_mlp_silu_act);
             }
 
@@ -782,6 +834,7 @@ namespace Flux {
                                                                                                    params.is_chroma,
                                                                                                    params.share_modulation,
                                                                                                    !params.disable_bias,
+                                                                                                   params.use_yak_mlp,
                                                                                                    params.use_mlp_silu_act);
             }
 
@@ -810,14 +863,14 @@ namespace Flux {
             }
         }
 
-        struct ggml_tensor* pad_to_patch_size(struct ggml_context* ctx,
+        struct ggml_tensor* pad_to_patch_size(GGMLRunnerContext* ctx,
                                               struct ggml_tensor* x) {
             int64_t W = x->ne[0];
             int64_t H = x->ne[1];
 
             int pad_h = (params.patch_size - H % params.patch_size) % params.patch_size;
             int pad_w = (params.patch_size - W % params.patch_size) % params.patch_size;
-            x         = ggml_pad(ctx, x, pad_w, pad_h, 0, 0);  // [N, C, H + pad_h, W + pad_w]
+            x         = ggml_ext_pad(ctx->ggml_ctx, x, pad_w, pad_h, 0, 0, ctx->circular_x_enabled, ctx->circular_y_enabled);
             return x;
         }
 
@@ -843,11 +896,11 @@ namespace Flux {
             return x;
         }
 
-        struct ggml_tensor* process_img(struct ggml_context* ctx,
+        struct ggml_tensor* process_img(GGMLRunnerContext* ctx,
                                         struct ggml_tensor* x) {
             // img = rearrange(x, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=patch_size, pw=patch_size)
             x = pad_to_patch_size(ctx, x);
-            x = patchify(ctx, x);
+            x = patchify(ctx->ggml_ctx, x);
             return x;
         }
 
@@ -948,6 +1001,12 @@ namespace Flux {
                 ss_mods     = single_stream_modulation->forward(ctx, vec);
             }
 
+            if (params.semantic_txt_norm) {
+                auto semantic_txt_norm = std::dynamic_pointer_cast<RMSNorm>(blocks["txt_norm"]);
+
+                txt = semantic_txt_norm->forward(ctx, txt);
+            }
+
             txt = txt_in->forward(ctx, txt);
 
             for (int i = 0; i < params.depth; i++) {
@@ -990,6 +1049,15 @@ namespace Flux {
             return img;
         }
 
+        struct ggml_tensor* _apply_x0_residual(GGMLRunnerContext* ctx,
+                                               struct ggml_tensor* predicted,
+                                               struct ggml_tensor* noisy,
+                                               struct ggml_tensor* timesteps) {
+            auto x = ggml_sub(ctx->ggml_ctx, noisy, predicted);
+            x      = ggml_div(ctx->ggml_ctx, x, timesteps);
+            return x;
+        }
+
         struct ggml_tensor* forward_chroma_radiance(GGMLRunnerContext* ctx,
                                                     struct ggml_tensor* x,
                                                     struct ggml_tensor* timestep,
@@ -1011,8 +1079,15 @@ namespace Flux {
             int pad_h          = (patch_size - H % patch_size) % patch_size;
             int pad_w          = (patch_size - W % patch_size) % patch_size;
 
-            auto img      = pad_to_patch_size(ctx->ggml_ctx, x);
+            auto img      = pad_to_patch_size(ctx, x);
             auto orig_img = img;
+
+            if (params.chroma_radiance_params.use_patch_size_32) {
+                // It's supposed to be using GGML_SCALE_MODE_NEAREST, but this seems more stable
+                // Maybe the implementation of nearest-neighbor interpolation in ggml behaves differently than the one in PyTorch?
+                // img = F.interpolate(img, size=(H//2, W//2), mode="nearest")
+                img = ggml_interpolate(ctx->ggml_ctx, img, W / 2, H / 2, C, x->ne[3], GGML_SCALE_MODE_BILINEAR);
+            }
 
             auto img_in_patch = std::dynamic_pointer_cast<Conv2d>(blocks["img_in_patch"]);
 
@@ -1050,6 +1125,10 @@ namespace Flux {
 
             out = nerf_final_layer_conv->forward(ctx, img_dct);  // [N, C, H, W]
 
+            if (params.chroma_radiance_params.use_x0) {
+                out = _apply_x0_residual(ctx, out, orig_img, timestep);
+            }
+
             return out;
         }
 
@@ -1074,7 +1153,7 @@ namespace Flux {
             int pad_h          = (patch_size - H % patch_size) % patch_size;
             int pad_w          = (patch_size - W % patch_size) % patch_size;
 
-            auto img            = process_img(ctx->ggml_ctx, x);
+            auto img            = process_img(ctx, x);
             uint64_t img_tokens = img->ne[1];
 
             if (params.version == VERSION_FLUX_FILL) {
@@ -1082,8 +1161,8 @@ namespace Flux {
                 ggml_tensor* masked = ggml_view_4d(ctx->ggml_ctx, c_concat, c_concat->ne[0], c_concat->ne[1], C, 1, c_concat->nb[1], c_concat->nb[2], c_concat->nb[3], 0);
                 ggml_tensor* mask   = ggml_view_4d(ctx->ggml_ctx, c_concat, c_concat->ne[0], c_concat->ne[1], 8 * 8, 1, c_concat->nb[1], c_concat->nb[2], c_concat->nb[3], c_concat->nb[2] * C);
 
-                masked = process_img(ctx->ggml_ctx, masked);
-                mask   = process_img(ctx->ggml_ctx, mask);
+                masked = process_img(ctx, masked);
+                mask   = process_img(ctx, mask);
 
                 img = ggml_concat(ctx->ggml_ctx, img, ggml_concat(ctx->ggml_ctx, masked, mask, 0), 0);
             } else if (params.version == VERSION_FLEX_2) {
@@ -1092,21 +1171,21 @@ namespace Flux {
                 ggml_tensor* mask    = ggml_view_4d(ctx->ggml_ctx, c_concat, c_concat->ne[0], c_concat->ne[1], 1, 1, c_concat->nb[1], c_concat->nb[2], c_concat->nb[3], c_concat->nb[2] * C);
                 ggml_tensor* control = ggml_view_4d(ctx->ggml_ctx, c_concat, c_concat->ne[0], c_concat->ne[1], C, 1, c_concat->nb[1], c_concat->nb[2], c_concat->nb[3], c_concat->nb[2] * (C + 1));
 
-                masked  = process_img(ctx->ggml_ctx, masked);
-                mask    = process_img(ctx->ggml_ctx, mask);
-                control = process_img(ctx->ggml_ctx, control);
+                masked  = process_img(ctx, masked);
+                mask    = process_img(ctx, mask);
+                control = process_img(ctx, control);
 
                 img = ggml_concat(ctx->ggml_ctx, img, ggml_concat(ctx->ggml_ctx, ggml_concat(ctx->ggml_ctx, masked, mask, 0), control, 0), 0);
             } else if (params.version == VERSION_FLUX_CONTROLS) {
                 GGML_ASSERT(c_concat != nullptr);
 
-                auto control = process_img(ctx->ggml_ctx, c_concat);
+                auto control = process_img(ctx, c_concat);
                 img          = ggml_concat(ctx->ggml_ctx, img, control, 0);
             }
 
             if (ref_latents.size() > 0) {
                 for (ggml_tensor* ref : ref_latents) {
-                    ref = process_img(ctx->ggml_ctx, ref);
+                    ref = process_img(ctx, ref);
                     img = ggml_concat(ctx->ggml_ctx, img, ref, 1);
                 }
             }
@@ -1206,6 +1285,11 @@ namespace Flux {
             } else if (version == VERSION_CHROMA_RADIANCE) {
                 flux_params.in_channels = 3;
                 flux_params.patch_size  = 16;
+            } else if (version == VERSION_OVIS_IMAGE) {
+                flux_params.semantic_txt_norm = true;
+                flux_params.use_yak_mlp       = true;
+                flux_params.context_in_dim    = 2048;
+                flux_params.vec_in_dim        = 0;
             } else if (sd_version_is_flux2(version)) {
                 flux_params.context_in_dim   = 15360;
                 flux_params.in_channels      = 128;
@@ -1230,6 +1314,15 @@ namespace Flux {
                 if (tensor_name.find("guidance_in.in_layer.weight") != std::string::npos) {
                     // not schnell
                     flux_params.guidance_embed = true;
+                }
+                if (tensor_name.find("__x0__") != std::string::npos) {
+                    LOG_DEBUG("using x0 prediction");
+                    flux_params.chroma_radiance_params.use_x0 = true;
+                }
+                if (tensor_name.find("__32x32__") != std::string::npos) {
+                    LOG_DEBUG("using patch size 32 prediction");
+                    flux_params.chroma_radiance_params.use_patch_size_32 = true;
+                    flux_params.patch_size                               = 32;
                 }
                 if (tensor_name.find("distilled_guidance_layer.in_proj.weight") != std::string::npos) {
                     // Chroma
@@ -1364,15 +1457,26 @@ namespace Flux {
                 ref_latents[i] = to_backend(ref_latents[i]);
             }
 
+            std::set<int> txt_arange_dims;
+            if (sd_version_is_flux2(version)) {
+                txt_arange_dims    = {3};
+                increase_ref_index = true;
+            } else if (version == VERSION_OVIS_IMAGE) {
+                txt_arange_dims = {1, 2};
+            }
+
             pe_vec      = Rope::gen_flux_pe(x->ne[1],
                                             x->ne[0],
                                             flux_params.patch_size,
                                             x->ne[3],
                                             context->ne[1],
+                                            txt_arange_dims,
                                             ref_latents,
-                                       sd_version_is_flux2(version) ? true : increase_ref_index,
+                                            increase_ref_index,
                                             flux_params.ref_index_scale,
                                             flux_params.theta,
+                                            circular_y_enabled,
+                                            circular_x_enabled,
                                             flux_params.axes_dim);
             int pos_len = pe_vec.size() / flux_params.axes_dim_sum / 2;
             // LOG_DEBUG("pos_len %d", pos_len);
@@ -1413,7 +1517,7 @@ namespace Flux {
             return gf;
         }
 
-        void compute(int n_threads,
+        bool compute(int n_threads,
                      struct ggml_tensor* x,
                      struct ggml_tensor* timesteps,
                      struct ggml_tensor* context,
@@ -1434,7 +1538,7 @@ namespace Flux {
                 return build_graph(x, timesteps, context, c_concat, y, guidance, ref_latents, increase_ref_index, skip_layers);
             };
 
-            GGMLRunner::compute(get_graph, n_threads, false, output, output_ctx);
+            return GGMLRunner::compute(get_graph, n_threads, false, output, output_ctx);
         }
 
         void test() {

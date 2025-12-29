@@ -389,9 +389,32 @@ build_sd() {
     -DBUILD_SHARED_LIBS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
     $vflag $cuflag $ocflag $SD_EXTRA $NATIVE_EXTRA -DCMAKE_BUILD_TYPE=Release \
     "${extra_cmake[@]}"
-  cmake --build "$bdir" $(cmake_jobs_flag) --config Release --target sd
+  local help_out targets=()
+  help_out=$(cmake --build "$bdir" --config Release --target help 2>/dev/null || true)
+  for t in sd-cli sd-server sd; do
+    if echo "$help_out" | grep -Eq "(^|[[:space:]])$t([[:space:]]|$)"; then
+      targets+=("$t")
+    fi
+  done
+  if [[ "${#targets[@]}" -eq 0 ]]; then
+    cmake --build "$bdir" $(cmake_jobs_flag) --config Release
+    targets=(sd sd-cli sd-server)
+  else
+    cmake --build "$bdir" $(cmake_jobs_flag) --config Release --target "${targets[@]}"
+  fi
   local out="$OUT_DIR/$arch/$os/$device/stable-diffusion.cpp"
-  copy_bin "$bdir" sd "$out" "$exe_suf" || true
+  for t in "${targets[@]}"; do
+    copy_bin "$bdir" "$t" "$out" "$exe_suf" || true
+  done
+  if [[ ! -f "$out/sd$exe_suf" && ! -f "$out/sd" ]]; then
+    if [[ -f "$out/sd-cli$exe_suf" ]]; then
+      cp -f "$out/sd-cli$exe_suf" "$out/sd$exe_suf"
+      echo "Copied sd-cli$exe_suf -> $out/sd$exe_suf"
+    elif [[ -f "$out/sd-cli" ]]; then
+      cp -f "$out/sd-cli" "$out/sd"
+      echo "Copied sd-cli -> $out/sd"
+    fi
+  fi
 }
 
 build_tts() {

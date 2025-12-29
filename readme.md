@@ -12,7 +12,7 @@ build.bat
 如果编译器是mingw则自动编译win7版本
 ## 更新后端时注意
 - 为了能在win7下运行所有项目的主CMakeLists.txt中顶部添加
-```txt
+```cmake
 if (MSVC)
     unset(GGML_WIN_VER CACHE)
 else()
@@ -161,4 +161,3 @@ inline bool mmap::open(const char *path) {
 #endif
 
 ```
-- 搜索set(GGML_WIN_VER "0x602" CACHE STRING   "ggml: Windows version")替换为set(GGML_WIN_VER "0x601" CACHE STRING   "ggml: Windows version")

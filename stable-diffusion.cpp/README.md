@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="./assets/cat_with_sd_cpp_42.png" width="360x">
+  <img src="./assets/logo.png" width="360x">
 </p>
 
 # stable-diffusion.cpp
@@ -49,9 +49,10 @@ API and command-line option may change frequently.***
     - [Chroma1-Radiance](./docs/chroma_radiance.md)
     - [Qwen Image](./docs/qwen_image.md)
     - [Z-Image](./docs/z_image.md)
+    - [Ovis-Image](./docs/ovis_image.md)
   - Image Edit Models
     - [FLUX.1-Kontext-dev](./docs/kontext.md)
-    - [Qwen Image Edit/Qwen Image Edit 2509](./docs/qwen_image_edit.md)
+    - [Qwen Image Edit series](./docs/qwen_image_edit.md)
   - Video Models
     - [Wan2.1/Wan2.2](./docs/wan.md)
   - [PhotoMaker](https://github.com/TencentARC/PhotoMaker) support.
@@ -104,7 +105,7 @@ API and command-line option may change frequently.***
 ### Download model weights
 
 - download weights(.ckpt or .safetensors or .gguf). For example
-    - Stable Diffusion v1.5 from https://huggingface.co/runwayml/stable-diffusion-v1-5
+    - Stable Diffusion v1.5 from https://huggingface.co/stable-diffusion-v1-5/stable-diffusion-v1-5 
 
     ```sh
     curl -L -O https://huggingface.co/runwayml/stable-diffusion-v1-5/resolve/main/v1-5-pruned-emaonly.safetensors
@@ -113,7 +114,7 @@ API and command-line option may change frequently.***
 ### Generate an image with just one command
 
 ```sh
-./bin/sd -m ../models/v1-5-pruned-emaonly.safetensors -p "a lovely cat"
+./bin/sd-cli -m ../models/v1-5-pruned-emaonly.safetensors -p "a lovely cat"
 ```
 
 ***For detailed command-line arguments, check out [cli doc](./examples/cli/README.md).***
@@ -131,9 +132,10 @@ If you want to improve performance or reduce VRAM/RAM usage, please refer to [pe
 - [FLUX.1-Kontext-dev](./docs/kontext.md)
 - [Chroma](./docs/chroma.md)
 - [🔥Qwen Image](./docs/qwen_image.md)
-- [🔥Qwen Image Edit/Qwen Image Edit 2509](./docs/qwen_image_edit.md)
+- [🔥Qwen Image Edit series](./docs/qwen_image_edit.md)
 - [🔥Wan2.1/Wan2.2](./docs/wan.md)
 - [🔥Z-Image](./docs/z_image.md)
+- [Ovis-Image](./docs/ovis_image.md)
 - [LoRA](./docs/lora.md)
 - [LCM/LCM-LoRA](./docs/lcm.md)
 - [Using PhotoMaker to personalize image generation](./docs/photo_maker.md)
@@ -141,6 +143,7 @@ If you want to improve performance or reduce VRAM/RAM usage, please refer to [pe
 - [Using TAESD to faster decoding](./docs/taesd.md)
 - [Docker](./docs/docker.md)
 - [Quantization and GGUF](./docs/quantization_and_gguf.md)
+- [Inference acceleration via caching](./docs/caching.md)
 
 ## Bindings
 

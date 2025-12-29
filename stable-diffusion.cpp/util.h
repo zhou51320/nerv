@@ -2,6 +2,7 @@
 #define __UTIL_H__
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -22,7 +23,6 @@ int round_up_to(int value, int base);
 
 bool file_exists(const std::string& filename);
 bool is_directory(const std::string& path);
-std::string get_full_path(const std::string& dir, const std::string& filename);
 
 std::u32string utf8_to_utf32(const std::string& utf8_str);
 std::string utf32_to_utf8(const std::u32string& utf32_str);
@@ -43,6 +43,28 @@ sd_image_f32_t sd_image_t_to_sd_image_f32_t(sd_image_t image);
 sd_image_f32_t resize_sd_image_f32_t(sd_image_f32_t image, int target_width, int target_height);
 
 sd_image_f32_t clip_preprocess(sd_image_f32_t image, int target_width, int target_height);
+
+class MmapWrapper {
+public:
+    static std::unique_ptr<MmapWrapper> create(const std::string& filename);
+
+    virtual ~MmapWrapper() = default;
+
+    MmapWrapper(const MmapWrapper&)            = delete;
+    MmapWrapper& operator=(const MmapWrapper&) = delete;
+    MmapWrapper(MmapWrapper&&)                 = delete;
+    MmapWrapper& operator=(MmapWrapper&&)      = delete;
+
+    const uint8_t* data() const { return static_cast<uint8_t*>(data_); }
+    size_t size() const { return size_; }
+    bool copy_data(void* buf, size_t n, size_t offset) const;
+
+protected:
+    MmapWrapper(void* data, size_t size)
+        : data_(data), size_(size) {}
+    void* data_  = nullptr;
+    size_t size_ = 0;
+};
 
 std::string path_join(const std::string& p1, const std::string& p2);
 std::vector<std::string> split_string(const std::string& str, char delimiter);

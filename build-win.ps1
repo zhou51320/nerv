@@ -373,9 +373,35 @@ function Build-SD([string]$device,[string]$arch) {
   $gen = $GeneratorSpec
   Invoke-CMakeConfigure $src $bdir $gen $defs
   if ($device -in @('vulkan','cuda','opencl')) { Assert-BackendEnabled $bdir $device 'stable-diffusion.cpp' }
-  Invoke-CMakeBuild $bdir @('sd')
+  $help = Get-AvailableTargets $bdir
+  $targets = @()
+  foreach ($t in @('sd-cli','sd-server','sd')) {
+    $pattern = '(?m)(^|\s){0}(\s|$)' -f [regex]::Escape($t)
+    if ($help -match $pattern) { $targets += $t }
+  }
+  if ($targets.Count -eq 0) {
+    Invoke-CMakeBuild $bdir @()
+    $targets = @('sd','sd-cli','sd-server')
+  } else {
+    Invoke-CMakeBuild $bdir $targets
+  }
   $out = Get-ProjectOutDir $arch $device 'stable-diffusion.cpp'
-  Copy-Binary $bdir 'sd' $out
+  foreach ($t in $targets) { Copy-Binary $bdir $t $out }
+  $sdOut = @((Join-Path $out 'sd.exe'), (Join-Path $out 'sd'))
+  $haveSd = $false
+  foreach ($p in $sdOut) { if (Test-Path $p) { $haveSd = $true; break } }
+  if (-not $haveSd) {
+    $cliOut = @((Join-Path $out 'sd-cli.exe'), (Join-Path $out 'sd-cli'))
+    foreach ($p in $cliOut) {
+      if (Test-Path $p) {
+        $ext = [System.IO.Path]::GetExtension($p)
+        $dest = Join-Path $out ("sd$ext")
+        Copy-Item $p -Destination $dest -Force
+        Write-Host "Copied $(Split-Path $p -Leaf) -> $dest"
+        break
+      }
+    }
+  }
 }
 
 function Build-TTS([string]$device,[string]$arch) {

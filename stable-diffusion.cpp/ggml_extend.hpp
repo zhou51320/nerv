@@ -5,6 +5,7 @@
 #include <inttypes.h>
 #include <stdarg.h>
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <fstream>
 #include <functional>
@@ -59,6 +60,14 @@
 #ifndef SD_UNUSED
 #define SD_UNUSED(x) (void)(x)
 #endif
+
+__STATIC_INLINE__ int align_up_offset(int n, int multiple) {
+    return (multiple - n % multiple) % multiple;
+}
+
+__STATIC_INLINE__ int align_up(int n, int multiple) {
+    return n + align_up_offset(n, multiple);
+}
 
 __STATIC_INLINE__ void ggml_log_callback_default(ggml_log_level level, const char* text, void*) {
     switch (level) {
@@ -724,34 +733,22 @@ __STATIC_INLINE__ struct ggml_tensor* ggml_ext_slice(struct ggml_context* ctx,
 __STATIC_INLINE__ std::vector<struct ggml_tensor*> ggml_ext_chunk(struct ggml_context* ctx,
                                                                   struct ggml_tensor* x,
                                                                   int num,
-                                                                  int64_t dim) {
+                                                                  int64_t dim,
+                                                                  bool cont = true) {
     GGML_ASSERT(dim >= 0 && dim < 4);
     GGML_ASSERT(x->ne[dim] % num == 0);
 
-    int perm[4] = {0, 1, 2, 3};
-    for (int i = dim; i < 3; ++i)
-        perm[i] = perm[i + 1];
-    perm[3] = dim;
-
-    int inv_perm[4];
-    for (int i = 0; i < 4; ++i)
-        inv_perm[perm[i]] = i;
-
-    if (dim != 3) {
-        x = ggml_ext_torch_permute(ctx, x, perm[0], perm[1], perm[2], perm[3]);
-        x = ggml_cont(ctx, x);
-    }
-
     std::vector<struct ggml_tensor*> chunks;
-    int64_t chunk_size = x->ne[3] / num;
+    int64_t chunk_size  = x->ne[dim] / num;
+    int64_t stride      = chunk_size * x->nb[dim];
+    int64_t chunk_ne[4] = {x->ne[0], x->ne[1], x->ne[2], x->ne[3]};
+    chunk_ne[dim]       = chunk_size;
     for (int i = 0; i < num; i++) {
         auto chunk = ggml_view_4d(
             ctx, x,
-            x->ne[0], x->ne[1], x->ne[2], chunk_size,
-            x->nb[1], x->nb[2], x->nb[3], x->nb[3] * i * chunk_size);
-
-        if (dim != 3) {
-            chunk = ggml_ext_torch_permute(ctx, chunk, inv_perm[0], inv_perm[1], inv_perm[2], inv_perm[3]);
+            chunk_ne[0], chunk_ne[1], chunk_ne[2], chunk_ne[3],
+            x->nb[1], x->nb[2], x->nb[3], stride * i);
+        if (cont) {
             chunk = ggml_cont(ctx, chunk);
         }
         chunks.push_back(chunk);
@@ -760,17 +757,23 @@ __STATIC_INLINE__ std::vector<struct ggml_tensor*> ggml_ext_chunk(struct ggml_co
     return chunks;
 }
 
-__STATIC_INLINE__ ggml_tensor* ggml_ext_silu_act(ggml_context* ctx, ggml_tensor* x) {
+__STATIC_INLINE__ ggml_tensor* ggml_ext_silu_act(ggml_context* ctx, ggml_tensor* x, bool gate_first = true) {
     // x: [ne3, ne2, ne1, ne0]
     // return: [ne3, ne2, ne1, ne0/2]
 
-    auto x_vec = ggml_ext_chunk(ctx, x, 2, 0);
-    auto x1    = x_vec[0];  // [ne3, ne2, ne1, ne0/2]
-    auto x2    = x_vec[1];  // [ne3, ne2, ne1, ne0/2]
+    auto x_vec = ggml_ext_chunk(ctx, x, 2, 0, false);
+    ggml_tensor* gate;
+    if (gate_first) {
+        gate = x_vec[0];
+        x    = x_vec[1];
+    } else {
+        x    = x_vec[0];
+        gate = x_vec[1];
+    }
+    gate = ggml_cont(ctx, gate);
+    gate = ggml_silu_inplace(ctx, gate);
 
-    x1 = ggml_gelu_inplace(ctx, x1);
-
-    x = ggml_mul(ctx, x1, x2);  // [ne3, ne2, ne1, ne0/2]
+    x = ggml_mul(ctx, x, gate);  // [ne3, ne2, ne1, ne0/2]
 
     return x;
 }
@@ -845,8 +848,6 @@ __STATIC_INLINE__ void sd_tiling_non_square(ggml_tensor* input,
 
     LOG_DEBUG("num tiles : %d, %d ", num_tiles_x, num_tiles_y);
     LOG_DEBUG("optimal overlap : %f, %f (targeting %f)", tile_overlap_factor_x, tile_overlap_factor_y, tile_overlap_factor);
-
-    GGML_ASSERT(input_width % 2 == 0 && input_height % 2 == 0 && output_width % 2 == 0 && output_height % 2 == 0);  // should be multiple of 2
 
     int tile_overlap_x     = (int32_t)(p_tile_size_x * tile_overlap_factor_x);
     int non_tile_overlap_x = p_tile_size_x - tile_overlap_x;
@@ -993,6 +994,48 @@ __STATIC_INLINE__ struct ggml_tensor* ggml_ext_linear(struct ggml_context* ctx,
     return x;
 }
 
+__STATIC_INLINE__ struct ggml_tensor* ggml_ext_pad_ext(struct ggml_context* ctx,
+                                                       struct ggml_tensor* x,
+                                                       int lp0,
+                                                       int rp0,
+                                                       int lp1,
+                                                       int rp1,
+                                                       int lp2,
+                                                       int rp2,
+                                                       int lp3,
+                                                       int rp3,
+                                                       bool circular_x = false,
+                                                       bool circular_y = false) {
+    if (circular_x && circular_y) {
+        return ggml_pad_ext_circular(ctx, x, lp0, rp0, lp1, rp1, lp2, rp2, lp3, rp3);
+    }
+
+    if (circular_x && (lp0 != 0 || rp0 != 0)) {
+        x   = ggml_pad_ext_circular(ctx, x, lp0, rp0, 0, 0, 0, 0, 0, 0);
+        lp0 = rp0 = 0;
+    }
+    if (circular_y && (lp1 != 0 || rp1 != 0)) {
+        x   = ggml_pad_ext_circular(ctx, x, 0, 0, lp1, rp1, 0, 0, 0, 0);
+        lp1 = rp1 = 0;
+    }
+
+    if (lp0 != 0 || rp0 != 0 || lp1 != 0 || rp1 != 0 || lp2 != 0 || rp2 != 0 || lp3 != 0 || rp3 != 0) {
+        x = ggml_pad_ext(ctx, x, lp0, rp0, lp1, rp1, lp2, rp2, lp3, rp3);
+    }
+    return x;
+}
+
+__STATIC_INLINE__ struct ggml_tensor* ggml_ext_pad(struct ggml_context* ctx,
+                                                   struct ggml_tensor* x,
+                                                   int p0,
+                                                   int p1,
+                                                   int p2          = 0,
+                                                   int p3          = 0,
+                                                   bool circular_x = false,
+                                                   bool circular_y = false) {
+    return ggml_ext_pad_ext(ctx, x, 0, p0, 0, p1, 0, p2, 0, p3, circular_x, circular_y);
+}
+
 // w: [OC，IC, KH, KW]
 // x: [N, IC, IH, IW]
 // b: [OC,]
@@ -1001,20 +1044,29 @@ __STATIC_INLINE__ struct ggml_tensor* ggml_ext_conv_2d(struct ggml_context* ctx,
                                                        struct ggml_tensor* x,
                                                        struct ggml_tensor* w,
                                                        struct ggml_tensor* b,
-                                                       int s0      = 1,
-                                                       int s1      = 1,
-                                                       int p0      = 0,
-                                                       int p1      = 0,
-                                                       int d0      = 1,
-                                                       int d1      = 1,
-                                                       bool direct = false,
-                                                       float scale = 1.f) {
+                                                       int s0          = 1,
+                                                       int s1          = 1,
+                                                       int p0          = 0,
+                                                       int p1          = 0,
+                                                       int d0          = 1,
+                                                       int d1          = 1,
+                                                       bool direct     = false,
+                                                       bool circular_x = false,
+                                                       bool circular_y = false,
+                                                       float scale     = 1.f) {
     if (scale != 1.f) {
         x = ggml_scale(ctx, x, scale);
     }
     if (w->ne[2] != x->ne[2] && ggml_n_dims(w) == 2) {
         w = ggml_reshape_4d(ctx, w, 1, 1, w->ne[0], w->ne[1]);
     }
+
+    if ((p0 != 0 || p1 != 0) && (circular_x || circular_y)) {
+        x  = ggml_ext_pad_ext(ctx, x, p0, p0, p1, p1, 0, 0, 0, 0, circular_x, circular_y);
+        p0 = 0;
+        p1 = 0;
+    }
+
     if (direct) {
         x = ggml_conv_2d_direct(ctx, w, x, s0, s1, p0, p1, d0, d1);
     } else {
@@ -1268,6 +1320,9 @@ __STATIC_INLINE__ struct ggml_tensor* ggml_ext_attention_ext(struct ggml_context
         }
 
         if (mask_in != nullptr) {
+            // the need for padding got removed in ggml 4767bda
+            // ensure we can still use the old version for now
+#ifdef GGML_KQ_MASK_PAD
             int mask_pad = 0;
             if (mask_in->ne[1] % GGML_KQ_MASK_PAD != 0) {
                 mask_pad = GGML_PAD(L_q, GGML_KQ_MASK_PAD) - mask_in->ne[1];
@@ -1275,6 +1330,7 @@ __STATIC_INLINE__ struct ggml_tensor* ggml_ext_attention_ext(struct ggml_context
             if (mask_pad > 0) {
                 mask_in = ggml_pad(ctx, mask_in, 0, mask_pad, 0, 0);
             }
+#endif
             mask_in = ggml_cast(ctx, mask_in, GGML_TYPE_F16);
         }
 
@@ -1386,10 +1442,14 @@ __STATIC_INLINE__ void ggml_ext_backend_tensor_get_and_sync(ggml_backend_t backe
 }
 
 __STATIC_INLINE__ float ggml_ext_backend_tensor_get_f32(ggml_tensor* tensor) {
-    GGML_ASSERT(tensor->type == GGML_TYPE_F32 || tensor->type == GGML_TYPE_F16 || tensor->type == GGML_TYPE_I32);
+    GGML_ASSERT(tensor->type == GGML_TYPE_F32 || tensor->type == GGML_TYPE_F16 || tensor->type == GGML_TYPE_I32 || tensor->type == GGML_TYPE_BF16);
     float value;
     if (tensor->type == GGML_TYPE_F32) {
         ggml_backend_tensor_get(tensor, &value, 0, sizeof(value));
+    } else if (tensor->type == GGML_TYPE_BF16) {
+        ggml_bf16_t bf16_value;
+        ggml_backend_tensor_get(tensor, &bf16_value, 0, sizeof(bf16_value));
+        value = ggml_bf16_to_fp32(bf16_value);
     } else if (tensor->type == GGML_TYPE_F16) {
         ggml_fp16_t f16_value;
         ggml_backend_tensor_get(tensor, &f16_value, 0, sizeof(f16_value));
@@ -1513,14 +1573,16 @@ struct WeightAdapter {
             float scale         = 1.f;
         } linear;
         struct {
-            int s0      = 1;
-            int s1      = 1;
-            int p0      = 0;
-            int p1      = 0;
-            int d0      = 1;
-            int d1      = 1;
-            bool direct = false;
-            float scale = 1.f;
+            int s0          = 1;
+            int s1          = 1;
+            int p0          = 0;
+            int p1          = 0;
+            int d0          = 1;
+            int d1          = 1;
+            bool direct     = false;
+            bool circular_x = false;
+            bool circular_y = false;
+            float scale     = 1.f;
         } conv2d;
     };
     virtual ggml_tensor* patch_weight(ggml_context* ctx, ggml_tensor* weight, const std::string& weight_name) = 0;
@@ -1538,6 +1600,8 @@ struct GGMLRunnerContext {
     ggml_context* ggml_ctx                        = nullptr;
     bool flash_attn_enabled                       = false;
     bool conv2d_direct_enabled                    = false;
+    bool circular_x_enabled                       = false;
+    bool circular_y_enabled                       = false;
     std::shared_ptr<WeightAdapter> weight_adapter = nullptr;
 };
 
@@ -1574,6 +1638,8 @@ protected:
 
     bool flash_attn_enabled    = false;
     bool conv2d_direct_enabled = false;
+    bool circular_x_enabled    = false;
+    bool circular_y_enabled    = false;
 
     void alloc_params_ctx() {
         struct ggml_init_params params;
@@ -1851,6 +1917,8 @@ public:
         runner_ctx.backend               = runtime_backend;
         runner_ctx.flash_attn_enabled    = flash_attn_enabled;
         runner_ctx.conv2d_direct_enabled = conv2d_direct_enabled;
+        runner_ctx.circular_x_enabled    = circular_x_enabled;
+        runner_ctx.circular_y_enabled    = circular_y_enabled;
         runner_ctx.weight_adapter        = weight_adapter;
         return runner_ctx;
     }
@@ -1938,25 +2006,35 @@ public:
         return ggml_get_tensor(cache_ctx, name.c_str());
     }
 
-    void compute(get_graph_cb_t get_graph,
+    bool compute(get_graph_cb_t get_graph,
                  int n_threads,
                  bool free_compute_buffer_immediately = true,
                  struct ggml_tensor** output          = nullptr,
                  struct ggml_context* output_ctx      = nullptr) {
         if (!offload_params_to_runtime_backend()) {
             LOG_ERROR("%s offload params to runtime backend failed", get_desc().c_str());
-            return;
+            return false;
         }
-        alloc_compute_buffer(get_graph);
+        if (!alloc_compute_buffer(get_graph)) {
+            LOG_ERROR("%s alloc compute buffer failed", get_desc().c_str());
+            return false;
+        }
         reset_compute_ctx();
         struct ggml_cgraph* gf = get_compute_graph(get_graph);
-        GGML_ASSERT(ggml_gallocr_alloc_graph(compute_allocr, gf));
+        if (!ggml_gallocr_alloc_graph(compute_allocr, gf)) {
+            LOG_ERROR("%s alloc compute graph failed", get_desc().c_str());
+            return false;
+        }
         copy_data_to_backend_tensor();
         if (ggml_backend_is_cpu(runtime_backend)) {
             ggml_backend_cpu_set_n_threads(runtime_backend, n_threads);
         }
 
-        ggml_backend_graph_compute(runtime_backend, gf);
+        ggml_status status = ggml_backend_graph_compute(runtime_backend, gf);
+        if (status != GGML_STATUS_SUCCESS) {
+            LOG_ERROR("%s compute failed: %s", get_desc().c_str(), ggml_status_to_string(status));
+            return false;
+        }
 #ifdef GGML_PERF
         ggml_graph_print(gf);
 #endif
@@ -1974,6 +2052,7 @@ public:
         if (free_compute_buffer_immediately) {
             free_compute_buffer();
         }
+        return true;
     }
 
     void set_flash_attention_enabled(bool enabled) {
@@ -1982,6 +2061,11 @@ public:
 
     void set_conv2d_direct_enabled(bool enabled) {
         conv2d_direct_enabled = enabled;
+    }
+
+    void set_circular_axes(bool circular_x, bool circular_y) {
+        circular_x_enabled = circular_x;
+        circular_y_enabled = circular_y;
     }
 
     void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter) {
@@ -2247,15 +2331,17 @@ public:
         }
         if (ctx->weight_adapter) {
             WeightAdapter::ForwardParams forward_params;
-            forward_params.op_type       = WeightAdapter::ForwardParams::op_type_t::OP_CONV2D;
-            forward_params.conv2d.s0     = stride.second;
-            forward_params.conv2d.s1     = stride.first;
-            forward_params.conv2d.p0     = padding.second;
-            forward_params.conv2d.p1     = padding.first;
-            forward_params.conv2d.d0     = dilation.second;
-            forward_params.conv2d.d1     = dilation.first;
-            forward_params.conv2d.direct = ctx->conv2d_direct_enabled;
-            forward_params.conv2d.scale  = scale;
+            forward_params.op_type           = WeightAdapter::ForwardParams::op_type_t::OP_CONV2D;
+            forward_params.conv2d.s0         = stride.second;
+            forward_params.conv2d.s1         = stride.first;
+            forward_params.conv2d.p0         = padding.second;
+            forward_params.conv2d.p1         = padding.first;
+            forward_params.conv2d.d0         = dilation.second;
+            forward_params.conv2d.d1         = dilation.first;
+            forward_params.conv2d.direct     = ctx->conv2d_direct_enabled;
+            forward_params.conv2d.circular_x = ctx->circular_x_enabled;
+            forward_params.conv2d.circular_y = ctx->circular_y_enabled;
+            forward_params.conv2d.scale      = scale;
             return ctx->weight_adapter->forward_with_lora(ctx->ggml_ctx, x, w, b, prefix, forward_params);
         }
         return ggml_ext_conv_2d(ctx->ggml_ctx,
@@ -2269,6 +2355,8 @@ public:
                                 dilation.second,
                                 dilation.first,
                                 ctx->conv2d_direct_enabled,
+                                ctx->circular_x_enabled,
+                                ctx->circular_y_enabled,
                                 scale);
     }
 };
