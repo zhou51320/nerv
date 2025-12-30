@@ -7,7 +7,7 @@ set -euo pipefail
 
 # Defaults
 PROJECTS="all"       # all|llama|whisper|sd|tts (stable-diffusion|tts)
-DEVICES="auto"       # auto|cpu|vulkan|cuda|opencl|all (comma-separated allowed)
+DEVICES="cpu,vulkan" # auto|cpu|vulkan|cuda|opencl|all (comma-separated allowed)
 JOBS=""              # empty => cmake default; else e.g. -j 8
 CLEAN=0
 ROOT_DIR="$(pwd)"

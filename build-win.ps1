@@ -1,6 +1,6 @@
 Param(
   [string]$Projects = 'all',      # all|llama|whisper|sd|tts (comma-separated)
-  [string]$Devices  = 'auto',     # auto|cpu|cpu-noavx|vulkan|cuda|opencl|all (comma-separated)
+  [string]$Devices  = 'cpu,vulkan',     # auto|cpu|cpu-noavx|vulkan|cuda|opencl|all (comma-separated)
   [int]$Jobs        = [int]::Parse($env:NUMBER_OF_PROCESSORS),
   [string]$Compiler = 'auto',     # auto|msvc|mingw
   [switch]$Clean,
@@ -512,6 +512,9 @@ $script:OutOsId = $OutOsId
 $BUILD = Join-Path $ROOT ("build-$arch-$buildOsTag")
 $devs = Resolve-Devices $Devices
 $devs = Filter-DevicesForCompiler $devs $CompilerMode
+if ($CompilerMode -eq 'mingw' -and ($devs -contains 'cpu') -and -not ($devs -contains 'cpu-noavx')) {
+  $devs += 'cpu-noavx'
+}
 $script:AllDevices = $devs
 if ($devs -contains 'cuda') {
   $cudaArchs = Resolve-CudaArchs
