@@ -256,6 +256,29 @@ function Copy-Binary([string]$bdir,[string]$tgt,[string]$outdir) {
   Write-Warning "Could not locate built binary '$tgt' under $bdir"
 }
 
+function Copy-BinaryAs([string]$bdir,[string]$src,[string]$destName,[string]$outdir) {
+  New-Item -ItemType Directory -Force -Path $outdir | Out-Null
+  $exe = "$src.exe"
+  $candidates = @()
+  $candidates += (Join-Path $bdir $exe)
+  $candidates += (Join-Path (Join-Path $bdir 'bin') $exe)
+  $candidates += (Join-Path (Join-Path $bdir 'Release') $exe)
+  $candidates += (Join-Path (Join-Path (Join-Path $bdir 'bin') 'Release') $exe)
+  $candidates += (Join-Path $bdir $src)
+  $candidates += (Join-Path (Join-Path $bdir 'bin') $src)
+  foreach ($c in $candidates) {
+    if (Test-Path $c) {
+      $ext = [System.IO.Path]::GetExtension($c)
+      $dest = Join-Path $outdir ("$destName$ext")
+      Copy-Item $c -Destination $dest -Force
+      Write-Host "Copied $(Split-Path $c -Leaf) -> $dest"
+      return $true
+    }
+  }
+  Write-Warning "Could not locate built binary '$src' under $bdir"
+  return $false
+}
+
 function Get-ProjectOutDir([string]$arch,[string]$device,[string]$project) {
   $osSegment = if ($script:OutOsId) { $script:OutOsId } else { $OS_ID }
   return Join-Path (Join-Path (Join-Path (Join-Path $OUT $arch) $osSegment) $device) $project
@@ -377,38 +400,47 @@ function Build-SD([string]$device,[string]$arch) {
     'opencl' {  $defs += @('-D','GGML_OPENCL=ON','-D','SD_OPENCL=ON') }
     default  { $defs += @('-D','GGML_VULKAN=OFF','-D','GGML_CUDA=OFF','-D','GGML_OPENCL=OFF') }
   }
+  $defs += @('-D','SD_BUILD_SERVER=OFF')
   $defs = Add-MingwCpuAccelGuards -defs $defs -device $device
   $gen = $GeneratorSpec
   Invoke-CMakeConfigure $src $bdir $gen $defs
   if ($device -in @('vulkan','cuda','opencl')) { Assert-BackendEnabled $bdir $device 'stable-diffusion.cpp' }
   $help = Get-AvailableTargets $bdir
   $targets = @()
-  foreach ($t in @('sd-cli','sd-server','sd')) {
-    $pattern = '(?m)(^|\s){0}(\s|$)' -f [regex]::Escape($t)
-    if ($help -match $pattern) { $targets += $t }
+  $sdPattern = '(?m)(^|\s)sd(\s|$)'
+  $cliPattern = '(?m)(^|\s)sd-cli(\s|$)'
+  $hasSd = $help -match $sdPattern
+  $hasCli = $help -match $cliPattern
+  if ($hasSd) {
+    $targets = @('sd')
+  } elseif ($hasCli) {
+    $targets = @('sd-cli')
   }
   if ($targets.Count -eq 0) {
     Invoke-CMakeBuild $bdir @()
-    $targets = @('sd','sd-cli','sd-server')
   } else {
     Invoke-CMakeBuild $bdir $targets
   }
   $out = Get-ProjectOutDir $arch $device 'stable-diffusion.cpp'
-  foreach ($t in $targets) { Copy-Binary $bdir $t $out }
+  $copied = $false
+  if ($hasSd) {
+    $copied = Copy-BinaryAs $bdir 'sd' 'sd' $out
+  }
+  if (-not $copied -and $hasCli) {
+    $copied = Copy-BinaryAs $bdir 'sd-cli' 'sd' $out
+  }
+  if (-not $copied -and -not $hasSd -and -not $hasCli) {
+    $copied = Copy-BinaryAs $bdir 'sd-cli' 'sd' $out
+    if (-not $copied) {
+      $copied = Copy-BinaryAs $bdir 'sd' 'sd' $out
+    }
+  }
   $sdOut = @((Join-Path $out 'sd.exe'), (Join-Path $out 'sd'))
   $haveSd = $false
   foreach ($p in $sdOut) { if (Test-Path $p) { $haveSd = $true; break } }
-  if (-not $haveSd) {
+  if ($haveSd) {
     $cliOut = @((Join-Path $out 'sd-cli.exe'), (Join-Path $out 'sd-cli'))
-    foreach ($p in $cliOut) {
-      if (Test-Path $p) {
-        $ext = [System.IO.Path]::GetExtension($p)
-        $dest = Join-Path $out ("sd$ext")
-        Copy-Item $p -Destination $dest -Force
-        Write-Host "Copied $(Split-Path $p -Leaf) -> $dest"
-        break
-      }
-    }
+    foreach ($p in $cliOut) { if (Test-Path $p) { Remove-Item $p -Force } }
   }
 }
 

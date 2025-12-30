@@ -28,6 +28,7 @@ endif()
 # general
 #option(SD_BUILD_TESTS                "sd: build tests"    ${SD_STANDALONE})
 option(SD_BUILD_EXAMPLES             "sd: build examples" ${SD_STANDALONE})
+option(SD_BUILD_SERVER               "sd: build server example" ${SD_BUILD_EXAMPLES})
 option(SD_CUDA                       "sd: cuda backend" OFF)
 option(SD_HIPBLAS                    "sd: rocm backend" OFF)
 option(SD_METAL                      "sd: metal backend" OFF)
@@ -39,7 +40,6 @@ option(SD_FAST_SOFTMAX               "sd: x1.5 faster softmax, indeterministic (
 option(SD_BUILD_SHARED_LIBS          "sd: build shared libs" OFF)
 option(SD_BUILD_SHARED_GGML_LIB      "sd: build ggml as a separate shared lib" OFF)
 option(SD_USE_SYSTEM_GGML            "sd: use system-installed GGML library" OFF)
-#option(SD_BUILD_SERVER               "sd: build server example"                           ON)
 
 if(SD_CUDA)
     message("-- Use CUDA as backend stable-diffusion")
