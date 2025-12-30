@@ -30,7 +30,8 @@ endif()
 #endif
 #endif
 ```
-    - common/CMakeLists.txt 搜索(${TARGET} PRIVATE ${LLAMA_COMMON_EXTRA_LIBS} PUBLIC llama Threads::Threads) 下面添加
+
+- common/CMakeLists.txt 搜索(${TARGET} PRIVATE ${LLAMA_COMMON_EXTRA_LIBS} PUBLIC llama Threads::Threads) 下面添加
 ```txt
 if (WIN32)
     target_link_libraries(${TARGET} PUBLIC ws2_32)
