@@ -343,7 +343,7 @@ function Build-Llama([string]$device,[string]$arch) {
   Show-Version 'llama.cpp' $src $LLAMA_EXPECT_REF ''
   $bdir = Join-Path (Join-Path $BUILD 'llama.cpp') $device
   if ($Clean) { Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $bdir }
-  $defs = @('-D', 'LLAMA_CURL=OFF', '-D', 'LLAMA_BUILD_TESTS=OFF', '-D', 'LLAMA_BUILD_EXAMPLES=ON', '-D', 'LLAMA_BUILD_SERVER=ON')
+  $defs = @('-D', 'LLAMA_CURL=OFF', '-D', 'LLAMA_OPENSSL=OFF', '-D', 'LLAMA_BUILD_TESTS=OFF', '-D', 'LLAMA_BUILD_EXAMPLES=ON', '-D', 'LLAMA_BUILD_SERVER=ON')
   switch ($device) {
     'vulkan' {  $defs += @('-D','GGML_VULKAN=ON','-D','SD_VULKAN=ON') }
     'cuda'   {  $defs += @('-D','GGML_CUDA=ON','-D','SD_CUDA=ON','-D','GGML_NATIVE=OFF') }
