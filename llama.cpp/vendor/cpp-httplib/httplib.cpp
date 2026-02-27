@@ -1426,8 +1426,6 @@ void stream_line_reader::append(char c) {
 mmap::mmap(const char *path) { open(path); }
 
 mmap::~mmap() { close(); }
-
-
 inline bool mmap::open(const char *path) {
   close();
 
@@ -1475,7 +1473,6 @@ inline bool mmap::open(const char *path) {
     close();
     return false;
   }
-
 
 #if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_APP | WINAPI_PARTITION_SYSTEM) && (_WIN32_WINNT >= _WIN32_WINNT_WIN8)
   addr_ = ::MapViewOfFileFromApp(hMapping_, FILE_MAP_READ, 0, 0);

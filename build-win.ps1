@@ -542,10 +542,10 @@ $buildOsTag = if ($CompilerMode -eq 'mingw') { 'win7' } else { $OS_ID }
 $OutOsId = $buildOsTag
 $script:OutOsId = $OutOsId
 $BUILD = Join-Path $ROOT ("build-$arch-$buildOsTag")
-$devs = Resolve-Devices $Devices
-$devs = Filter-DevicesForCompiler $devs $CompilerMode
+[string[]]$devs = @(Resolve-Devices $Devices)
+$devs = @(Filter-DevicesForCompiler $devs $CompilerMode)
 if ($CompilerMode -eq 'mingw' -and ($devs -contains 'cpu') -and -not ($devs -contains 'cpu-noavx')) {
-  $devs += 'cpu-noavx'
+  $devs += @('cpu-noavx')
 }
 $script:AllDevices = $devs
 if ($devs -contains 'cuda') {
