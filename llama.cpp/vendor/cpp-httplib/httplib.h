@@ -8,29 +8,15 @@
 #ifndef CPPHTTPLIB_HTTPLIB_H
 #define CPPHTTPLIB_HTTPLIB_H
 
-#define CPPHTTPLIB_VERSION "0.34.0"
-#define CPPHTTPLIB_VERSION_NUM "0x002200"
+#define CPPHTTPLIB_VERSION "0.37.1"
+#define CPPHTTPLIB_VERSION_NUM "0x002501"
 
-/*
- * Platform compatibility check
- */
-
-#if defined(_WIN32) && !defined(_WIN64)
-#if defined(_MSC_VER)
-#pragma message(                                                               \
-    "cpp-httplib doesn't support 32-bit Windows. Please use a 64-bit compiler.")
-#else
-#warning                                                                       \
-    "cpp-httplib doesn't support 32-bit Windows. Please use a 64-bit compiler."
+#ifdef _WIN32
+#if defined(_WIN32_WINNT) && _WIN32_WINNT < 0x0A00
+#error                                                                         \
+    "cpp-httplib doesn't support Windows 8 or lower. Please use Windows 10 or later."
 #endif
-#elif defined(__SIZEOF_POINTER__) && __SIZEOF_POINTER__ < 8
-#warning                                                                       \
-    "cpp-httplib doesn't support 32-bit platforms. Please use a 64-bit compiler."
-#elif defined(__SIZEOF_SIZE_T__) && __SIZEOF_SIZE_T__ < 8
-#warning                                                                       \
-    "cpp-httplib doesn't support platforms where size_t is less than 64 bits."
 #endif
-
 
 /*
  * Configuration
@@ -351,14 +337,32 @@ using socket_t = int;
 #include <any>
 #endif
 
+// On macOS with a TLS backend, enable Keychain root certificates by default
+// unless the user explicitly opts out.
+#if defined(__APPLE__) &&                                                      \
+    !defined(CPPHTTPLIB_DISABLE_MACOSX_AUTOMATIC_ROOT_CERTIFICATES) &&         \
+    (defined(CPPHTTPLIB_OPENSSL_SUPPORT) ||                                    \
+     defined(CPPHTTPLIB_MBEDTLS_SUPPORT) ||                                    \
+     defined(CPPHTTPLIB_WOLFSSL_SUPPORT))
+#ifndef CPPHTTPLIB_USE_CERTS_FROM_MACOSX_KEYCHAIN
+#define CPPHTTPLIB_USE_CERTS_FROM_MACOSX_KEYCHAIN
+#endif
+#endif
+
+// On Windows, enable Schannel certificate verification by default
+// unless the user explicitly opts out.
+#if defined(_WIN32) &&                                                         \
+    !defined(CPPHTTPLIB_DISABLE_WINDOWS_AUTOMATIC_ROOT_CERTIFICATES_UPDATE)
+#define CPPHTTPLIB_WINDOWS_AUTOMATIC_ROOT_CERTIFICATES_UPDATE
+#endif
+
 #if defined(CPPHTTPLIB_USE_NON_BLOCKING_GETADDRINFO) ||                        \
     defined(CPPHTTPLIB_USE_CERTS_FROM_MACOSX_KEYCHAIN)
 #if TARGET_OS_MAC
 #include <CFNetwork/CFHost.h>
 #include <CoreFoundation/CoreFoundation.h>
 #endif
-#endif // CPPHTTPLIB_USE_NON_BLOCKING_GETADDRINFO or
-       // CPPHTTPLIB_USE_CERTS_FROM_MACOSX_KEYCHAIN
+#endif
 
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
 #ifdef _WIN32
@@ -376,11 +380,11 @@ using socket_t = int;
 #endif
 #endif // _WIN32
 
-#if defined(CPPHTTPLIB_USE_CERTS_FROM_MACOSX_KEYCHAIN)
+#ifdef CPPHTTPLIB_USE_CERTS_FROM_MACOSX_KEYCHAIN
 #if TARGET_OS_MAC
 #include <Security/Security.h>
 #endif
-#endif // CPPHTTPLIB_USE_NON_BLOCKING_GETADDRINFO
+#endif
 
 #include <openssl/err.h>
 #include <openssl/evp.h>
@@ -424,11 +428,11 @@ using socket_t = int;
 #pragma comment(lib, "crypt32.lib")
 #endif
 #endif // _WIN32
-#if defined(CPPHTTPLIB_USE_CERTS_FROM_MACOSX_KEYCHAIN)
+#ifdef CPPHTTPLIB_USE_CERTS_FROM_MACOSX_KEYCHAIN
 #if TARGET_OS_MAC
 #include <Security/Security.h>
 #endif
-#endif // CPPHTTPLIB_USE_CERTS_FROM_MACOSX_KEYCHAIN
+#endif
 
 // Mbed TLS 3.x API compatibility
 #if MBEDTLS_VERSION_MAJOR >= 3
@@ -467,11 +471,11 @@ using socket_t = int;
 #pragma comment(lib, "crypt32.lib")
 #endif
 #endif // _WIN32
-#if defined(CPPHTTPLIB_USE_CERTS_FROM_MACOSX_KEYCHAIN)
+#ifdef CPPHTTPLIB_USE_CERTS_FROM_MACOSX_KEYCHAIN
 #if TARGET_OS_MAC
 #include <Security/Security.h>
 #endif
-#endif // CPPHTTPLIB_USE_CERTS_FROM_MACOSX_KEYCHAIN
+#endif
 #endif // CPPHTTPLIB_WOLFSSL_SUPPORT
 
 // Define CPPHTTPLIB_SSL_ENABLED if any SSL backend is available
@@ -549,6 +553,14 @@ inline unsigned char to_lower(int c) {
       255,
   };
   return table[(unsigned char)(char)c];
+}
+
+inline std::string to_lower(const std::string &s) {
+  std::string result = s;
+  std::transform(
+      result.begin(), result.end(), result.begin(),
+      [](unsigned char c) { return static_cast<char>(to_lower(c)); });
+  return result;
 }
 
 inline bool equal(const std::string &a, const std::string &b) {
@@ -1835,23 +1847,23 @@ public:
       : res_(std::move(res)), err_(err),
         request_headers_(std::move(request_headers)), ssl_error_(ssl_error) {}
   Result(std::unique_ptr<Response> &&res, Error err, Headers &&request_headers,
-         int ssl_error, unsigned long ssl_backend_error)
+         int ssl_error, uint64_t ssl_backend_error)
       : res_(std::move(res)), err_(err),
         request_headers_(std::move(request_headers)), ssl_error_(ssl_error),
         ssl_backend_error_(ssl_backend_error) {}
 
   int ssl_error() const { return ssl_error_; }
-  unsigned long ssl_backend_error() const { return ssl_backend_error_; }
+  uint64_t ssl_backend_error() const { return ssl_backend_error_; }
 
 private:
   int ssl_error_ = 0;
-  unsigned long ssl_backend_error_ = 0;
+  uint64_t ssl_backend_error_ = 0;
 #endif
 
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
 public:
   [[deprecated("Use ssl_backend_error() instead")]]
-  unsigned long ssl_openssl_error() const {
+  uint64_t ssl_openssl_error() const {
     return ssl_backend_error_;
   }
 #endif
@@ -2321,7 +2333,7 @@ protected:
   bool server_hostname_verification_ = true;
   std::string ca_cert_pem_; // Store CA cert PEM for redirect transfer
   int last_ssl_error_ = 0;
-  unsigned long last_backend_error_ = 0;
+  uint64_t last_backend_error_ = 0;
 #endif
 
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
@@ -2551,8 +2563,7 @@ public:
 
   tls::ctx_t tls_context() const;
 
-#if defined(_WIN32) &&                                                         \
-    !defined(CPPHTTPLIB_DISABLE_WINDOWS_AUTOMATIC_ROOT_CERTIFICATES_UPDATE)
+#ifdef CPPHTTPLIB_WINDOWS_AUTOMATIC_ROOT_CERTIFICATES_UPDATE
   void enable_windows_certificate_verification(bool enabled);
 #endif
 
@@ -2673,8 +2684,7 @@ public:
 
   tls::ctx_t tls_context() const { return ctx_; }
 
-#if defined(_WIN32) &&                                                         \
-    !defined(CPPHTTPLIB_DISABLE_WINDOWS_AUTOMATIC_ROOT_CERTIFICATES_UPDATE)
+#ifdef CPPHTTPLIB_WINDOWS_AUTOMATIC_ROOT_CERTIFICATES_UPDATE
   void enable_windows_certificate_verification(bool enabled);
 #endif
 
@@ -2706,8 +2716,7 @@ private:
 
   std::function<SSLVerifierResponse(tls::session_t)> session_verifier_;
 
-#if defined(_WIN32) &&                                                         \
-    !defined(CPPHTTPLIB_DISABLE_WINDOWS_AUTOMATIC_ROOT_CERTIFICATES_UPDATE)
+#ifdef CPPHTTPLIB_WINDOWS_AUTOMATIC_ROOT_CERTIFICATES_UPDATE
   bool enable_windows_cert_verification_ = true;
 #endif
 
@@ -2768,7 +2777,7 @@ inline size_t get_header_value_u64(const Headers &headers,
   std::advance(it, static_cast<ssize_t>(id));
   if (it != rng.second) {
     if (is_numeric(it->second)) {
-      return std::strtoull(it->second.data(), nullptr, 10);
+      return static_cast<size_t>(std::strtoull(it->second.data(), nullptr, 10));
     } else {
       is_invalid_value = true;
     }
