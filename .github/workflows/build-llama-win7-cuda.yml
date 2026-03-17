@@ -69,6 +69,26 @@ jobs:
             Write-Host 'build directory not found: build-x86_64-win7\llama.cpp\cuda'
           }
 
+      - name: Debug CMake logs
+        if: always()
+        shell: pwsh
+        run: |
+          $bdir = 'build-x86_64-win7\llama.cpp\cuda'
+          $err = Join-Path $bdir 'CMakeFiles\CMakeError.log'
+          $out = Join-Path $bdir 'CMakeFiles\CMakeOutput.log'
+          if (Test-Path $err) {
+            Write-Host '---- CMakeError.log (tail 200) ----'
+            Get-Content $err -Tail 200
+          } else {
+            Write-Host "No CMakeError.log at $err"
+          }
+          if (Test-Path $out) {
+            Write-Host '---- CMakeOutput.log (tail 120) ----'
+            Get-Content $out -Tail 120
+          } else {
+            Write-Host "No CMakeOutput.log at $out"
+          }
+
       - name: Verify binaries
         shell: pwsh
         run: |

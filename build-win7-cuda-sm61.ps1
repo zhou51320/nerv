@@ -227,18 +227,13 @@ if ($Clean) {
   Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $bdir
 }
 
-$compileDef = if ($isVsGen -or $isNinja) { '/D_WIN32_WINNT=0x0601' } else { '-D_WIN32_WINNT=0x0601' }
-
 $defs = @(
   '-DBUILD_SHARED_LIBS=OFF',
   '-DCMAKE_POSITION_INDEPENDENT_CODE=ON',
   '-DCMAKE_BUILD_TYPE=Release',
   '-DCMAKE_CUDA_FLAGS:STRING=-allow-unsupported-compiler',
   "-DCMAKE_CUDA_ARCHITECTURES=$CudaArch",
-  "-DCMAKE_C_FLAGS:STRING=$compileDef",
-  "-DCMAKE_CXX_FLAGS:STRING=$compileDef",
   '-DCMAKE_OBJECT_PATH_MAX=196',
-  '-DGGML_WIN_VER=0x601',
   '-DGGML_AVX512=OFF',
   '-DGGML_CUDA=ON',
   '-DGGML_NATIVE=OFF',
@@ -250,6 +245,15 @@ $defs = @(
   '-DLLAMA_BUILD_EXAMPLES=OFF',
   '-DLLAMA_BUILD_SERVER=ON'
 )
+
+# Win7-targeting compile defs are only viable in the MinGW lane in this repo.
+if ($isMingw) {
+  $defs += @(
+    '-DGGML_WIN_VER=0x601',
+    '-DCMAKE_C_FLAGS:STRING=-D_WIN32_WINNT=0x0601',
+    '-DCMAKE_CXX_FLAGS:STRING=-D_WIN32_WINNT=0x0601'
+  )
+}
 
 New-Item -ItemType Directory -Force -Path $bdir | Out-Null
 
