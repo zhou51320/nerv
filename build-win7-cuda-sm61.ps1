@@ -14,10 +14,38 @@ function Test-Cmd([string]$name) {
   return [bool](Get-Command $name -ErrorAction SilentlyContinue)
 }
 
+function Show-CMakeDiagnosticLogs([string[]]$cmdArgs) {
+  $bdir = $null
+  for ($i = 0; $i -lt $cmdArgs.Count; $i++) {
+    if ($cmdArgs[$i] -eq '-B' -and ($i + 1) -lt $cmdArgs.Count) {
+      $bdir = $cmdArgs[$i + 1]
+      break
+    }
+  }
+  if (-not $bdir -and $cmdArgs.Count -ge 2 -and $cmdArgs[0] -eq '--build') {
+    $bdir = $cmdArgs[1]
+  }
+  if (-not $bdir) { return }
+
+  $errLog = Join-Path $bdir 'CMakeFiles\CMakeError.log'
+  $outLog = Join-Path $bdir 'CMakeFiles\CMakeOutput.log'
+  if (Test-Path $errLog) {
+    Write-Warning "---- CMakeError.log (tail) ----"
+    Get-Content -LiteralPath $errLog -Tail 200 | ForEach-Object { Write-Warning $_ }
+  }
+  if (Test-Path $outLog) {
+    Write-Host "---- CMakeOutput.log (tail) ----"
+    Get-Content -LiteralPath $outLog -Tail 120 | ForEach-Object { Write-Host $_ }
+  }
+}
+
 function Invoke-Native([string]$exe,[string[]]$cmdArgs) {
   Write-Host "==> Running: $exe $($cmdArgs -join ' ')"
   & $exe @cmdArgs
   if ($LASTEXITCODE -ne 0) {
+    if ($exe -eq 'cmake') {
+      Show-CMakeDiagnosticLogs $cmdArgs
+    }
     throw "$exe failed with exit code $LASTEXITCODE. Args: $($cmdArgs -join ' ')"
   }
 }
@@ -156,8 +184,7 @@ if ($Clean) {
   Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $bdir
 }
 
-$compileFlags = '-fopenmp -mthreads -D_WIN32_WINNT=0x0601'
-$linkFlags = '-static -static-libgcc -static-libstdc++ -fopenmp -Wl,-s -Wl,--gc-sections -mthreads -lpthread'
+$compileDef = '-D_WIN32_WINNT=0x0601'
 
 $defs = @(
   '-DBUILD_SHARED_LIBS=OFF',
@@ -165,11 +192,8 @@ $defs = @(
   '-DCMAKE_BUILD_TYPE=Release',
   '-DCMAKE_CUDA_FLAGS:STRING=-allow-unsupported-compiler',
   "-DCMAKE_CUDA_ARCHITECTURES=$CudaArch",
-  "-DCMAKE_C_FLAGS:STRING=$compileFlags",
-  "-DCMAKE_CXX_FLAGS:STRING=$compileFlags",
-  "-DCMAKE_EXE_LINKER_FLAGS:STRING=$linkFlags",
-  "-DCMAKE_SHARED_LINKER_FLAGS:STRING=$linkFlags",
-  "-DCMAKE_MODULE_LINKER_FLAGS:STRING=$linkFlags",
+  "-DCMAKE_C_FLAGS:STRING=$compileDef",
+  "-DCMAKE_CXX_FLAGS:STRING=$compileDef",
   '-DCMAKE_OBJECT_PATH_MAX=196',
   '-DGGML_WIN_VER=0x601',
   '-DGGML_AVX512=OFF',

@@ -1,10 +1,7 @@
 name: Tests
 
 on:
-  push:
-    branches:
-      - main
-  pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -15,7 +12,6 @@ env:
 jobs:
   build-win7:
     name: Build Win7 (MinGW)
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: windows-2022
     steps:
       - name: Checkout
@@ -118,7 +114,6 @@ jobs:
 
   build-win:
     name: Build Windows (MSVC)
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: windows-2022
     steps:
       - name: Checkout
@@ -214,7 +209,6 @@ jobs:
 
   build-linux-x86:
     name: Build Linux x86
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout
@@ -303,7 +297,6 @@ jobs:
 
   build-linux-arm:
     name: Build Linux ARM64
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout
@@ -403,7 +396,6 @@ jobs:
       - build-win
       - build-linux-x86
       - build-linux-arm
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-22.04
     steps:
       - name: Download artifacts
