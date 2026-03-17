@@ -159,6 +159,39 @@ function Copy-BinaryByAliases([string]$bdir,[string[]]$names,[string]$destName,[
   return $true
 }
 
+function Find-FilePath([string]$bdir,[string]$fileName) {
+  $candidates = @(
+    (Join-Path $bdir $fileName),
+    (Join-Path (Join-Path $bdir 'bin') $fileName),
+    (Join-Path (Join-Path $bdir 'Release') $fileName),
+    (Join-Path (Join-Path (Join-Path $bdir 'bin') 'Release') $fileName)
+  )
+  foreach ($p in $candidates) {
+    if (Test-Path $p) { return $p }
+  }
+
+  $hit = Get-ChildItem -Recurse -File -Path $bdir -Filter $fileName -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($hit) { return $hit.FullName }
+  return $null
+}
+
+function Copy-RequiredDlls([string]$bdir,[string]$outdir,[string[]]$dllNames) {
+  New-Item -ItemType Directory -Force -Path $outdir | Out-Null
+  $missing = @()
+  foreach ($dll in $dllNames) {
+    $src = Find-FilePath $bdir $dll
+    if (-not $src) {
+      $missing += $dll
+      continue
+    }
+    Copy-Item $src -Destination (Join-Path $outdir $dll) -Force
+    Write-Host "Copied $(Split-Path $src -Leaf) -> $outdir"
+  }
+  if ($missing.Count -gt 0) {
+    throw "Missing required runtime DLL(s) in build output: $($missing -join ', ')"
+  }
+}
+
 function Show-KeyCacheValues([string]$bdir) {
   $cache = Join-Path $bdir 'CMakeCache.txt'
   if (-not (Test-Path $cache)) {
@@ -306,5 +339,13 @@ if (-not $okServer -or -not $okQuant) {
   }
   throw "Build completed but required binaries are missing under $outDir"
 }
+
+$requiredProjectDlls = @(
+  'mtmd.dll',
+  'llama.dll',
+  'ggml.dll',
+  'ggml-base.dll'
+)
+Copy-RequiredDlls $bdir $outDir $requiredProjectDlls
 
 Write-Host "Done. Artifacts under: $outDir"

@@ -152,6 +152,10 @@ jobs:
           if (-not (Test-Path $out)) { throw "Output directory missing: $out" }
           if (-not (Test-Path (Join-Path $out 'llama-server.exe'))) { throw 'llama-server.exe missing' }
           if (-not (Test-Path (Join-Path $out 'llama-quantize.exe'))) { throw 'llama-quantize.exe missing' }
+          if (-not (Test-Path (Join-Path $out 'mtmd.dll'))) { throw 'mtmd.dll missing' }
+          if (-not (Test-Path (Join-Path $out 'llama.dll'))) { throw 'llama.dll missing' }
+          if (-not (Test-Path (Join-Path $out 'ggml.dll'))) { throw 'ggml.dll missing' }
+          if (-not (Test-Path (Join-Path $out 'ggml-base.dll'))) { throw 'ggml-base.dll missing' }
           if (-not (Test-Path (Join-Path $out 'cudart64_110.dll'))) { throw 'cudart64_110.dll missing' }
           if (-not (Test-Path (Join-Path $out 'cublas64_11.dll'))) { throw 'cublas64_11.dll missing' }
           if (-not (Test-Path (Join-Path $out 'cublasLt64_11.dll'))) { throw 'cublasLt64_11.dll missing' }
