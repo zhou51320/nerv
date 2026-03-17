@@ -43,6 +43,20 @@ jobs:
             (Join-Path $cudaPath 'extras\CUPTI\lib64') | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           }
 
+      - name: Patch CUDA host_config for MSVC compatibility
+        shell: pwsh
+        run: |
+          $hostCfg = Join-Path $env:CUDA_PATH 'include\crt\host_config.h'
+          if (-not (Test-Path $hostCfg)) { throw "host_config.h not found at $hostCfg" }
+          $raw = Get-Content -Raw -LiteralPath $hostCfg
+          $patched = $raw -replace '_MSC_VER\s*>=\s*1940', '_MSC_VER >= 1950'
+          if ($patched -ne $raw) {
+            Set-Content -LiteralPath $hostCfg -Value $patched -Encoding UTF8
+            Write-Host "Patched MSVC upper-bound check in $hostCfg"
+          } else {
+            Write-Host "No MSVC upper-bound pattern matched in $hostCfg; continuing"
+          }
+
       - name: Setup MSVC environment
         uses: ilammy/msvc-dev-cmd@v1
         with:

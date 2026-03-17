@@ -230,7 +230,8 @@ if ($Clean) {
 
 $defs = @(
   '-DCMAKE_BUILD_TYPE=Release',
-  '-DCMAKE_CUDA_FLAGS:STRING=-allow-unsupported-compiler',
+  '-DCMAKE_CUDA_FLAGS_INIT:STRING=--allow-unsupported-compiler',
+  '-DCMAKE_CUDA_FLAGS:STRING=--allow-unsupported-compiler',
   "-DCMAKE_CUDA_COMPILER:FILEPATH=$nvccPath",
   '-DCMAKE_CUDA_HOST_COMPILER:FILEPATH=cl.exe',
   "-DCMAKE_CUDA_ARCHITECTURES=$CudaArch",
