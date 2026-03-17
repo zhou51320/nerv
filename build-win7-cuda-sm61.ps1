@@ -199,6 +199,7 @@ if (-not (Test-Path (Join-Path $src 'CMakeLists.txt'))) {
 
 if (-not (Test-Cmd 'cmake')) { throw "cmake not found in PATH." }
 if (-not (Test-Cmd 'nvcc')) { throw "nvcc not found in PATH. Install CUDA toolkit and open a shell with CUDA env." }
+$nvccPath = (Get-Command nvcc -ErrorAction Stop).Source
 
 $resolvedGenerator = Resolve-Generator $Generator
 $isMingw = $resolvedGenerator -like 'MinGW*'
@@ -228,23 +229,27 @@ if ($Clean) {
 }
 
 $defs = @(
-  '-DBUILD_SHARED_LIBS=OFF',
-  '-DCMAKE_POSITION_INDEPENDENT_CODE=ON',
   '-DCMAKE_BUILD_TYPE=Release',
   '-DCMAKE_CUDA_FLAGS:STRING=-allow-unsupported-compiler',
+  "-DCMAKE_CUDA_COMPILER:FILEPATH=$nvccPath",
   "-DCMAKE_CUDA_ARCHITECTURES=$CudaArch",
-  '-DCMAKE_OBJECT_PATH_MAX=196',
-  '-DGGML_AVX512=OFF',
   '-DGGML_CUDA=ON',
   '-DGGML_NATIVE=OFF',
   '-DLLAMA_BUILD_COMMON=ON',
   '-DLLAMA_BUILD_TOOLS=ON',
-  '-DLLAMA_CURL=OFF',
-  '-DLLAMA_OPENSSL=OFF',
   '-DLLAMA_BUILD_TESTS=OFF',
   '-DLLAMA_BUILD_EXAMPLES=OFF',
-  '-DLLAMA_BUILD_SERVER=ON'
+  '-DLLAMA_BUILD_SERVER=ON',
+  '-DLLAMA_CURL=OFF',
+  '-DLLAMA_OPENSSL=OFF'
 )
+
+if ($env:CUDAToolkit_ROOT) {
+  $defs += "-DCUDAToolkit_ROOT:PATH=$env:CUDAToolkit_ROOT"
+}
+if ($env:CUDA_PATH) {
+  $defs += "-DCUDA_TOOLKIT_ROOT_DIR:PATH=$env:CUDA_PATH"
+}
 
 # Win7-targeting compile defs are only viable in the MinGW lane in this repo.
 if ($isMingw) {
