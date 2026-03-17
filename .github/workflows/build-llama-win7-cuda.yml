@@ -63,6 +63,18 @@ jobs:
         run: |
           .\build-win7-cuda-sm61.ps1 -Clean -CudaArch 61
 
+      - name: Debug build outputs
+        if: always()
+        shell: pwsh
+        run: |
+          if (Test-Path 'build-x86_64-win7\llama.cpp\cuda') {
+            Get-ChildItem -Recurse -File -Path 'build-x86_64-win7\llama.cpp\cuda' -Filter *.exe | ForEach-Object {
+              Write-Host $_.FullName
+            }
+          } else {
+            Write-Host 'build directory not found: build-x86_64-win7\llama.cpp\cuda'
+          }
+
       - name: Verify binaries
         shell: pwsh
         run: |
