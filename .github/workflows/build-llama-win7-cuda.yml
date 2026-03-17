@@ -108,9 +108,7 @@ jobs:
         run: |
           $out = 'EVA_BACKEND\x86_64\win7\cuda\llama.cpp'
           if (-not (Test-Path $out)) { throw "Output directory missing: $out" }
-
-          $cudaBin = Join-Path $env:CUDA_PATH 'bin'
-          if (-not (Test-Path $cudaBin)) { throw "CUDA bin not found: $cudaBin" }
+          if (-not (Test-Path $env:CUDA_PATH)) { throw "CUDA_PATH missing: $env:CUDA_PATH" }
 
           $requiredCudaDlls = @(
             'cudart64_110.dll',
@@ -119,12 +117,11 @@ jobs:
           )
 
           foreach ($dll in $requiredCudaDlls) {
-            $src = Join-Path $cudaBin $dll
-            if (-not (Test-Path $src)) {
-              throw "Required CUDA runtime DLL missing: $src"
-            }
+            $src = Get-ChildItem -Path $env:CUDA_PATH -Recurse -File -Filter $dll -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $src) { throw "Required CUDA runtime DLL missing under CUDA_PATH: $dll" }
+            $src = $src.FullName
             Copy-Item $src -Destination $out -Force
-            Write-Host "Bundled $dll"
+            Write-Host "Bundled $dll from $src"
           }
 
           $optionalVcDlls = @(
