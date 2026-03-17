@@ -61,7 +61,7 @@ jobs:
       - name: Build llama.cpp Win7 CUDA sm_61
         shell: pwsh
         run: |
-          powershell -NoProfile -ExecutionPolicy Bypass -File .\build-win7-cuda-sm61.ps1 -Clean -CudaArch 61
+          .\build-win7-cuda-sm61.ps1 -Clean -CudaArch 61
 
       - name: Verify binaries
         shell: pwsh
