@@ -1,0 +1,85 @@
+name: Build Llama Win7 CUDA (sm_61)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/build-llama-win7-cuda.yml'
+      - '.github/actions/windows-setup-cuda/**'
+      - 'build-win7-cuda-sm61.ps1'
+      - 'llama.cpp/**'
+
+permissions:
+  contents: read
+
+jobs:
+  build-llama-win7-cuda:
+    name: Build llama.cpp (Win7 + CUDA sm_61)
+    runs-on: windows-2022
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup CUDA Toolkit
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: '11.7'
+
+      - name: Configure CUDA environment
+        shell: pwsh
+        run: |
+          $cudaPath = $env:CUDA_PATH
+          if (-not $cudaPath) { throw "CUDA_PATH not set after CUDA installation." }
+          if (-not (Test-Path $cudaPath)) { throw "CUDA path '$cudaPath' not found." }
+          "CUDAToolkit_ROOT=$cudaPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          if (Test-Path (Join-Path $cudaPath 'bin')) {
+            (Join-Path $cudaPath 'bin') | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          }
+          if (Test-Path (Join-Path $cudaPath 'extras\CUPTI\lib64')) {
+            (Join-Path $cudaPath 'extras\CUPTI\lib64') | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          }
+
+      - name: Setup MSYS2 toolchain
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            base-devel
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-cmake
+
+      - name: Add MinGW to PATH
+        shell: pwsh
+        run: |
+          "C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Build llama.cpp Win7 CUDA sm_61
+        shell: pwsh
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\build-win7-cuda-sm61.ps1 -Clean -CudaArch 61
+
+      - name: Verify binaries
+        shell: pwsh
+        run: |
+          $out = 'EVA_BACKEND\x86_64\win7\cuda\llama.cpp'
+          if (-not (Test-Path $out)) { throw "Output directory missing: $out" }
+          if (-not (Test-Path (Join-Path $out 'llama-server.exe'))) { throw 'llama-server.exe missing' }
+          if (-not (Test-Path (Join-Path $out 'llama-quantize.exe'))) { throw 'llama-quantize.exe missing' }
+
+      - name: Package artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          Compress-Archive -Path 'EVA_BACKEND\x86_64\win7\cuda\llama.cpp' -DestinationPath 'artifacts/llama-win7-cuda-sm61.zip' -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-win7-cuda-sm61
+          path: artifacts/llama-win7-cuda-sm61.zip
+          if-no-files-found: error
