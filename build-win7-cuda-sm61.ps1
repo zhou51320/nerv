@@ -7,7 +7,7 @@ Param(
 
 $ErrorActionPreference = 'Stop'
 if ($PSVersionTable.PSVersion.Major -ge 7) {
-  $PSNativeCommandUseErrorActionPreference = $true
+  $PSNativeCommandUseErrorActionPreference = $false
 }
 
 function Test-Cmd([string]$name) {
@@ -15,6 +15,7 @@ function Test-Cmd([string]$name) {
 }
 
 function Invoke-Native([string]$exe,[string[]]$cmdArgs) {
+  Write-Host "==> Running: $exe $($cmdArgs -join ' ')"
   & $exe @cmdArgs
   if ($LASTEXITCODE -ne 0) {
     throw "$exe failed with exit code $LASTEXITCODE. Args: $($cmdArgs -join ' ')"
