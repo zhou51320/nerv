@@ -48,10 +48,14 @@ jobs:
         with:
           arch: x64
 
+      - name: Install Ninja
+        shell: pwsh
+        run: choco install ninja --no-progress -y
+
       - name: Build llama.cpp Win7 CUDA sm_61
         shell: pwsh
         run: |
-          .\build-win7-cuda-sm61.ps1 -Clean -CudaArch 61 -Generator "Visual Studio 17 2022" -Platform x64
+          .\build-win7-cuda-sm61.ps1 -Clean -CudaArch 61 -Generator "Ninja"
 
       - name: Debug build outputs
         if: always()

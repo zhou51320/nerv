@@ -43,18 +43,29 @@ function Show-CMakeDiagnosticLogs([string[]]$cmdArgs) {
 
 function Invoke-Native([string]$exe,[string[]]$cmdArgs) {
   Write-Host "==> Running: $exe $($cmdArgs -join ' ')"
-  & $exe @cmdArgs
-  if ($LASTEXITCODE -ne 0) {
+  $output = & $exe @cmdArgs 2>&1
+  $exitCode = $LASTEXITCODE
+  if ($output) {
+    $output | ForEach-Object { Write-Host $_ }
+  }
+  if ($exitCode -ne 0) {
     if ($exe -eq 'cmake') {
       Show-CMakeDiagnosticLogs $cmdArgs
+      if ($output) {
+        Write-Warning "---- CMake command output (tail) ----"
+        $output | Select-Object -Last 120 | ForEach-Object { Write-Warning $_ }
+      }
     }
-    throw "$exe failed with exit code $LASTEXITCODE. Args: $($cmdArgs -join ' ')"
+    throw "$exe failed with exit code $exitCode. Args: $($cmdArgs -join ' ')"
   }
 }
 
 function Resolve-Generator([string]$requested) {
   if ($requested -and $requested -ne 'auto') {
     return $requested
+  }
+  if ((Test-Cmd 'ninja') -and (Test-Cmd 'cl')) {
+    return 'Ninja'
   }
   if (Test-Cmd 'cl') {
     return 'Visual Studio 17 2022'
@@ -192,6 +203,7 @@ if (-not (Test-Cmd 'nvcc')) { throw "nvcc not found in PATH. Install CUDA toolki
 $resolvedGenerator = Resolve-Generator $Generator
 $isMingw = $resolvedGenerator -like 'MinGW*'
 $isVsGen = $resolvedGenerator -like 'Visual Studio*'
+$isNinja = $resolvedGenerator -eq 'Ninja'
 
 if ($isMingw) {
   if (-not (Test-Cmd 'gcc')) { throw "gcc not found in PATH. MinGW GCC >= 12 is recommended." }
@@ -204,6 +216,10 @@ if ($isMingw) {
 if ($isVsGen -and -not (Test-Cmd 'cl')) {
   throw "MSVC generator selected but 'cl' was not found. Run in a VS Developer Command Prompt or add ilammy/msvc-dev-cmd in GitHub Actions."
 }
+if ($isNinja) {
+  if (-not (Test-Cmd 'ninja')) { throw "Ninja generator selected but 'ninja' was not found in PATH." }
+  if (-not (Test-Cmd 'cl')) { throw "Ninja + CUDA on Windows requires MSVC host compiler. 'cl' not found." }
+}
 
 $buildRoot = Join-Path $ROOT ("build-$arch-win7")
 $bdir = Join-Path (Join-Path $buildRoot 'llama.cpp') 'cuda'
@@ -211,7 +227,7 @@ if ($Clean) {
   Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $bdir
 }
 
-$compileDef = if ($isVsGen) { '/D_WIN32_WINNT=0x0601' } else { '-D_WIN32_WINNT=0x0601' }
+$compileDef = if ($isVsGen -or $isNinja) { '/D_WIN32_WINNT=0x0601' } else { '-D_WIN32_WINNT=0x0601' }
 
 $defs = @(
   '-DBUILD_SHARED_LIBS=OFF',
