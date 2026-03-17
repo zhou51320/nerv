@@ -6,9 +6,19 @@ Param(
 )
 
 $ErrorActionPreference = 'Stop'
+if ($PSVersionTable.PSVersion.Major -ge 7) {
+  $PSNativeCommandUseErrorActionPreference = $true
+}
 
 function Test-Cmd([string]$name) {
   return [bool](Get-Command $name -ErrorAction SilentlyContinue)
+}
+
+function Invoke-Native([string]$exe,[string[]]$args) {
+  & $exe @args
+  if ($LASTEXITCODE -ne 0) {
+    throw "$exe failed with exit code $LASTEXITCODE. Args: $($args -join ' ')"
+  }
 }
 
 function Resolve-Arch {
@@ -56,10 +66,11 @@ function Copy-Binary([string]$bdir,[string]$name,[string]$outdir) {
     if (Test-Path $c) {
       Copy-Item $c -Destination $outdir -Force
       Write-Host "Copied $(Split-Path $c -Leaf) -> $outdir"
-      return
+      return $true
     }
   }
   Write-Warning "Could not locate built binary '$name' under $bdir"
+  return $false
 }
 
 $ROOT = (Get-Location).Path
@@ -91,33 +102,33 @@ $compileFlags = '-fopenmp -mthreads -D_WIN32_WINNT=0x0601'
 $linkFlags = '-static -static-libgcc -static-libstdc++ -fopenmp -Wl,-s -Wl,--gc-sections -mthreads -lpthread'
 
 $defs = @(
-  '-D', 'BUILD_SHARED_LIBS=OFF',
-  '-D', 'CMAKE_POSITION_INDEPENDENT_CODE=ON',
-  '-D', 'CMAKE_BUILD_TYPE=Release',
-  '-D', 'CMAKE_CUDA_FLAGS:STRING=-allow-unsupported-compiler',
-  '-D', 'CMAKE_CUDA_ARCHITECTURES=' + $CudaArch,
-  '-D', 'CMAKE_C_FLAGS:STRING=' + $compileFlags,
-  '-D', 'CMAKE_CXX_FLAGS:STRING=' + $compileFlags,
-  '-D', 'CMAKE_EXE_LINKER_FLAGS:STRING=' + $linkFlags,
-  '-D', 'CMAKE_SHARED_LINKER_FLAGS:STRING=' + $linkFlags,
-  '-D', 'CMAKE_MODULE_LINKER_FLAGS:STRING=' + $linkFlags,
-  '-D', 'CMAKE_OBJECT_PATH_MAX=196',
-  '-D', 'GGML_WIN_VER=0x601',
-  '-D', 'GGML_AVX512=OFF',
-  '-D', 'GGML_CUDA=ON',
-  '-D', 'GGML_NATIVE=OFF',
-  '-D', 'LLAMA_CURL=OFF',
-  '-D', 'LLAMA_OPENSSL=OFF',
-  '-D', 'LLAMA_BUILD_TESTS=OFF',
-  '-D', 'LLAMA_BUILD_EXAMPLES=ON',
-  '-D', 'LLAMA_BUILD_SERVER=ON'
+  '-DBUILD_SHARED_LIBS=OFF',
+  '-DCMAKE_POSITION_INDEPENDENT_CODE=ON',
+  '-DCMAKE_BUILD_TYPE=Release',
+  '-DCMAKE_CUDA_FLAGS:STRING=-allow-unsupported-compiler',
+  "-DCMAKE_CUDA_ARCHITECTURES=$CudaArch",
+  "-DCMAKE_C_FLAGS:STRING=$compileFlags",
+  "-DCMAKE_CXX_FLAGS:STRING=$compileFlags",
+  "-DCMAKE_EXE_LINKER_FLAGS:STRING=$linkFlags",
+  "-DCMAKE_SHARED_LINKER_FLAGS:STRING=$linkFlags",
+  "-DCMAKE_MODULE_LINKER_FLAGS:STRING=$linkFlags",
+  '-DCMAKE_OBJECT_PATH_MAX=196',
+  '-DGGML_WIN_VER=0x601',
+  '-DGGML_AVX512=OFF',
+  '-DGGML_CUDA=ON',
+  '-DGGML_NATIVE=OFF',
+  '-DLLAMA_CURL=OFF',
+  '-DLLAMA_OPENSSL=OFF',
+  '-DLLAMA_BUILD_TESTS=OFF',
+  '-DLLAMA_BUILD_EXAMPLES=ON',
+  '-DLLAMA_BUILD_SERVER=ON'
 )
 
 New-Item -ItemType Directory -Force -Path $bdir | Out-Null
 
 $configureArgs = @('-S', $src, '-B', $bdir, '-G', 'MinGW Makefiles') + $defs
 Write-Host "==> ARCH=$arch OUT_OS=win7 DEVICE=cuda PROJECT=llama.cpp CMAKE_CUDA_ARCHITECTURES=$CudaArch BUILD_DIR=$bdir"
-& cmake @configureArgs
+Invoke-Native 'cmake' $configureArgs
 
 $helpText = ''
 try {
@@ -134,10 +145,13 @@ foreach ($t in @('llama-server','llama-quantize')) {
 $buildArgs = @('--build', $bdir, '--config', 'Release')
 if ($Jobs -gt 0) { $buildArgs += @('--parallel', "$Jobs") }
 if ($targets.Count -gt 0) { $buildArgs += @('--target'); $buildArgs += $targets }
-& cmake @buildArgs
+Invoke-Native 'cmake' $buildArgs
 
 $outDir = Join-Path (Join-Path (Join-Path (Join-Path $OUT $arch) 'win7') 'cuda') 'llama.cpp'
-Copy-Binary $bdir 'llama-server' $outDir
-Copy-Binary $bdir 'llama-quantize' $outDir
+$okServer = Copy-Binary $bdir 'llama-server' $outDir
+$okQuant  = Copy-Binary $bdir 'llama-quantize' $outDir
+if (-not $okServer -or -not $okQuant) {
+  throw "Build completed but required binaries are missing under $outDir"
+}
 
 Write-Host "Done. Artifacts under: $outDir"
