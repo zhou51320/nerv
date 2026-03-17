@@ -43,25 +43,15 @@ jobs:
             (Join-Path $cudaPath 'extras\CUPTI\lib64') | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           }
 
-      - name: Setup MSYS2 toolchain
-        uses: msys2/setup-msys2@v2
+      - name: Setup MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
         with:
-          msystem: MINGW64
-          update: true
-          install: >-
-            base-devel
-            mingw-w64-x86_64-toolchain
-            mingw-w64-x86_64-cmake
-
-      - name: Add MinGW to PATH
-        shell: pwsh
-        run: |
-          "C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          arch: x64
 
       - name: Build llama.cpp Win7 CUDA sm_61
         shell: pwsh
         run: |
-          .\build-win7-cuda-sm61.ps1 -Clean -CudaArch 61
+          .\build-win7-cuda-sm61.ps1 -Clean -CudaArch 61 -Generator "Visual Studio 17 2022" -Platform x64
 
       - name: Debug build outputs
         if: always()

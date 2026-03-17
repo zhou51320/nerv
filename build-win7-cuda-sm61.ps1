@@ -2,7 +2,9 @@ Param(
   [int]$Jobs        = [int]::Parse($env:NUMBER_OF_PROCESSORS),
   [switch]$Clean,
   [string]$LlamaSrc = '',
-  [string]$CudaArch = '61'
+  [string]$CudaArch = '61',
+  [string]$Generator = 'auto',
+  [string]$Platform = 'x64'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -48,6 +50,19 @@ function Invoke-Native([string]$exe,[string[]]$cmdArgs) {
     }
     throw "$exe failed with exit code $LASTEXITCODE. Args: $($cmdArgs -join ' ')"
   }
+}
+
+function Resolve-Generator([string]$requested) {
+  if ($requested -and $requested -ne 'auto') {
+    return $requested
+  }
+  if (Test-Cmd 'cl') {
+    return 'Visual Studio 17 2022'
+  }
+  if ((Test-Cmd 'gcc') -and ((Test-Cmd 'mingw32-make') -or (Test-Cmd 'make'))) {
+    return 'MinGW Makefiles'
+  }
+  throw "No suitable toolchain found. Need either MSVC (cl) or MinGW (gcc + make)."
 }
 
 function Resolve-Arch {
@@ -173,9 +188,21 @@ if (-not (Test-Path (Join-Path $src 'CMakeLists.txt'))) {
 
 if (-not (Test-Cmd 'cmake')) { throw "cmake not found in PATH." }
 if (-not (Test-Cmd 'nvcc')) { throw "nvcc not found in PATH. Install CUDA toolkit and open a shell with CUDA env." }
-if (-not (Test-Cmd 'gcc')) { throw "gcc not found in PATH. MinGW GCC >= 12 is recommended for Win7 builds." }
-if (-not (Test-Cmd 'mingw32-make') -and -not (Test-Cmd 'make')) {
-  throw "mingw32-make/make not found in PATH. Install MinGW make tools."
+
+$resolvedGenerator = Resolve-Generator $Generator
+$isMingw = $resolvedGenerator -like 'MinGW*'
+$isVsGen = $resolvedGenerator -like 'Visual Studio*'
+
+if ($isMingw) {
+  if (-not (Test-Cmd 'gcc')) { throw "gcc not found in PATH. MinGW GCC >= 12 is recommended." }
+  if (-not (Test-Cmd 'mingw32-make') -and -not (Test-Cmd 'make')) {
+    throw "mingw32-make/make not found in PATH. Install MinGW make tools."
+  }
+  throw "CUDA + MinGW on Windows is not supported reliably by nvcc. Use MSVC generator (e.g. -Generator 'Visual Studio 17 2022')."
+}
+
+if ($isVsGen -and -not (Test-Cmd 'cl')) {
+  throw "MSVC generator selected but 'cl' was not found. Run in a VS Developer Command Prompt or add ilammy/msvc-dev-cmd in GitHub Actions."
 }
 
 $buildRoot = Join-Path $ROOT ("build-$arch-win7")
@@ -184,7 +211,7 @@ if ($Clean) {
   Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $bdir
 }
 
-$compileDef = '-D_WIN32_WINNT=0x0601'
+$compileDef = if ($isVsGen) { '/D_WIN32_WINNT=0x0601' } else { '-D_WIN32_WINNT=0x0601' }
 
 $defs = @(
   '-DBUILD_SHARED_LIBS=OFF',
@@ -210,8 +237,13 @@ $defs = @(
 
 New-Item -ItemType Directory -Force -Path $bdir | Out-Null
 
-$configureArgs = @('-S', $src, '-B', $bdir, '-G', 'MinGW Makefiles') + $defs
-Write-Host "==> ARCH=$arch OUT_OS=win7 DEVICE=cuda PROJECT=llama.cpp CMAKE_CUDA_ARCHITECTURES=$CudaArch BUILD_DIR=$bdir"
+$configureArgs = @('-S', $src, '-B', $bdir, '-G', $resolvedGenerator)
+if ($isVsGen -and $Platform) {
+  $configureArgs += @('-A', $Platform)
+}
+$configureArgs += $defs
+
+Write-Host "==> ARCH=$arch OUT_OS=win7 DEVICE=cuda PROJECT=llama.cpp GENERATOR=$resolvedGenerator CMAKE_CUDA_ARCHITECTURES=$CudaArch BUILD_DIR=$bdir"
 Invoke-Native 'cmake' $configureArgs
 Show-KeyCacheValues $bdir
 
