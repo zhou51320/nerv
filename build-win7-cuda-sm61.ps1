@@ -199,6 +199,7 @@ if (-not (Test-Path (Join-Path $src 'CMakeLists.txt'))) {
 
 if (-not (Test-Cmd 'cmake')) { throw "cmake not found in PATH." }
 if (-not (Test-Cmd 'nvcc')) { throw "nvcc not found in PATH. Install CUDA toolkit and open a shell with CUDA env." }
+$nvccPath = (Get-Command nvcc -ErrorAction Stop).Source
 
 $resolvedGenerator = Resolve-Generator $Generator
 $isMingw = $resolvedGenerator -like 'MinGW*'
@@ -230,6 +231,8 @@ if ($Clean) {
 $defs = @(
   '-DCMAKE_BUILD_TYPE=Release',
   '-DCMAKE_CUDA_FLAGS:STRING=-allow-unsupported-compiler',
+  "-DCMAKE_CUDA_COMPILER:FILEPATH=$nvccPath",
+  '-DCMAKE_CUDA_HOST_COMPILER:FILEPATH=cl.exe',
   "-DCMAKE_CUDA_ARCHITECTURES=$CudaArch",
   '-DGGML_CUDA=ON',
   '-DGGML_NATIVE=OFF',
@@ -251,42 +254,36 @@ if ($isMingw) {
   )
 }
 
+if ($isVsGen) {
+  $vsCudaProps = @(
+    'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\MSBuild\Microsoft\VC\v170\BuildCustomizations\CUDA 11.7.props',
+    'C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Microsoft\VC\v170\BuildCustomizations\CUDA 11.7.props',
+    'C:\Program Files\Microsoft Visual Studio\2022\Professional\MSBuild\Microsoft\VC\v170\BuildCustomizations\CUDA 11.7.props',
+    'C:\Program Files\Microsoft Visual Studio\2022\BuildTools\MSBuild\Microsoft\VC\v170\BuildCustomizations\CUDA 11.7.props'
+  )
+  $hasVsCudaToolset = $false
+  foreach ($p in $vsCudaProps) {
+    if (Test-Path $p) { $hasVsCudaToolset = $true; break }
+  }
+  if (-not $hasVsCudaToolset) {
+    throw "Visual Studio CUDA toolset not found (No CUDA toolset found). Use -Generator Ninja in CI, or install full CUDA VS integration."
+  }
+}
+
+if (Test-Path $bdir) {
+  Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $bdir
+}
 New-Item -ItemType Directory -Force -Path $bdir | Out-Null
 
-$generatorAttempts = @(@{ G = $resolvedGenerator; A = $(if ($isVsGen) { $Platform } else { $null }) })
-if ($resolvedGenerator -eq 'Ninja') {
-  $generatorAttempts += @(@{ G = 'Visual Studio 17 2022'; A = $Platform })
+$configureArgs = @('-S', $src, '-B', $bdir, '-G', $resolvedGenerator)
+if ($isVsGen -and $Platform) {
+  $configureArgs += @('-A', $Platform)
 }
+$configureArgs += $defs
 
-$configured = $false
-$lastError = $null
-foreach ($ga in $generatorAttempts) {
-  if (Test-Path $bdir) {
-    Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $bdir
-  }
-  New-Item -ItemType Directory -Force -Path $bdir | Out-Null
-
-  $configureArgs = @('-S', $src, '-B', $bdir, '-G', $ga.G)
-  if ($ga.A) {
-    $configureArgs += @('-A', $ga.A)
-  }
-  $configureArgs += $defs
-
-  Write-Host "==> ARCH=$arch OUT_OS=win7 DEVICE=cuda PROJECT=llama.cpp GENERATOR=$($ga.G) CMAKE_CUDA_ARCHITECTURES=$CudaArch BUILD_DIR=$bdir"
-  try {
-    Invoke-Native 'cmake' $configureArgs
-    Show-KeyCacheValues $bdir
-    $configured = $true
-    break
-  } catch {
-    $lastError = $_
-    Write-Warning "Configure failed with generator '$($ga.G)'."
-  }
-}
-
-if (-not $configured) {
-  throw $lastError
-}
+Write-Host "==> ARCH=$arch OUT_OS=win7 DEVICE=cuda PROJECT=llama.cpp GENERATOR=$resolvedGenerator CMAKE_CUDA_ARCHITECTURES=$CudaArch BUILD_DIR=$bdir"
+Invoke-Native 'cmake' $configureArgs
+Show-KeyCacheValues $bdir
 
 $buildArgs = @('--build', $bdir, '--config', 'Release')
 if ($Jobs -gt 0) { $buildArgs += @('--parallel', "$Jobs") }
