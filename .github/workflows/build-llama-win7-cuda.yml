@@ -103,6 +103,48 @@ jobs:
             Write-Host "No CMakeOutput.log at $out"
           }
 
+      - name: Bundle runtime DLLs
+        shell: pwsh
+        run: |
+          $out = 'EVA_BACKEND\x86_64\win7\cuda\llama.cpp'
+          if (-not (Test-Path $out)) { throw "Output directory missing: $out" }
+
+          $cudaBin = Join-Path $env:CUDA_PATH 'bin'
+          if (-not (Test-Path $cudaBin)) { throw "CUDA bin not found: $cudaBin" }
+
+          $requiredCudaDlls = @(
+            'cudart64_110.dll',
+            'cublas64_11.dll',
+            'cublasLt64_11.dll'
+          )
+
+          foreach ($dll in $requiredCudaDlls) {
+            $src = Join-Path $cudaBin $dll
+            if (-not (Test-Path $src)) {
+              throw "Required CUDA runtime DLL missing: $src"
+            }
+            Copy-Item $src -Destination $out -Force
+            Write-Host "Bundled $dll"
+          }
+
+          $optionalVcDlls = @(
+            'vcruntime140.dll',
+            'vcruntime140_1.dll',
+            'msvcp140.dll',
+            'concrt140.dll',
+            'vcomp140.dll'
+          )
+
+          foreach ($dll in $optionalVcDlls) {
+            $sysPath = Join-Path "$env:WINDIR\System32" $dll
+            if (Test-Path $sysPath) {
+              Copy-Item $sysPath -Destination $out -Force
+              Write-Host "Bundled optional $dll"
+            } else {
+              Write-Host "Optional runtime DLL not found: $dll"
+            }
+          }
+
       - name: Verify binaries
         shell: pwsh
         run: |
@@ -110,6 +152,9 @@ jobs:
           if (-not (Test-Path $out)) { throw "Output directory missing: $out" }
           if (-not (Test-Path (Join-Path $out 'llama-server.exe'))) { throw 'llama-server.exe missing' }
           if (-not (Test-Path (Join-Path $out 'llama-quantize.exe'))) { throw 'llama-quantize.exe missing' }
+          if (-not (Test-Path (Join-Path $out 'cudart64_110.dll'))) { throw 'cudart64_110.dll missing' }
+          if (-not (Test-Path (Join-Path $out 'cublas64_11.dll'))) { throw 'cublas64_11.dll missing' }
+          if (-not (Test-Path (Join-Path $out 'cublasLt64_11.dll'))) { throw 'cublasLt64_11.dll missing' }
 
       - name: Package artifact
         shell: pwsh
