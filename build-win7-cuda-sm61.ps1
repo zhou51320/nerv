@@ -14,10 +14,10 @@ function Test-Cmd([string]$name) {
   return [bool](Get-Command $name -ErrorAction SilentlyContinue)
 }
 
-function Invoke-Native([string]$exe,[string[]]$args) {
-  & $exe @args
+function Invoke-Native([string]$exe,[string[]]$cmdArgs) {
+  & $exe @cmdArgs
   if ($LASTEXITCODE -ne 0) {
-    throw "$exe failed with exit code $LASTEXITCODE. Args: $($args -join ' ')"
+    throw "$exe failed with exit code $LASTEXITCODE. Args: $($cmdArgs -join ' ')"
   }
 }
 
