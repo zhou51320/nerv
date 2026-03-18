@@ -106,6 +106,16 @@ jobs:
           } else {
             Write-Host "CUDA_PATH is missing or invalid before toolchain check"
           }
+          foreach ($mustHave in @('lib\\x64\\cudart.lib', 'lib\\x64\\cublas.lib')) {
+            $p = Join-Path $env:CUDA_PATH $mustHave
+            if (-not (Test-Path $p)) { throw "Missing required CUDA dev lib: $p" }
+            Write-Host "Found $p"
+          }
+          Write-Host "CUDA runtime dll candidates in CUDA_PATH\\bin:"
+          Get-ChildItem -Path (Join-Path $env:CUDA_PATH 'bin') -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '^(?i)(cudart64_|cublas64_|cublasLt64_).*\\.dll$' } |
+            Select-Object -ExpandProperty Name |
+            ForEach-Object { Write-Host $_ }
           where.exe nvcc
           nvcc --version
 
