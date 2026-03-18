@@ -76,6 +76,18 @@ jobs:
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
+          toolset: 14.29
+
+      - name: Check MSVC toolchain
+        shell: pwsh
+        run: |
+          where.exe cl
+          Write-Host "VCToolsVersion=$env:VCToolsVersion"
+          $clBanner = (& cl.exe 2>&1 | Select-Object -First 3) -join "`n"
+          Write-Host $clBanner
+          if (-not $env:VCToolsVersion -or $env:VCToolsVersion -notlike '14.29*') {
+            throw "CUDA 10.2 requires MSVC v142 (14.29.x). Current VCToolsVersion=$env:VCToolsVersion"
+          }
 
       - name: Install Ninja
         shell: pwsh

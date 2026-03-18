@@ -277,10 +277,12 @@ if ($Clean) {
   Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $bdir
 }
 
+$cudaCompatFlags = '--allow-unsupported-compiler -D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH -Xcompiler=/D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH'
+
 $defs = @(
   '-DCMAKE_BUILD_TYPE=Release',
-  '-DCMAKE_CUDA_FLAGS_INIT:STRING=--allow-unsupported-compiler -Xcompiler=/D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH',
-  '-DCMAKE_CUDA_FLAGS:STRING=--allow-unsupported-compiler -Xcompiler=/D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH',
+  "-DCMAKE_CUDA_FLAGS_INIT:STRING=$cudaCompatFlags",
+  "-DCMAKE_CUDA_FLAGS:STRING=$cudaCompatFlags",
   "-DCMAKE_CUDA_COMPILER:FILEPATH=$nvccPath",
   '-DCMAKE_CUDA_HOST_COMPILER:FILEPATH=cl.exe',
   "-DCMAKE_CUDA_ARCHITECTURES=$CudaArch",
