@@ -23,27 +23,48 @@ runs:
         $root = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v10.2"
         $installer = Join-Path $env:RUNNER_TEMP "cuda_10.2.89_441.22_win10.exe"
         $extractDir = Join-Path $env:RUNNER_TEMP "cuda-10.2-extract"
+        $stageDir = Join-Path $env:RUNNER_TEMP "cuda-10.2-stage"
         $url = "https://developer.download.nvidia.com/compute/cuda/10.2/Prod/local_installers/cuda_10.2.89_441.22_win10.exe"
 
         if (Test-Path $extractDir) { Remove-Item -Recurse -Force $extractDir }
+        if (Test-Path $stageDir) { Remove-Item -Recurse -Force $stageDir }
         New-Item -ItemType Directory -Force -Path $extractDir | Out-Null
+        New-Item -ItemType Directory -Force -Path $stageDir | Out-Null
 
         Write-Host "Downloading $url"
         curl.exe -L $url -o $installer
 
-        # Per CUDA 10.2 docs, full installer can be manually extracted with LZMA-capable tools.
+        # Pass 1: unpack the self-extracting installer container.
         & 7z x -y "-o$extractDir" $installer | Out-Null
 
-        $toolkitDir = Join-Path $extractDir "CUDAToolkit"
-        if (-not (Test-Path $toolkitDir)) {
-          throw "Extracted CUDAToolkit directory not found under $extractDir"
+        # Pass 2: unpack all payload archives found in pass 1.
+        $payloads = Get-ChildItem -Path $extractDir -Recurse -File -Filter *.7z -ErrorAction SilentlyContinue
+        if (-not $payloads -or $payloads.Count -eq 0) {
+          Write-Host "No nested .7z payloads found; using extracted tree as stage"
+          Copy-Item -Path "$extractDir\*" -Destination $stageDir -Recurse -Force
+        } else {
+          foreach ($pkg in $payloads) {
+            Write-Host "Extracting payload $($pkg.FullName)"
+            & 7z x -y "-o$stageDir" $pkg.FullName | Out-Null
+          }
         }
 
-        Copy-Item -Path "$toolkitDir\*" -Destination $root -Recurse -Force
+        # Locate nvcc from the staged tree and infer toolkit root (<toolkit>\bin\nvcc.exe).
+        $nvccInStage = Get-ChildItem -Path $stageDir -Recurse -File -Filter nvcc.exe -ErrorAction SilentlyContinue |
+          Where-Object { $_.FullName -match '\\bin\\nvcc\.exe$' } |
+          Select-Object -First 1
+        if (-not $nvccInStage) {
+          throw "nvcc.exe not found in staged CUDA 10.2 payload under $stageDir"
+        }
+
+        $toolkitRoot = Split-Path -Parent (Split-Path -Parent $nvccInStage.FullName)
+        Write-Host "Detected CUDA toolkit root in stage: $toolkitRoot"
+
+        Copy-Item -Path "$toolkitRoot\*" -Destination $root -Recurse -Force
 
         $nvcc = Get-ChildItem -Path $root -Recurse -File -Filter nvcc.exe -ErrorAction SilentlyContinue | Select-Object -First 1
         if (-not $nvcc) {
-          throw "nvcc.exe not found after CUDA 10.2 extraction under $root"
+          throw "nvcc.exe not found after staging/copy under $root"
         }
         $nvccDir = Split-Path $nvcc.FullName -Parent
         echo "$nvccDir" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
