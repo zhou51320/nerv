@@ -231,8 +231,24 @@ if (-not (Test-Path (Join-Path $src 'CMakeLists.txt'))) {
 }
 
 if (-not (Test-Cmd 'cmake')) { throw "cmake not found in PATH." }
-if (-not (Test-Cmd 'nvcc')) { throw "nvcc not found in PATH. Install CUDA toolkit and open a shell with CUDA env." }
-$nvccPath = (Get-Command nvcc -ErrorAction Stop).Source
+$nvccCmd = Get-Command nvcc -ErrorAction SilentlyContinue
+if ($nvccCmd) {
+  $nvccPath = $nvccCmd.Source
+} else {
+  $nvccPath = $null
+  if ($env:CUDA_PATH -and (Test-Path $env:CUDA_PATH)) {
+    $nvccFound = Get-ChildItem -Path $env:CUDA_PATH -Recurse -File -Filter nvcc.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($nvccFound) {
+      $nvccPath = $nvccFound.FullName
+      $nvccDir = Split-Path $nvccPath -Parent
+      $env:PATH = "$nvccDir;$env:PATH"
+      Write-Host "nvcc not found in PATH; recovered from CUDA_PATH: $nvccPath"
+    }
+  }
+  if (-not $nvccPath) {
+    throw "nvcc not found in PATH and not found under CUDA_PATH. Install CUDA toolkit and open a shell with CUDA env."
+  }
+}
 
 $resolvedGenerator = Resolve-Generator $Generator
 $isMingw = $resolvedGenerator -like 'MinGW*'
