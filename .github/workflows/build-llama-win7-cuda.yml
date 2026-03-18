@@ -106,9 +106,9 @@ jobs:
           } else {
             Write-Host "CUDA_PATH is missing or invalid before toolchain check"
           }
-          foreach ($mustHave in @('lib\\x64\\cudart.lib', 'lib\\x64\\cublas.lib')) {
+          foreach ($mustHave in @('lib\\x64\\cudart.lib', 'lib\\x64\\cublas.lib', 'include\\cublas_v2.h', 'include\\cuda_runtime.h')) {
             $p = Join-Path $env:CUDA_PATH $mustHave
-            if (-not (Test-Path $p)) { throw "Missing required CUDA dev lib: $p" }
+            if (-not (Test-Path $p)) { throw "Missing required CUDA toolkit file: $p" }
             Write-Host "Found $p"
           }
           Write-Host "CUDA runtime dll candidates in CUDA_PATH\\bin:"

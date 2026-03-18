@@ -51,16 +51,32 @@ runs:
           }
         }
 
-        # Pass 3: extract common component containers that often hold dev/import libs.
+        # Pass 3: extract common component containers that often hold dev/import libs and headers.
         $componentArchives = Get-ChildItem -Path $extractDir -Recurse -File -ErrorAction SilentlyContinue |
           Where-Object {
-            $_.Extension -in @('.cab', '.zip') -and
+            $_.Extension -in @('.cab', '.zip', '.msi') -and
             $_.Name -match '(?i)(nvcc|cudart|cublas|cublaslt|nvrtc|nvvm|crt|curand|cufft|cusolver|cusparse|npp|toolkit)'
           } |
           Sort-Object -Property FullName -Unique
         foreach ($archive in $componentArchives) {
           Write-Host "Extracting component archive $($archive.FullName)"
           & 7z x -y "-o$stageDir" $archive.FullName | Out-Null
+        }
+
+        # If cublas headers are still missing in stage, do one broader extraction pass.
+        $stagedCublasHeader = Get-ChildItem -Path $stageDir -Recurse -File -Filter cublas_v2.h -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $stagedCublasHeader) {
+          Write-Host "cublas_v2.h missing after targeted extraction; trying broad CUDA package extraction fallback"
+          $broadArchives = Get-ChildItem -Path $extractDir -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object {
+              $_.Extension -in @('.7z', '.cab', '.zip', '.msi') -and
+              $_.Name -match '(?i)(cuda|cublas|cudart|nvcc|toolkit)'
+            } |
+            Sort-Object -Property FullName -Unique
+          foreach ($archive in $broadArchives) {
+            Write-Host "Broad fallback extracting $($archive.FullName)"
+            & 7z x -y "-o$stageDir" $archive.FullName | Out-Null
+          }
         }
 
         function Find-StagedNvcc([string]$searchRoot) {
@@ -129,8 +145,10 @@ runs:
         # Normalize key CUDA libraries from full staged tree into canonical toolkit paths.
         $libDir = Join-Path $root 'lib\x64'
         $binDir = Join-Path $root 'bin'
+        $includeDir = Join-Path $root 'include'
         New-Item -ItemType Directory -Force -Path $libDir | Out-Null
         New-Item -ItemType Directory -Force -Path $binDir | Out-Null
+        New-Item -ItemType Directory -Force -Path $includeDir | Out-Null
 
         $requiredImportLibs = @('cudart.lib', 'cublas.lib')
         $optionalImportLibs = @('cublasLt.lib', 'cudadevrt.lib', 'cudart_static.lib')
@@ -161,6 +179,25 @@ runs:
           }
         }
 
+        # Ensure cublas and cuda runtime headers exist under canonical include path.
+        $headerNames = @(
+          'cublas_v2.h',
+          'cublasLt.h',
+          'cuda_runtime.h',
+          'cuda_runtime_api.h',
+          'driver_types.h',
+          'vector_types.h'
+        )
+        foreach ($headerName in $headerNames) {
+          $headerHit = Get-ChildItem -Path $stageDir -Recurse -File -Filter $headerName -ErrorAction SilentlyContinue |
+            Sort-Object -Property FullName |
+            Select-Object -First 1
+          if ($headerHit) {
+            Copy-Item -Path $headerHit.FullName -Destination (Join-Path $includeDir $headerName) -Force
+            Write-Host "Staged header $headerName from $($headerHit.FullName)"
+          }
+        }
+
         $nvcc = Get-ChildItem -Path $root -Recurse -File -Filter nvcc.exe -ErrorAction SilentlyContinue | Select-Object -First 1
         if (-not $nvcc) {
           throw "nvcc.exe not found after staging/copy under $root"
@@ -175,6 +212,18 @@ runs:
               Select-Object -First 40 -ExpandProperty FullName |
               ForEach-Object { Write-Host $_ }
             throw "Required CUDA dev library missing after extraction: $mustHave"
+          }
+        }
+        foreach ($mustHeader in @('include\cublas_v2.h', 'include\cuda_runtime.h')) {
+          $mustHeaderPath = Join-Path $root $mustHeader
+          if (-not (Test-Path $mustHeaderPath)) {
+            Write-Host "Missing required CUDA header after staging: $mustHeaderPath"
+            Write-Host "Discovered cublas/cuda headers in stage (first 80):"
+            Get-ChildItem -Path $stageDir -Recurse -File -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -match '^(?i)(cublas.*|cuda.*)\.h$' } |
+              Select-Object -First 80 -ExpandProperty FullName |
+              ForEach-Object { Write-Host $_ }
+            throw "Required CUDA header missing after extraction: $mustHeader"
           }
         }
         $nvccDir = Split-Path $nvcc.FullName -Parent
