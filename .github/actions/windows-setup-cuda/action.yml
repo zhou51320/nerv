@@ -37,11 +37,13 @@ runs:
         # Pass 1: unpack the self-extracting installer container.
         & 7z x -y "-o$extractDir" $installer | Out-Null
 
-        # Pass 2: unpack all payload archives found in pass 1.
+        # Seed stage with everything from pass 1, then expand nested payloads on top.
+        Copy-Item -Path "$extractDir\*" -Destination $stageDir -Recurse -Force
+
+        # Pass 2: unpack all nested .7z payload archives found in pass 1.
         $payloads = Get-ChildItem -Path $extractDir -Recurse -File -Filter *.7z -ErrorAction SilentlyContinue
         if (-not $payloads -or $payloads.Count -eq 0) {
-          Write-Host "No nested .7z payloads found; using extracted tree as stage"
-          Copy-Item -Path "$extractDir\*" -Destination $stageDir -Recurse -Force
+          Write-Host "No nested .7z payloads found in CUDA 10.2 installer tree"
         } else {
           foreach ($pkg in $payloads) {
             Write-Host "Extracting payload $($pkg.FullName)"
@@ -49,11 +51,48 @@ runs:
           }
         }
 
+        function Find-StagedNvcc([string]$searchRoot) {
+          return Get-ChildItem -Path $searchRoot -Recurse -File -Filter nvcc.exe -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match '\\bin\\nvcc\.exe$' } |
+            Select-Object -First 1
+        }
+
         # Locate nvcc from the staged tree and infer toolkit root (<toolkit>\bin\nvcc.exe).
-        $nvccInStage = Get-ChildItem -Path $stageDir -Recurse -File -Filter nvcc.exe -ErrorAction SilentlyContinue |
-          Where-Object { $_.FullName -match '\\bin\\nvcc\.exe$' } |
-          Select-Object -First 1
+        $nvccInStage = Find-StagedNvcc $stageDir
         if (-not $nvccInStage) {
+          Write-Host "nvcc.exe not found after .7z extraction; trying targeted archive fallback (.cab/.zip/.7z)"
+          $fallbackArchives = Get-ChildItem -Path $extractDir -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object {
+              $_.Extension -in @('.cab', '.zip', '.7z') -and
+              $_.Name -match '(?i)(nvcc|cudart|cublas|cufft|curand|cusolver|cusparse|npp|toolkit)'
+            } |
+            Sort-Object -Property FullName -Unique
+
+          foreach ($archive in $fallbackArchives) {
+            Write-Host "Fallback extracting $($archive.FullName)"
+            & 7z x -y "-o$stageDir" $archive.FullName | Out-Null
+          }
+          $nvccInStage = Find-StagedNvcc $stageDir
+        }
+        if (-not $nvccInStage) {
+          Write-Host "---- CUDA 10.2 staging diagnostics ----"
+          Write-Host "Stage directory: $stageDir"
+          Write-Host "Top-level entries in stage (first 60):"
+          Get-ChildItem -Path $stageDir -Force -ErrorAction SilentlyContinue |
+            Select-Object -First 60 -ExpandProperty FullName |
+            ForEach-Object { Write-Host $_ }
+
+          Write-Host "Entries in stage matching *nvcc* (first 40):"
+          Get-ChildItem -Path $stageDir -Recurse -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '(?i)nvcc' } |
+            Select-Object -First 40 -ExpandProperty FullName |
+            ForEach-Object { Write-Host $_ }
+
+          Write-Host "bin directories discovered in stage (first 40):"
+          Get-ChildItem -Path $stageDir -Recurse -Directory -Filter bin -ErrorAction SilentlyContinue |
+            Select-Object -First 40 -ExpandProperty FullName |
+            ForEach-Object { Write-Host $_ }
+
           throw "nvcc.exe not found in staged CUDA 10.2 payload under $stageDir"
         }
 

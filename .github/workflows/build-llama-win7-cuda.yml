@@ -84,6 +84,16 @@ jobs:
       - name: Check CUDA toolchain
         shell: pwsh
         run: |
+          Write-Host "CUDA_PATH=$env:CUDA_PATH"
+          if ($env:CUDA_PATH -and (Test-Path $env:CUDA_PATH)) {
+            Write-Host "CUDA_PATH exists: $env:CUDA_PATH"
+            Write-Host "nvcc candidates under CUDA_PATH (first 10):"
+            Get-ChildItem -Path $env:CUDA_PATH -Recurse -File -Filter nvcc.exe -ErrorAction SilentlyContinue |
+              Select-Object -First 10 -ExpandProperty FullName |
+              ForEach-Object { Write-Host $_ }
+          } else {
+            Write-Host "CUDA_PATH is missing or invalid before toolchain check"
+          }
           where.exe nvcc
           nvcc --version
 
