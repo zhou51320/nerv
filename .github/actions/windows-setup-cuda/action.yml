@@ -180,8 +180,25 @@ runs:
         }
 
         # Ensure cublas and cuda runtime headers exist under canonical include path.
+        $headerNameHints = @('cublas_v2.h', 'cublas_api.h', 'cuda_runtime.h', 'cuda_runtime_api.h')
+        $includeSourceDirs = @()
+        foreach ($hint in $headerNameHints) {
+          $hit = Get-ChildItem -Path $stageDir -Recurse -File -Filter $hint -ErrorAction SilentlyContinue |
+            Sort-Object -Property FullName |
+            Select-Object -First 1
+          if ($hit) {
+            $includeSourceDirs += (Split-Path -Parent $hit.FullName)
+          }
+        }
+        $includeSourceDirs = $includeSourceDirs | Sort-Object -Unique
+        foreach ($srcIncludeDir in $includeSourceDirs) {
+          Write-Host "Merging include tree from $srcIncludeDir into $includeDir"
+          Copy-Item -Path (Join-Path $srcIncludeDir '*') -Destination $includeDir -Recurse -Force
+        }
+
         $headerNames = @(
           'cublas_v2.h',
+          'cublas_api.h',
           'cublasLt.h',
           'cuda_runtime.h',
           'cuda_runtime_api.h',
@@ -214,7 +231,7 @@ runs:
             throw "Required CUDA dev library missing after extraction: $mustHave"
           }
         }
-        foreach ($mustHeader in @('include\cublas_v2.h', 'include\cuda_runtime.h')) {
+        foreach ($mustHeader in @('include\cublas_v2.h', 'include\cublas_api.h', 'include\cuda_runtime.h')) {
           $mustHeaderPath = Join-Path $root $mustHeader
           if (-not (Test-Path $mustHeaderPath)) {
             Write-Host "Missing required CUDA header after staging: $mustHeaderPath"
