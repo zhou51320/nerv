@@ -27,7 +27,7 @@ jobs:
       - name: Setup CUDA Toolkit
         uses: ./.github/actions/windows-setup-cuda
         with:
-          cuda_version: '11.7'
+          cuda_version: '10.2'
 
       - name: Configure CUDA environment
         shell: pwsh
@@ -49,7 +49,9 @@ jobs:
           $hostCfg = Join-Path $env:CUDA_PATH 'include\crt\host_config.h'
           if (-not (Test-Path $hostCfg)) { throw "host_config.h not found at $hostCfg" }
           $raw = Get-Content -Raw -LiteralPath $hostCfg
-          $patched = $raw -replace '_MSC_VER\s*>=\s*1940', '_MSC_VER >= 1950'
+          $patched = $raw
+          $patched = $patched -replace '_MSC_VER\s*>=\s*19\d{2}', '_MSC_VER >= 2000'
+          $patched = $patched -replace '_MSC_VER\s*>\s*19\d{2}', '_MSC_VER > 2000'
           if ($patched -ne $raw) {
             Set-Content -LiteralPath $hostCfg -Value $patched -Encoding UTF8
             Write-Host "Patched MSVC upper-bound check in $hostCfg"
@@ -110,18 +112,19 @@ jobs:
           if (-not (Test-Path $out)) { throw "Output directory missing: $out" }
           if (-not (Test-Path $env:CUDA_PATH)) { throw "CUDA_PATH missing: $env:CUDA_PATH" }
 
-          $requiredCudaDlls = @(
-            'cudart64_110.dll',
-            'cublas64_11.dll',
-            'cublasLt64_11.dll'
+          $requiredCudaDllPatterns = @(
+            'cudart64_*.dll',
+            'cublas64_*.dll',
+            'cublasLt64_*.dll'
           )
 
-          foreach ($dll in $requiredCudaDlls) {
-            $src = Get-ChildItem -Path $env:CUDA_PATH -Recurse -File -Filter $dll -ErrorAction SilentlyContinue | Select-Object -First 1
-            if (-not $src) { throw "Required CUDA runtime DLL missing under CUDA_PATH: $dll" }
+          foreach ($pattern in $requiredCudaDllPatterns) {
+            $src = Get-ChildItem -Path $env:CUDA_PATH -Recurse -File -Filter $pattern -ErrorAction SilentlyContinue | Sort-Object FullName | Select-Object -First 1
+            if (-not $src) { throw "Required CUDA runtime DLL missing under CUDA_PATH pattern: $pattern" }
             $src = $src.FullName
-            Copy-Item $src -Destination $out -Force
-            Write-Host "Bundled $dll from $src"
+            $destName = Split-Path $src -Leaf
+            Copy-Item $src -Destination (Join-Path $out $destName) -Force
+            Write-Host "Bundled $destName from $src"
           }
 
           $optionalVcDlls = @(
@@ -155,9 +158,9 @@ jobs:
           if (-not (Test-Path (Join-Path $out 'ggml-base.dll'))) { throw 'ggml-base.dll missing' }
           if (-not (Test-Path (Join-Path $out 'ggml-cpu.dll'))) { throw 'ggml-cpu.dll missing' }
           if (-not (Test-Path (Join-Path $out 'ggml-cuda.dll'))) { throw 'ggml-cuda.dll missing' }
-          if (-not (Test-Path (Join-Path $out 'cudart64_110.dll'))) { throw 'cudart64_110.dll missing' }
-          if (-not (Test-Path (Join-Path $out 'cublas64_11.dll'))) { throw 'cublas64_11.dll missing' }
-          if (-not (Test-Path (Join-Path $out 'cublasLt64_11.dll'))) { throw 'cublasLt64_11.dll missing' }
+          if (-not (Get-ChildItem -Path $out -Filter 'cudart64_*.dll' -ErrorAction SilentlyContinue)) { throw 'cudart64_*.dll missing' }
+          if (-not (Get-ChildItem -Path $out -Filter 'cublas64_*.dll' -ErrorAction SilentlyContinue)) { throw 'cublas64_*.dll missing' }
+          if (-not (Get-ChildItem -Path $out -Filter 'cublasLt64_*.dll' -ErrorAction SilentlyContinue)) { throw 'cublasLt64_*.dll missing' }
 
       - name: Package artifact
         shell: pwsh

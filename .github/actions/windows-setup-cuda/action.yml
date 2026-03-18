@@ -2,7 +2,7 @@ name: "Windows - Setup CUDA Toolkit"
 description: "Download and extract a specific CUDA Toolkit version on Windows runners"
 inputs:
   cuda_version:
-    description: "CUDA Toolkit version (currently supported: 11.7 or 12.4)"
+    description: "CUDA Toolkit version (currently supported: 10.2, 11.7 or 12.4)"
     required: true
 
 runs:
@@ -14,6 +14,35 @@ runs:
         $target = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v${{ inputs.cuda_version }}"
         New-Item -ItemType Directory -Force -Path $target | Out-Null
         choco install unzip -y
+        choco install 7zip -y
+
+    - name: Install CUDA Toolkit 10.2 artifacts
+      if: ${{ inputs.cuda_version == '10.2' }}
+      shell: pwsh
+      run: |
+        $root = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v10.2"
+        $installer = Join-Path $env:RUNNER_TEMP "cuda_10.2.89_441.22_win10.exe"
+        $extractDir = Join-Path $env:RUNNER_TEMP "cuda-10.2-extract"
+        $url = "https://developer.download.nvidia.com/compute/cuda/10.2/Prod/local_installers/cuda_10.2.89_441.22_win10.exe"
+
+        if (Test-Path $extractDir) { Remove-Item -Recurse -Force $extractDir }
+        New-Item -ItemType Directory -Force -Path $extractDir | Out-Null
+
+        Write-Host "Downloading $url"
+        curl.exe -L $url -o $installer
+
+        # Per CUDA 10.2 docs, full installer can be manually extracted with LZMA-capable tools.
+        & 7z x -y "-o$extractDir" $installer | Out-Null
+
+        $toolkitDir = Join-Path $extractDir "CUDAToolkit"
+        if (-not (Test-Path $toolkitDir)) {
+          throw "Extracted CUDAToolkit directory not found under $extractDir"
+        }
+
+        Copy-Item -Path "$toolkitDir\*" -Destination $root -Recurse -Force
+        echo "$root\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        echo "CUDA_PATH=$root" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        echo "CUDA_PATH_V10_2=$root" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
     - name: Install CUDA Toolkit 11.7 artifacts
       if: ${{ inputs.cuda_version == '11.7' }}
