@@ -344,7 +344,9 @@ $requiredProjectDlls = @(
   'mtmd.dll',
   'llama.dll',
   'ggml.dll',
-  'ggml-base.dll'
+  'ggml-base.dll',
+  'ggml-cpu.dll',
+  'ggml-cuda.dll'
 )
 Copy-RequiredDlls $bdir $outDir $requiredProjectDlls
 
