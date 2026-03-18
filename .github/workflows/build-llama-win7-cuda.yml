@@ -81,6 +81,12 @@ jobs:
         shell: pwsh
         run: choco install ninja --no-progress -y
 
+      - name: Check CUDA toolchain
+        shell: pwsh
+        run: |
+          where.exe nvcc
+          nvcc --version
+
       - name: Build llama.cpp Win7 CUDA sm_61
         shell: pwsh
         run: |

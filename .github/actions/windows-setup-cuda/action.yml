@@ -40,7 +40,18 @@ runs:
         }
 
         Copy-Item -Path "$toolkitDir\*" -Destination $root -Recurse -Force
-        echo "$root\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+        $nvcc = Get-ChildItem -Path $root -Recurse -File -Filter nvcc.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $nvcc) {
+          throw "nvcc.exe not found after CUDA 10.2 extraction under $root"
+        }
+        $nvccDir = Split-Path $nvcc.FullName -Parent
+        echo "$nvccDir" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+        $cudaBin = Join-Path $root 'bin'
+        if (Test-Path $cudaBin) {
+          echo "$cudaBin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        }
         echo "CUDA_PATH=$root" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
         echo "CUDA_PATH_V10_2=$root" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
