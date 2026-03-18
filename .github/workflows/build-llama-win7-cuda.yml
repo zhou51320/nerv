@@ -46,17 +46,30 @@ jobs:
       - name: Patch CUDA host_config for MSVC compatibility
         shell: pwsh
         run: |
-          $hostCfg = Join-Path $env:CUDA_PATH 'include\crt\host_config.h'
-          if (-not (Test-Path $hostCfg)) { throw "host_config.h not found at $hostCfg" }
-          $raw = Get-Content -Raw -LiteralPath $hostCfg
-          $patched = $raw
-          $patched = $patched -replace '_MSC_VER\s*>=\s*19\d{2}', '_MSC_VER >= 2000'
-          $patched = $patched -replace '_MSC_VER\s*>\s*19\d{2}', '_MSC_VER > 2000'
-          if ($patched -ne $raw) {
-            Set-Content -LiteralPath $hostCfg -Value $patched -Encoding UTF8
-            Write-Host "Patched MSVC upper-bound check in $hostCfg"
+          $hostCfgCandidates = @()
+          $defaultHostCfg = Join-Path $env:CUDA_PATH 'include\crt\host_config.h'
+          if (Test-Path $defaultHostCfg) {
+            $hostCfgCandidates += $defaultHostCfg
           } else {
-            Write-Host "No MSVC upper-bound pattern matched in $hostCfg; continuing"
+            $hostCfgCandidates += @(Get-ChildItem -Path $env:CUDA_PATH -Recurse -File -Filter host_config.h -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName)
+          }
+
+          if (-not $hostCfgCandidates -or $hostCfgCandidates.Count -eq 0) {
+            Write-Host "host_config.h not found under $env:CUDA_PATH, skip patch"
+            return
+          }
+
+          foreach ($hostCfg in $hostCfgCandidates) {
+            $raw = Get-Content -Raw -LiteralPath $hostCfg
+            $patched = $raw
+            $patched = $patched -replace '_MSC_VER\s*>=\s*19\d{2}', '_MSC_VER >= 2000'
+            $patched = $patched -replace '_MSC_VER\s*>\s*19\d{2}', '_MSC_VER > 2000'
+            if ($patched -ne $raw) {
+              Set-Content -LiteralPath $hostCfg -Value $patched -Encoding UTF8
+              Write-Host "Patched MSVC upper-bound check in $hostCfg"
+            } else {
+              Write-Host "No MSVC upper-bound pattern matched in $hostCfg"
+            }
           }
 
       - name: Setup MSVC environment
