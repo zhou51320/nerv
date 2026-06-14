@@ -28,6 +28,7 @@ def quant_shape_from_byte_shape(shape: Sequence[int], quant_type: GGMLQuantizati
 # This is faster than np.vectorize and np.apply_along_axis because it works on more than one row at a time
 def _apply_over_grouped_rows(func: Callable[[np.ndarray], np.ndarray], arr: np.ndarray, otype: DTypeLike, oshape: tuple[int, ...]) -> np.ndarray:
     rows = arr.reshape((-1, arr.shape[-1]))
+    assert len(rows.shape)
     osize = 1
     for dim in oshape:
         osize *= dim
@@ -91,11 +92,11 @@ class __Quant(ABC):
     def __init_subclass__(cls, qtype: GGMLQuantizationType) -> None:
         cls.qtype = qtype
         cls.block_size, cls.type_size = GGML_QUANT_SIZES[qtype]
-        cls.__quantize_lazy = LazyNumpyTensor._wrap_fn(
+        cls.__quantize_lazy: Any = LazyNumpyTensor._wrap_fn(
             cls.__quantize_array,
             meta_noop=(np.uint8, cls.__shape_to_bytes)
         )
-        cls.__dequantize_lazy = LazyNumpyTensor._wrap_fn(
+        cls.__dequantize_lazy: Any = LazyNumpyTensor._wrap_fn(
             cls.__dequantize_array,
             meta_noop=(np.float32, cls.__shape_from_bytes)
         )

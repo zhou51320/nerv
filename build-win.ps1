@@ -34,7 +34,7 @@ switch ($Compiler) {
 $CompilerRequest = $Compiler
 
 # Pinned references (only checked/warned)
-$LLAMA_EXPECT_REF = 'b6880'
+$LLAMA_EXPECT_REF = 'b9632'
 $WHISPER_EXPECT_TAG = 'v1.8.1'
 $SD_EXPECT_REF = '0585e2609d26fc73cde0dd963127ae585ca62d49'
 $TTS_EXPECT_REF = 'e4634fb'

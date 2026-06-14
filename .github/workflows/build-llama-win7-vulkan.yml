@@ -1,0 +1,90 @@
+name: Build Llama Win7 Vulkan
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/build-llama-win7-vulkan.yml'
+      - 'build-win.ps1'
+      - 'llama.cpp/**'
+
+permissions:
+  contents: read
+
+env:
+  VULKAN_SDK_VERSION: '1.3.290.0'
+
+jobs:
+  build-llama-win7-vulkan:
+    name: Build llama.cpp (Win7 + Vulkan)
+    runs-on: windows-2022
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Vulkan SDK
+        shell: pwsh
+        run: |
+          $version = "${{ env.VULKAN_SDK_VERSION }}"
+          if (-not $version) { $version = '1.3.290.0' }
+          $sdkRoot = "C:\VulkanSDK\$version"
+          if (-not (Test-Path $sdkRoot)) {
+            $installer = Join-Path $env:RUNNER_TEMP "VulkanSDK-$version.exe"
+            $uri = "https://sdk.lunarg.com/sdk/download/$version/windows/VulkanSDK-$version-Installer.exe"
+            Write-Host "Downloading Vulkan SDK $version from $uri"
+            Invoke-WebRequest -Uri $uri -OutFile $installer -UseBasicParsing
+            Write-Host "Installing Vulkan SDK..."
+            $args = '--accept-licenses', '--default-answer', '--confirm-command', 'install'
+            $proc = Start-Process -FilePath $installer -ArgumentList $args -PassThru -Wait
+            if ($proc.ExitCode -ne 0) { throw "Vulkan SDK installer failed with exit code $($proc.ExitCode)" }
+          }
+          if (-not (Test-Path $sdkRoot)) { throw "Failed to install Vulkan SDK $version" }
+          "VULKAN_SDK=$sdkRoot" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$sdkRoot\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: Setup MSYS2 toolchain
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            base-devel
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+
+      - name: Add MinGW to PATH
+        shell: pwsh
+        run: |
+          "C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Build llama.cpp Win7 Vulkan
+        shell: pwsh
+        run: |
+          ./build.bat -p llama -d vulkan -Compiler mingw
+
+      - name: Verify binaries
+        shell: pwsh
+        run: |
+          $out = 'EVA_BACKEND\x86_64\win7\vulkan\llama.cpp'
+          if (-not (Test-Path $out)) { throw "Output directory missing: $out" }
+          if (-not (Test-Path (Join-Path $out 'llama-server.exe'))) { throw 'llama-server.exe missing' }
+          if (-not (Test-Path (Join-Path $out 'llama-quantize.exe'))) { throw 'llama-quantize.exe missing' }
+          Write-Host "All required binaries verified."
+
+      - name: Package artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          Compress-Archive -Path 'EVA_BACKEND\x86_64\win7\vulkan\llama.cpp' -DestinationPath 'artifacts/llama-win7-vulkan.zip' -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-win7-vulkan
+          path: artifacts/llama-win7-vulkan.zip
+          if-no-files-found: error
