@@ -25,6 +25,14 @@
 #include "devices/cpu/alivethreadpool.h"
 #include "json11.hpp"
 
+// nerv: MSVC does not implement the GCC __int128 extension. These
+// computations hold device-memory byte budgets, comfortably within 64 bits.
+#if defined(_MSC_VER) && !defined(FASTLLM_I128)
+#define FASTLLM_I128 long long
+#elif !defined(FASTLLM_I128)
+#define FASTLLM_I128 __int128
+#endif
+
 #ifdef USE_SENTENCEPIECE
 #include <sentencepiece_processor.h>
 #endif
