@@ -1,0 +1,194 @@
+name: Build FastLLM Win7 CUDA (sm_75)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/build-fastllm-win7-cuda.yml'
+      - '.github/actions/windows-setup-cuda/**'
+      - 'build-fastllm-win7-cuda.ps1'
+      - 'fastllm/**'
+
+permissions:
+  contents: read
+
+jobs:
+  build-fastllm-win7-cuda:
+    name: Build fastllm (Win7 + CUDA sm_75)
+    runs-on: windows-2022
+    timeout-minutes: 360
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Setup CUDA Toolkit
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: '11.7'
+
+      - name: Configure CUDA environment
+        shell: pwsh
+        run: |
+          $cudaPath = $env:CUDA_PATH
+          if (-not $cudaPath) { throw "CUDA_PATH not set after CUDA installation." }
+          if (-not (Test-Path $cudaPath)) { throw "CUDA path '$cudaPath' not found." }
+          "CUDAToolkit_ROOT=$cudaPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          if (Test-Path (Join-Path $cudaPath 'bin')) {
+            (Join-Path $cudaPath 'bin') | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          }
+
+      - name: Patch CUDA host_config for MSVC compatibility
+        shell: pwsh
+        run: |
+          $hostCfgCandidates = @()
+          $defaultHostCfg = Join-Path $env:CUDA_PATH 'include\crt\host_config.h'
+          if (Test-Path $defaultHostCfg) {
+            $hostCfgCandidates += $defaultHostCfg
+          } else {
+            $hostCfgCandidates += @(Get-ChildItem -Path $env:CUDA_PATH -Recurse -File -Filter host_config.h -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName)
+          }
+
+          if (-not $hostCfgCandidates -or $hostCfgCandidates.Count -eq 0) {
+            Write-Host "host_config.h not found under $env:CUDA_PATH, skip patch"
+            return
+          }
+
+          foreach ($hostCfg in $hostCfgCandidates) {
+            $raw = Get-Content -Raw -LiteralPath $hostCfg
+            $patched = $raw
+            $patched = $patched -replace '_MSC_VER\s*>=\s*19\d{2}', '_MSC_VER >= 2000'
+            $patched = $patched -replace '_MSC_VER\s*>\s*19\d{2}', '_MSC_VER > 2000'
+            if ($patched -ne $raw) {
+              Set-Content -LiteralPath $hostCfg -Value $patched -Encoding UTF8
+              Write-Host "Patched MSVC upper-bound check in $hostCfg"
+            } else {
+              Write-Host "No MSVC upper-bound pattern matched in $hostCfg"
+            }
+          }
+
+      - name: Setup MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+          toolset: 14.29
+
+      - name: Check MSVC toolchain
+        shell: pwsh
+        run: |
+          where.exe cl
+          Write-Host "VCToolsVersion=$env:VCToolsVersion"
+          $clBanner = (& cl.exe 2>&1 | Select-Object -First 3) -join "`n"
+          Write-Host $clBanner
+          if (-not $env:VCToolsVersion -or $env:VCToolsVersion -notlike '14.29*') {
+            throw "CUDA 11.7 expects MSVC v142 (14.29.x). Current VCToolsVersion=$env:VCToolsVersion"
+          }
+
+      - name: Install Ninja
+        shell: pwsh
+        run: choco install ninja --no-progress -y
+
+      - name: Check CUDA toolchain
+        shell: pwsh
+        run: |
+          Write-Host "CUDA_PATH=$env:CUDA_PATH"
+          foreach ($mustHave in @('lib\\x64\\cudart.lib', 'lib\\x64\\cublas.lib', 'lib\\x64\\cublasLt.lib', 'include\\cublas_v2.h', 'include\\cuda_runtime.h')) {
+            $p = Join-Path $env:CUDA_PATH $mustHave
+            if (-not (Test-Path $p)) { throw "Missing required CUDA toolkit file: $p" }
+            Write-Host "Found $p"
+          }
+          where.exe nvcc
+          nvcc --version
+
+      - name: Build fastllm Win7 CUDA sm_75
+        shell: pwsh
+        run: |
+          .\build-fastllm-win7-cuda.ps1 -Clean -CudaArch 75 -Generator "Ninja"
+
+      - name: Debug CMake logs
+        if: always()
+        shell: pwsh
+        run: |
+          $bdir = 'build-x86_64-win7\fastllm\cuda'
+          $err = Join-Path $bdir 'CMakeFiles\CMakeError.log'
+          $out = Join-Path $bdir 'CMakeFiles\CMakeOutput.log'
+          if (Test-Path $err) {
+            Write-Host '---- CMakeError.log (tail 250) ----'
+            Get-Content $err -Tail 250
+          } else {
+            Write-Host "No CMakeError.log at $err"
+          }
+          if (Test-Path $out) {
+            Write-Host '---- CMakeOutput.log (tail 120) ----'
+            Get-Content $out -Tail 120
+          } else {
+            Write-Host "No CMakeOutput.log at $out"
+          }
+
+      - name: Bundle runtime DLLs
+        shell: pwsh
+        run: |
+          $out = 'EVA_BACKEND\x86_64\win7\cuda\fastllm'
+          if (-not (Test-Path $out)) { throw "Output directory missing: $out" }
+          if (-not (Test-Path $env:CUDA_PATH)) { throw "CUDA_PATH missing: $env:CUDA_PATH" }
+
+          $requiredCudaDllPatterns = @(
+            'cudart64_*.dll',
+            'cublas64_*.dll',
+            'cublasLt64_*.dll'
+          )
+
+          foreach ($pattern in $requiredCudaDllPatterns) {
+            $src = Get-ChildItem -Path $env:CUDA_PATH -Recurse -File -Filter $pattern -ErrorAction SilentlyContinue | Sort-Object FullName | Select-Object -First 1
+            if (-not $src) { throw "Required CUDA runtime DLL missing under CUDA_PATH pattern: $pattern" }
+            $src = $src.FullName
+            $destName = Split-Path $src -Leaf
+            Copy-Item $src -Destination (Join-Path $out $destName) -Force
+            Write-Host "Bundled $destName from $src"
+          }
+
+          $optionalVcDlls = @(
+            'vcruntime140.dll',
+            'vcruntime140_1.dll',
+            'msvcp140.dll',
+            'concrt140.dll',
+            'vcomp140.dll'
+          )
+
+          foreach ($dll in $optionalVcDlls) {
+            $sysPath = Join-Path "$env:WINDIR\System32" $dll
+            if (Test-Path $sysPath) {
+              Copy-Item $sysPath -Destination $out -Force
+              Write-Host "Bundled optional $dll"
+            } else {
+              Write-Host "Optional runtime DLL not found: $dll"
+            }
+          }
+
+      - name: Verify binaries
+        shell: pwsh
+        run: |
+          $out = 'EVA_BACKEND\x86_64\win7\cuda\fastllm'
+          if (-not (Test-Path $out)) { throw "Output directory missing: $out" }
+          foreach ($exe in @('main.exe', 'quant.exe', 'fastllm-apiserver.exe')) {
+            if (-not (Test-Path (Join-Path $out $exe))) { throw "$exe missing" }
+          }
+          if (-not (Get-ChildItem -Path $out -Filter 'cudart64_*.dll' -ErrorAction SilentlyContinue)) { throw 'cudart64_*.dll missing' }
+          if (-not (Get-ChildItem -Path $out -Filter 'cublas64_*.dll' -ErrorAction SilentlyContinue)) { throw 'cublas64_*.dll missing' }
+          if (-not (Get-ChildItem -Path $out -Filter 'cublasLt64_*.dll' -ErrorAction SilentlyContinue)) { throw 'cublasLt64_*.dll missing' }
+
+      - name: Package artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          Compress-Archive -Path 'EVA_BACKEND\x86_64\win7\cuda\fastllm' -DestinationPath 'artifacts/fastllm-win7-cuda-sm75.zip' -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fastllm-win7-cuda-sm75
+          path: artifacts/fastllm-win7-cuda-sm75.zip
+          if-no-files-found: error

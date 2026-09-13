@@ -1,0 +1,571 @@
+//
+// Created by huangyuyang on 3/5/26.
+//
+
+#ifndef FASTLLM_QWEN3_5_H
+#define FASTLLM_QWEN3_5_H
+#include "basellm.h"
+#include "cmath"
+#include "utils/persistent_worker_group.h"
+#include "utils/image_embedding_cache.h"
+
+#include <array>
+#include <atomic>
+#include <iostream>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <set>
+#include <unordered_map>
+#include <vector>
+
+namespace fastllm {
+    class Qwen3_5Model: public basellm {
+    public:
+    Qwen3_5Model (); // 构造函数
+        virtual ~Qwen3_5Model();
+
+        virtual void InitParams(); // 初始化参数信息
+        ModelContextSpec GetContextSpec() const override { return {true, true, "text_config."}; }
+
+        virtual std::map <std::string, std::vector <std::pair <std::string, DataType> > >
+        GetTensorMap(const std::vector <std::string> &tensorNames) override;
+
+        virtual void OnWeightLoaded(const std::string &weightName, const std::set<std::string> &finishedWeightNames) override;
+
+        virtual void OnWeightsCreated(const std::set<std::string> &allWeightNames) override;
+
+        virtual int GetWeightLoadPriority(
+                const std::string &tensorName,
+                const std::vector <std::pair <std::string, DataType> > &mappedWeights) const override;
+
+        virtual bool ShouldLoadWeightSeriallyBeforeOthers(
+                const std::string &tensorName,
+                const std::vector <std::pair <std::string, DataType> > &mappedWeights) const override;
+
+        virtual void OnWeightLoadGroupStarted(const std::set<std::string> &weightNames) override;
+
+        virtual bool IsWeightConsumedAfterLoad(const std::string &weightName) const override;
+
+        virtual void OnWeightLoadGroupFinished() override;
+
+        virtual void OnModelWeightsLoaded() override;
+
+        virtual bool ShouldDelaySpecialWeightCudaMove(const std::string &weightName) const override;
+        
+        // 推理
+        virtual int Forward(
+            const Data &inputIds,
+            const Data &attentionMask,
+            const Data &positionIds,
+            std::vector <std::pair <Data, Data> > &pastKeyValues,
+            const GenerationConfig &generationConfig = GenerationConfig(),
+            const LastTokensManager &lastTokens = LastTokensManager(),
+            std::vector <float> *logits = nullptr);
+            
+        virtual std::vector <int> ForwardV2(
+                int batch,
+                const Data &inputIds,
+                const std::vector <Data*> &attentionMask,
+                const std::vector <Data*> &positionIds,
+                const std::vector <int> &seqLens,
+                std::vector <std::pair <Data*, Data*> > &pastKeyValues,
+                const std::vector <GenerationConfig> &generationConfigs,
+                const LastTokensManager &lastTokens = LastTokensManager(),
+                std::vector <std::vector <float>*> *logits = nullptr);
+
+        virtual std::vector <int> ForwardGPU(
+                int batch,
+                const Data &inputIds,
+                const std::vector <Data*> &attentionMask,
+                const std::vector <Data*> &positionIds,
+                const std::vector <int> &seqLens,
+                std::vector <std::pair <Data*, Data*> > &pastKeyValues,
+                const std::vector <GenerationConfig> &generationConfigs,
+                const LastTokensManager &lastTokens = LastTokensManager(),
+                std::vector <std::vector <float>*> *logits = nullptr) override;
+
+        virtual std::vector <int> ForwardMultimodal(
+                const Data &inputIds,
+                const Data &attentionMask,
+                const Data &positionIds,
+                std::vector <std::pair <Data, Data> > &pastKeyValues,
+                const std::map <std::string, std::vector <Data*> > &multimodalInput,
+                const GenerationConfig &generationConfig = GenerationConfig(),
+                const LastTokensManager &lastTokens = LastTokensManager(),
+                std::vector <std::vector <float>*> *logits = nullptr) override;
+        
+        // 是否需要生成AttentionMask
+        virtual bool NeedAttentionMask(int qlen, int klen);
+
+        virtual void WarmUp(); // 预热
+
+        virtual bool CanUseGPUForward() const override;
+
+        virtual void OnAutoWarmupFinished() override;
+
+        virtual PagedCacheManager* GetPagedKVCacheManager(int layerIndex, bool isKey) const override;
+        virtual std::vector<std::pair<int, PagedCacheManager*> > GetPagedKVCacheManagers(int layerIndex, bool isKey) const override;
+        virtual bool TryRecordPagedPrefixCacheExtra(ResponseContext *context) override;
+        virtual int QueryPagedPrefixCacheExtra(ResponseContext *context, int maxCachedLen) const override;
+        virtual bool RestorePagedPrefixCacheExtra(ResponseContext *context, int cachedLen) const override;
+        virtual int GetChunkedPrefillSize() override;
+
+        virtual int GetBatchedPrefillTokenLimit() override;
+
+        virtual long long GetAutoWarmupCudaRuntimeReserveBytes(int deviceId, int batch) const override;
+
+        virtual long long GetAutoWarmupCudaAdditionalCacheBytesPerToken(int deviceId) const override;
+
+        virtual long long GetAutoWarmupCudaServingReserveBytes(int deviceId) const override;
+
+        virtual int GetAutoWarmupLinearAttentionBatchBudgetPercent() const override;
+
+        virtual bool ShouldEnforceAutoWarmupRuntimeBatchLimit() const override;
+
+        virtual void WarmupCudaRuntimeBuffers(int batch) override;
+
+        virtual void WarmupCudaServingHighWaterBuffers() override;
+
+        virtual bool MaterializeCudaServingForFinalKvCalibration() override;
+
+        virtual void ResetCudaServingForKvCacheResize() override;
+
+        virtual void OnResponseContextCreated(ResponseContext *context) override;
+
+        virtual void OnResponseContextRemoved(ResponseContext *context) override;
+
+        virtual bool UseModelSpecificScheduler() const override;
+
+        virtual void RunModelSpecificScheduler() override;
+
+        virtual std::string MakeInput(const std::string &history, int round, const std::string &input); // 根据历史信息和当前输入生成prompt
+
+        virtual std::string MakeHistory(const std::string &history, int round, const std::string &input, const std::string &output); // 根据当前回复更新history
+
+        std::pair<std::vector<float>, std::vector<float>> UpdateRotaryPosEmb(float base, float factor, int seqLen = 0); // 更新位置编码
+
+        static const std::string language_prefix;
+        static const std::string visual_prefix;
+
+    protected:
+        bool IsThreadTensorParallelEnabled() const;
+
+        std::vector <int> ForwardGPUWithHiddenStates(
+                int batch,
+                const Data &inputIds,
+                const std::vector <Data*> &attentionMask,
+                const std::vector <Data*> &positionIds,
+                const std::vector <int> &seqLens,
+                std::vector <std::pair <Data*, Data*> > &pastKeyValues,
+                const std::vector <GenerationConfig> &generationConfigs,
+                const LastTokensManager &lastTokens,
+                std::vector <std::vector <float>*> *logits,
+                Data *precomputedHiddenStates);
+
+        std::vector <int> ForwardV2ThreadTensorParallel(
+                int batch,
+                const Data &inputIds,
+                const std::vector <Data*> &attentionMask,
+                const std::vector <Data*> &positionIds,
+                const std::vector <int> &seqLens,
+                std::vector <std::pair <Data*, Data*> > &pastKeyValues,
+                const std::vector <GenerationConfig> &generationConfigs,
+                const LastTokensManager &lastTokens,
+                std::vector <std::vector <float>*> *logits = nullptr);
+
+        void ForwardSingleGPU(
+                int gpuId,
+                std::map <int, int> ratios,
+                int batch,
+                const Data &inputIds,
+                const Data &positionIds,
+                const std::vector <int> &seqLens,
+                std::vector <std::pair <Data*, Data*> > &pastKeyValues,
+                bool all1,
+                bool isPrefill,
+                bool tensorParallel,
+                bool firstTensorParallelRank,
+                int pagedCacheLayerOffset,
+                Data &logits,
+                Data *precomputedHiddenStates = nullptr);
+
+        bool ForwardSingleGPUDecodeGraph(
+                int gpuId,
+                std::map <int, int> ratios,
+                int batch,
+                const Data &inputIds,
+                const Data &positionIds,
+                const std::vector <int> &seqLens,
+                std::vector <std::pair <Data*, Data*> > &pastKeyValues,
+                bool all1,
+                bool isPrefill,
+                bool tensorParallel,
+                bool firstTensorParallelRank,
+                int pagedCacheLayerOffset,
+                Data &logits,
+                Data *precomputedHiddenStates = nullptr);
+
+        void PrepareMtpCudaServingWarmup();
+        void PrepareCudaServingAfterWarmup(bool highWaterOnly = false,
+                                           bool allowDuringAutoWarmup = false);
+        void PreAllocateLinearSlotPoolsForCudaGraph(
+                const std::vector<int> &devices,
+                const std::map<int, int> &ratios,
+                int slotCapacity);
+
+        Data &GetThreadTensorParallelBias(const std::string &name);
+
+        RoPEType rope_type = RoPEType::BASE;
+
+        float rope_base = 10000.f;
+
+        float rope_factor = 1.f;
+
+        int num_key_value_heads = num_attention_heads;
+
+        float rms_norm_eps = 1e-6;
+
+        bool mergeQKV = false;
+        bool mergeSwiglu = false;
+
+        bool initialized_add1 = false;
+
+        int num_k_heads, num_v_heads, head_k_dim, head_v_dim;
+        int mtp_num_hidden_layers = 0;
+        struct MtpKvCache {
+            Data key;
+            Data value;
+            int tokens = 0;
+            // TP parents keep only global shape/length; each rank owns its pages.
+            std::map<int, std::unique_ptr<MtpKvCache> > shards;
+
+            void Append(const Data &k, const Data &v,
+                        PagedCacheManager &keyPool, PagedCacheManager &valuePool);
+            void Truncate(int tokens);
+            void SetTpLength(int tokens, int heads, int headDim, DataType type);
+        };
+        struct MtpPagedCachePool {
+            PagedCacheManager key;
+            PagedCacheManager value;
+        };
+        // Declared before request caches so their page references die first.
+        mutable std::map<int, std::unique_ptr<MtpPagedCachePool> > mtpPagedCachePools;
+        mutable std::mutex mtpPagedCachePoolMutex;
+        MtpPagedCachePool &GetMtpPagedCachePool(int device, const Data &shape) const;
+        bool RestoreMtpPagedSnapshot(MtpKvCache &cache, const Data &key,
+                                    const Data &value, int device) const;
+        bool SnapshotMtpPagedCache(const MtpKvCache &cache, Data &key, Data &value) const;
+        struct DFlashContext {
+            int committedTokens = 0;
+            std::vector <std::pair <Data, Data> > draftKeyValues;
+            std::vector <int> proposalTokens;
+            std::vector <int> proposalCandidateIds;
+            std::vector <float> proposalCandidateProbs;
+        };
+        bool mtpWeightsPrepared = false;
+        bool mtpSharedWeightsPrepared = false;
+        int mtpWeightsPreparedDevice = -1;
+        bool mtpTpPrepared = false;
+        std::vector<int> mtpTpDevices;
+        std::map<int, std::vector<std::pair<int, int> > > mtpTpKvHeadScheme;
+        std::unordered_map<int, std::vector<Data*> > mtpTpMoeWeights;
+        std::unordered_map<int, std::vector<Data*> > mtpTpMoeBiass;
+        std::vector <Data*> mtpMoeWeights;
+        std::vector <Data*> mtpMoeBiass;
+        bool speculativeCollectAllLogits = false;
+        bool speculativeCaptureAllHiddenStates = false;
+        bool speculativeCaptureDFlashHiddenStates = false;
+        bool speculativeCacheOnlyForward = false;
+        Data speculativeHiddenStates;
+        std::vector <Data> speculativeDFlashHiddenStates;
+        std::vector<unsigned char> speculativeMtpAccepted;
+        DFlashContext *speculativeDFlashSamplingContext = nullptr;
+        std::vector<DFlashContext*> speculativeDFlashSamplingContexts;
+        std::vector<unsigned char> speculativeDFlashAccepted;
+        bool speculativeCaptureFirstTokenLinearState = false;
+        int speculativeLinearStateCaptureSlots = 0;
+        std::vector<std::vector<std::pair<Data, Data> > > speculativeLinearStates;
+        std::vector<std::vector<int> > speculativeLinearCaptureMask;
+        std::vector<std::pair<Data, Data> > speculativeFirstTokenLinearStates;
+        std::vector<int> speculativeFirstTokenLinearCaptureMask;
+        mutable std::unordered_map<ResponseContext*, MtpKvCache> mtpCaches;
+        mutable std::unordered_map<ResponseContext*, DFlashContext> dflashContexts;
+        mutable std::mutex mtpCacheMutex;
+        std::atomic<bool> mtpLogPrinted{false};
+        std::atomic<bool> mtpSkipLogPrinted{false};
+        std::atomic<long long> mtpValidationCount{0};
+        std::array<std::atomic<long long>, 8> mtpDraftPositionAttempts{};
+        std::array<std::atomic<long long>, 8> mtpDraftPositionAccepts{};
+
+        Data inv_scale_data;
+
+        std::vector <std::vector <Data*> > weights;
+        std::vector <std::vector <Data*> > biass;
+        bool loadFusedMoePlanned = false;
+        bool moeFusedWeightsPrepared = false;
+        std::vector <char> moeFusedLayerPlanned;
+        std::set <std::string> loadFusedMoeSourceWeights;
+        std::set <std::string> consumedFusedMoeSourceWeights;
+        std::vector <Data*> moeGate3DWeights;
+        std::vector <Data*> moeUp3DWeights;
+        std::vector <Data*> moeDown3DWeights;
+        std::vector <std::vector <char> > moeGate3DExpertReady;
+        std::vector <std::vector <char> > moeUp3DExpertReady;
+        std::vector <std::vector <char> > moeDown3DExpertReady;
+        std::unordered_map <int, std::vector <std::vector <Data*> > > threadTpMoeWeights;
+        std::unordered_map <int, std::vector <std::vector <Data*> > > threadTpMoeBiass;
+        std::unordered_map <int, std::vector <std::vector <Data*> > > singleGpuMoeWeights;
+        std::unordered_map <int, std::vector <std::vector <Data*> > > singleGpuMoeBiass;
+        bool moeWeightsPrepared = false;
+        bool gdnMergedWeightsPrepared = false;
+        std::set<int> ggufGdnRestoredLayers;
+        std::vector <int> mrope_sections = {11, 11, 10};
+        bool visionPrepared = false;
+        std::string visionDevice = "auto";
+        int vision_depth = 0;
+        int vision_hidden_size = 0;
+        int vision_num_heads = 0;
+        int vision_head_dim = 0;
+        int vision_intermediate_size = 0;
+        int vision_patch_size = 16;
+        int vision_temporal_patch_size = 2;
+        int vision_spatial_merge_size = 2;
+        int vision_out_hidden_size = 0;
+        int vision_num_position_embeddings = 0;
+        int vision_num_grid_per_side = 0;
+        int image_token_id = -1;
+        int video_token_id = -1;
+        int vision_start_token_id = -1;
+        int vision_end_token_id = -1;
+        std::vector<int> vision_deepstack_visual_indexes;
+        std::vector<float> vision_image_mean = {0.5f, 0.5f, 0.5f};
+        std::vector<float> vision_image_std = {0.5f, 0.5f, 0.5f};
+        Data visionSinData;
+        Data visionCosData;
+
+        std::unordered_map <std::string, Data> threadTpEmptyBiases;
+        int threadTpPagedCacheBase = -1;
+        std::mutex threadTpWeightPrepareLock;
+        std::atomic<bool> singleGpuWeightsPrepared{false};
+        std::atomic<bool> threadTpWeightsPrepared{false};
+        std::atomic<bool> cudaGraphPreCaptureRunning{false};
+        bool mtpCudaServingWarmupPrepared = false;
+        bool cudaServingHighWaterPrepared = false;
+        bool cudaServingPrepared = false;
+        std::vector <int> threadTpPreparedDevices;
+        std::map <int, int> threadTpPreparedRatios;
+        std::vector <std::map <int, std::vector <std::pair <int, int> > > > threadTpAttentionKVHeadSchemes;
+        std::vector <std::map <int, std::vector <std::pair <int, int> > > > threadTpLinearKeyHeadSchemes;
+        std::vector <std::map <int, std::vector <std::pair <int, int> > > > threadTpLinearValueHeadSchemes;
+        std::vector <std::map <int, std::vector <std::pair <int, int> > > > threadTpLinearConvSchemes;
+        std::map <int, std::vector <std::pair <int, int> > > threadTpLmHeadScheme;
+        std::vector <uint8_t> threadTpLinearAttentionLayers;
+        bool streamingCudaLoadEnabled = false;
+        int streamingCudaCurrentLoadGroup = -1;
+        std::unordered_map <int, Data*> mtpDraftLmHeadWeights;
+        PersistentWorkerGroup threadTpWorkerGroup;
+
+        bool dflashEnabled = false;
+        bool dflashWeightsPrepared = false;
+        int dflashWeightsPreparedDevice = -1;
+        bool dflashTpBackboneDecisionMade = false;
+        bool dflashTpBackbonePrepared = false;
+        bool dflashTpPairedMlpPrepared = false;
+        std::vector<int> dflashTpPreparedDevices;
+        std::map<int, int> dflashTpPreparedRatios;
+        int dflashCheckpointBlockSize = 0;
+        int dflashRuntimeBlockSize = 0;
+        int dflashLayers = 0;
+        int dflashHeads = 0;
+        int dflashKvHeads = 0;
+        int dflashHeadDim = 0;
+        int dflashIntermediateSize = 0;
+        int dflashMaskTokenId = -1;
+        int dflashConvGroupSize = 0;
+        int dflashConvKernelSize = 0;
+        int dflashSelectorRank = 0;
+        int dflashSelectorTopK = 0;
+        int dflashSlidingWindow = 0;
+        float dflashRmsNormEps = 1e-6f;
+        float dflashRopeTheta = 10000000.0f;
+        std::vector <int> dflashTargetLayerIds;
+        Data dflashSinData;
+        Data dflashCosData;
+        int dflashRotaryCapacity = 0;
+
+        void SplitFusedMoeWeightsIfNeeded(const std::string &layerPrefix);
+        void PrepareMoeWeights();
+        bool TryConsumeFusedMoeSourceWeight(const std::string &weightName);
+        void TryFinalizeFusedMoeLayerParts(int layer);
+        bool TryBuildFusedMoeWeightsFromLoaded();
+        bool TryBuildFusedMoeLayerFromLoaded(int layer);
+        bool IsFusedMoeLayerPlanned(int layer) const;
+        bool HasPlannedFusedMoeLayers() const;
+        bool ArePlannedFusedMoeLayersReady() const;
+        bool HasFusedMoeWeights(int layer) const;
+        Data *GetFusedMoeWeightForDevice(Data *weight, int device) const;
+        void PrepareFusedMoeLayerForDevices(int layer, const std::vector <int> &devices,
+                                             std::map <int, int> ratios);
+        void PrepareFusedMoeWeightsForDevices(const std::vector <int> &devices,
+                                              std::map <int, int> ratios);
+        void RestoreGgufGdnWeights(int firstLayer, int lastLayer);
+        void PrepareGdnWeights();
+        void PrepareGdnWeights(int firstLayer, int lastLayer);
+#ifdef USE_CUDA
+        void PrepareStreamingSingleCudaLayer(int layer, int device);
+        void PrepareStreamingTpLayer(
+                int layer, const std::vector<int> &devices,
+                std::map<int, int> ratios);
+#endif
+        void PrepareVision();
+        Data BuildFlattenedPositionIds(const std::vector <Data*> &positionIds,
+                                      const std::vector <int> &seqLens,
+                                      bool all1);
+        void MergeMultimodalFeaturesIntoText(const Data &mmTokenTypeIds,
+                                             const Data *imageEmbeds,
+                                             const Data *videoEmbeds,
+                                             Data &hiddenStates);
+        void ApplyVisionRotary(Data &input, const Data &posX, const Data &posY);
+        void EncodeVisualItems(const std::vector <Data*> &rawInputs,
+                               const Data *gridThwData,
+                               bool isVideo,
+                               Data &features,
+                               std::vector<std::vector<int>> &gridThwList,
+                               const Data *imageCacheKeys = nullptr);
+        // Created only when an image request supplies cache keys and caching
+        // is enabled. Text-only models never construct a cache pool.
+        std::unique_ptr<ImageEmbeddingCache> imageEmbeddingCache;
+        void BuildMultimodalPositionData(const Data &inputIds,
+                                         const std::vector<std::vector<int>> &imageGridThwList,
+                                         const std::vector<std::vector<int>> &videoGridThwList,
+                                         Data &mmTokenTypeIds,
+                                         Data &mropePositionIds,
+                                         Data &mropePositionDelta);
+        void ApplyMultimodalRotary(Data &input, const Data &positionIds, float ropeScale);
+        void AdjustPositionIdsWithDelta(const Data &positionIds,
+                                        const Data &mropePositionDelta,
+                                        Data &adjustedPositionIds);
+        bool HasMtpWeights() const;
+        bool HasDFlashWeights() const;
+        int DFlashDraftsPerStep() const;
+        void PrepareDFlashWeightsForDevice(int device);
+        void PrepareDFlashBackboneTensorParallelWeights(int device);
+        void RunDFlashGateupLinear(int device, Data &input,
+                                   Data &linearWeight, Data &output);
+        bool RunDFlashTensorParallelMlp(int device, Data &input,
+                                       Data &gateupWeight,
+                                       Data &downWeight, Data &output);
+        void RunDFlashDynamicConvolutionFallback(
+                const Data &source, Data &dynamicProjection,
+                Data &baseKernel, int side, int blockSize, Data &output);
+        std::vector<int> SelectDFlashDraftTokens(
+                const float *candidateTopK, const float *selectorHidden,
+                int anchorToken, const GenerationConfig &generationConfig,
+                DFlashContext &context);
+        void EnsureDFlashRotary(int positions, int device);
+        void AppendDFlashTargetHidden(int device, int tokens,
+                                      DFlashContext &context);
+        std::vector<int> RunDFlashDraft(int device,
+                                       const std::vector<int> &devices,
+                                       int anchorToken,
+                                       const GenerationConfig &generationConfig,
+                                       DFlashContext &context);
+        std::vector<std::vector<int> > RunDFlashDraftBatch(
+                int device, const std::vector<int> &devices,
+                const std::vector<int> &anchorTokens,
+                const std::vector<const GenerationConfig*> &generationConfigs,
+                const std::vector<DFlashContext*> &contexts);
+        bool HasMtpMoeWeights() const;
+        bool CanUseQwen35MTPBatchForward(int draftsPerStep) const;
+        bool CanUseQwen35DFlashBatchForward(int draftsPerStep) const;
+        bool RequiresMtpPrefixSnapshot(const ResponseContext *context) const;
+        bool RequiresDFlashPrefixSnapshot(const ResponseContext *context) const;
+        void AddMtpRmsNormOffset();
+        void PrepareMtpWeightsForDevice(int device, bool includeSharedWeights = true);
+        void RunMtpFeedForward(int device, Data &hiddenStates,
+                               bool tensorParallel = false, bool firstRank = true);
+        bool UseMtpBackboneTp(const std::vector<int> &devices) const;
+        void PrepareMtpTpWeights(const std::vector<int> &devices);
+        std::vector<int> RunMtpTpDraft(
+                const std::vector<int> &devices,
+                const std::vector<MtpKvCache*> &caches,
+                const std::vector<const Data*> &targetHiddenStates,
+                const std::vector<std::vector<int> > &inputTokens,
+                const std::vector<Data*> &positionIds,
+                const std::vector<int> &sampleRows,
+                std::vector<Data> *sampledHiddenStates, bool cacheOnly);
+        void PrepareMtpDraftLmHeadWeights(const std::vector<int> &devices);
+        Data BuildMtpPositionIds(const Data &positionIds, int row, int delta);
+        Data BuildMtpPositionIdsSlice(const Data &positionIds, int begin, int end, int delta);
+        int RunMtpGreedyDraft(int device, const std::vector<int> &devices,
+                              MtpKvCache &cache,
+                              const Data &targetHiddenStates,
+                              const std::vector<int> &inputTokens,
+                              const Data &positionIds, int sampleRow,
+                              Data *sampledHiddenStates = nullptr,
+                              bool cacheOnly = false);
+        std::vector<int> RunMtpGreedyDraftBatch(
+                              int device,
+                              const std::vector<int> &devices,
+                              const std::vector<MtpKvCache*> &caches,
+                              const std::vector<const Data*> &targetHiddenStates,
+                              const std::vector<std::vector<int> > &inputTokens,
+                              const std::vector<Data*> &positionIds,
+                              const std::vector<int> &sampleRows,
+                              std::vector<Data> *sampledHiddenStates = nullptr);
+        void Qwen35MTPLoop();
+        bool Qwen35MTPForward(
+                bool useGPUForward,
+                ResponseContext *context,
+                const Data &inputIds,
+                const std::vector <Data*> &attentionMask,
+                const std::vector <Data*> &positionIds,
+                const std::vector <int> &seqLens,
+                std::vector <std::pair <Data*, Data*> > &pastKeyValues,
+                const std::vector <GenerationConfig> &generationConfigs,
+                std::vector <std::vector <int> > &acceptedTokens,
+                std::vector <std::vector <int> > &nextInputTokens,
+                std::vector <int> &keptInputLens);
+        std::vector <int> Qwen35ForwardMultimodal(
+                ResponseContext *context,
+                const Data &inputIds,
+                const Data &attentionMask,
+                const Data &positionIds,
+                std::vector <std::pair <Data, Data> > &pastKeyValues,
+                const std::map <std::string, std::vector <Data*> > &multimodalInput,
+                const GenerationConfig &generationConfig,
+                const LastTokensManager &lastTokens,
+                std::vector <std::vector <float>*> *logits,
+                std::vector <std::vector <int> > &acceptedTokens,
+                std::vector <std::vector <int> > &nextInputTokens,
+                std::vector <int> &keptInputLens,
+                bool &usedMtpForward);
+        bool Qwen35MTPBatchForward(
+                bool useGPUForward,
+                const std::vector <ResponseContext*> &contexts,
+                const Data &inputIds,
+                const std::vector <Data*> &attentionMask,
+                const std::vector <Data*> &positionIds,
+                const std::vector <int> &seqLens,
+                std::vector <std::pair <Data*, Data*> > &pastKeyValues,
+                const std::vector <GenerationConfig> &generationConfigs,
+                std::vector <std::vector <int> > &acceptedTokens,
+                std::vector <std::vector <int> > &nextInputTokens,
+                std::vector <int> &keptInputLens);
+        std::vector <int> ForwardFromHiddenStates(
+                int batch,
+                const Data &inputIds,
+                const std::vector <Data*> &attentionMask,
+                const Data &allPositionIds,
+                const std::vector <int> &seqLens,
+                std::vector <std::pair <Data*, Data*> > &pastKeyValues,
+                const std::vector <GenerationConfig> &generationConfigs,
+                const LastTokensManager &lastTokens,
+                std::vector <std::vector <float>*> *retLogits,
+                Data &hiddenStates,
+                bool all1);
+    };
+}
+
+#endif //FASTLLM_QWEN3_5_H

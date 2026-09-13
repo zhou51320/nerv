@@ -1,0 +1,182 @@
+import argparse
+import os
+import sys
+
+from .util import make_normal_parser
+
+
+def save_defaults_to_json(parser, filename):
+    # 获取所有参数的默认值
+    defaults = {}
+
+    # 添加位置参数的默认值
+    for action in parser._actions:
+        if not action.option_strings and action.dest != 'help':
+            defaults[action.dest] = action.default if action.default is not None else ""
+    if defaults["model"] == '':
+        defaults["model"] = "Qwen/Qwen2-0.5B-Instruct"
+    for action in parser._actions:
+        # 跳过位置参数（没有option_strings的）
+        if not action.option_strings:
+            continue
+
+        # 获取参数名（选择最长的选项名，去掉前面的--或-）
+        name = max(action.option_strings, key=len).lstrip('-')
+        if (name == 'low' or name == 'path'):
+            continue
+        if (name == 'device'):
+            action.default = ""
+        # 处理store_true类型的参数
+        if action.const is True:
+            defaults[name] = False  # store_true参数的默认值是False
+        else:
+            defaults[name] = action.default
+    defaults["FASTLLM_ACTIVATE_NUMA"] = "OFF"
+    defaults["FASTLLM_NUMA_THREADS"] = 27
+
+    # 将字典转换为JSON并保存到文件
+    import json
+    with open(filename, 'w', encoding='utf-8') as f:
+        json.dump(defaults, f, indent = 4, ensure_ascii = False)
+
+    print("Create config to -> \"" + filename + "\"")
+
+def args_parser():
+    parser = argparse.ArgumentParser(description = "fastllm")
+    subparsers = parser.add_subparsers(dest='command', help='子命令')
+
+    # 创建共享的解析器
+    shared_parser = make_normal_parser("fastllm", add_help = False)
+
+    # 下载解析器
+    from .download import make_download_parser
+    download_parser = make_download_parser(add_help = False)
+
+    # 打开终端部署向导
+    tui_parser_ = subparsers.add_parser('tui', help = '终端部署向导')
+    tui_parser_.add_argument('--plain', action = 'store_true', help = '使用普通问答模式，不启用curses界面')
+
+    # 创建chat子命令（使用共享解析器）
+    subparsers.add_parser('chat', parents = [shared_parser], help = '聊天模式')
+
+    # 创建run子命令（使用相同的共享解析器）
+    subparsers.add_parser('run', parents = [shared_parser], help = '运行模式')
+
+    # 创建benchmark子命令（使用相同的共享解析器）
+    from .benchmark import add_benchmark_args
+    benchmark_parser_ = subparsers.add_parser('benchmark', aliases = ['bench'],
+                                              parents = [shared_parser],
+                                              help = '性能测试模式')
+    add_benchmark_args(benchmark_parser_)
+
+    subparsers.add_parser('download', parents = [download_parser], help = '下载模型')
+
+    # 创建webui子命令
+    from .webui_server import add_webui_args
+    webui_parser_ = subparsers.add_parser('webui', help='Web UI')
+    add_webui_args(webui_parser_)
+
+    # 浏览器部署启动器。与 webui 一样启动本地网页，但不加载模型；
+    # 模型服务由页面中的独立子进程托管。
+    launch_parser_ = subparsers.add_parser(
+        'launch', help = 'Browser deployment launcher'
+    )
+    launch_parser_.add_argument(
+        '--host', type = str, default = '127.0.0.1',
+        help = 'Launcher listen address; use 0.0.0.0 for access from other devices'
+    )
+    launch_parser_.add_argument(
+        '--port', type = int, default = 8000,
+        help = 'Launcher port (default: 8000)'
+    )
+    launch_parser_.add_argument(
+        '--no-browser', action = 'store_true', help = 'Do not open a browser automatically'
+    )
+    launch_parser_.add_argument(
+        '--config', type = str, default = '', help = 'Custom launch profile path'
+    )
+    launch_parser_.add_argument('--plugins-dir', default='', help='User UI plugin directory')
+    launch_parser_.add_argument(
+        '--agent-workspace-root', '--agent_workspace_root', default = '',
+        help = 'Root directory for Pi Agent projects (default: current user home)'
+    )
+    launch_parser_.add_argument(
+        '--allow-remote-workspace-agent', '--allow_remote_workspace_agent',
+        action = 'store_true', default = True,
+        help = 'Allow directory agents on remote listeners (enabled by default)'
+    )
+    launch_parser_.add_argument(
+        '--disable-workspace-agent', '--disable_workspace_agent',
+        action = 'store_true',
+        help = 'Disable directory agents on both local and remote listeners'
+    )
+
+    from .util import add_server_args
+    add_server_args(shared_parser)
+    subparsers.add_parser('serve', parents = [shared_parser], help = 'api模式')
+    subparsers.add_parser('server', parents = [shared_parser], help = 'api模式')
+
+    config_parser_ = subparsers.add_parser('config', help = '创建配置文件')
+    config_parser_.add_argument('file', nargs='?', help = '配置文件的路径')
+
+    export_parser_ = subparsers.add_parser('export', parents = [shared_parser], help = '创建配置文件')
+    export_parser_.add_argument('-o', '--output', type = str, required = True, help = '导出路径')
+
+    parser.add_argument('-v', '--version', action='store_true', help='输出版本号并退出')
+
+    return parser
+
+
+def main(argv=None):
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    if not raw_argv:
+        raw_argv = ["launch"]
+    args = args_parser().parse_args(raw_argv)
+    if (args.version):
+        from . import __version__
+        print("ftllm version: " + __version__)
+        return
+    # 根据不同的子命令执行不同的操作
+    if args.command == 'tui':
+        from .tui import FastllmTUI
+        raise SystemExit(FastllmTUI(plain = args.plain))
+    elif args.command == 'config':
+        file = args.file
+        if not(file) or file == '':
+            file = "config.json"
+        if os.path.exists(file):
+            choice = input("File '" + file + "' exists，replace it? (Y/N): ").strip().upper()
+            if choice == 'Y':
+                pass
+            else:
+                return
+        save_defaults_to_json(make_normal_parser("fastllm", add_help = False), file)
+    elif args.command in ('chat', 'run'):
+        from .chat import fastllm_chat
+        fastllm_chat(args)
+    elif args.command in ('benchmark', 'bench'):
+        from .benchmark import fastllm_benchmark
+        fastllm_benchmark(args)
+    elif args.command == "download":
+        from .download import HFDDownloader
+        HFDDownloader(args).run()
+    elif args.command == 'webui':
+        from .webui_server import serve_webui
+        return serve_webui(args)
+    elif args.command == 'launch':
+        from .launcher import fastllm_launcher
+        return fastllm_launcher(args)
+    elif args.command in ('server', 'serve'):
+        from .server import fastllm_server
+        fastllm_server(args)
+    elif args.command == 'export':
+        from . import llm
+        if (args.path == '' or args.path is None):
+            args.path = args.model
+        llm.export_llm_model_fromhf(path = args.path, dtype = args.dtype, moe_dtype = args.moe_dtype, lora = args.lora, output = args.output, dtype_config = args.dtype_config)
+    else:
+        print("Invalid command: ", args.command)
+        exit(0)
+
+if __name__ == "__main__":
+    main()

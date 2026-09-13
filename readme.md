@@ -156,3 +156,16 @@ inline bool mmap::open(const char *path) {
 #endif
 
 ```
+
+## fastllm（Win7 CUDA / sm_75）
+- 上游：`https://github.com/ztxz16/fastllm`，master @ `a679ccad`，作为普通 vendor 目录放在 `fastllm/`
+- 构建：`build-fastllm-win7-cuda.ps1 -Clean -CudaArch 75`（MSVC v142 14.29 + Ninja + CUDA 11.7）
+- CI：`.github/workflows/build-fastllm-win7-cuda.yml`（windows-2022 + windows-setup-cuda 11.7）
+- 产物：`EVA_BACKEND/x86_64/win7/cuda/fastllm/{main.exe, quant.exe, fastllm-apiserver.exe} + cuda 运行库 + VC 运行库`
+- fastllm 无 Vulkan 后端，Windows GPU 路径只有 CUDA；本仓库定位于 sm75（2080Ti）
+- Win7 兼容本地补丁（全在 `fastllm/` 内，不改上游）：
+  - `CMakeLists.txt`：WIN32 时加 `-D_WIN32_WINNT=0x0601`；剔除可选 Triton 源；链接只保留 `cublasLt cublas`（去掉 nccl/cuda）；把 `third_party/nccl_stub` 加入构建，并新增 `fastllm-apiserver` 可执行目标
+  - `src/devices/cuda/fastllm-cuda.cu`：`FastllmCudaValidatePointerRange` 在 Windows 用 runtime API `cudaPointerGetAttributes`（无 driver import lib）
+  - `third_party/nccl_stub/`：Windows 无 NCCL，提供最小 nccl.h + stub 实现（多卡运行时不可用，单卡无影响）与 `cuda_profiler_api.h` fallback
+- 运行要求：目标机 Win7 + NVIDIA 驱动（支持 Turing/2080Ti）+ 打包目录内附带的 CUDA/VC 运行库 DLL
+- 目标机使用：`main.exe` 交互对话、`quant.exe` 量化、`fastllm-apiserver.exe` OpenAI 兼容 HTTP server（自带 winsock 网络栈，无需外部依赖）

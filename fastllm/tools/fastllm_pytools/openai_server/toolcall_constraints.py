@@ -1,0 +1,446 @@
+import copy
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Any, Dict, Optional
+
+
+@dataclass(frozen=True)
+class ToolCallConstraintSpec:
+    """Backend-neutral tool-call constraint description."""
+
+    version: int
+    backend: str
+    descriptor: Dict[str, Any]
+    structural_tag: Optional[Dict[str, Any]] = None
+    name_constraint: Optional[Dict[str, Any]] = None
+    parameter_name_constraint: Optional[Dict[str, Any]] = None
+    name_grammar: Optional[str] = None
+    json_schemas: Dict[str, Any] = field(default_factory=dict)
+    notes: tuple[str, ...] = ()
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "version": self.version,
+            "backend": self.backend,
+            "descriptor": copy.deepcopy(self.descriptor),
+            "structural_tag": copy.deepcopy(self.structural_tag),
+            "name_constraint": copy.deepcopy(self.name_constraint),
+            "parameter_name_constraint": copy.deepcopy(
+                self.parameter_name_constraint),
+            "name_grammar": self.name_grammar,
+            "json_schemas": copy.deepcopy(self.json_schemas),
+            "notes": list(self.notes),
+        }
+
+
+@dataclass(frozen=True)
+class ConstraintApplyResult:
+    applied: bool
+    mode: Optional[str]
+    spec: Optional[ToolCallConstraintSpec]
+    message: str = ""
+
+
+def compile_tool_call_constraint(
+    descriptor: Any,
+) -> Optional[ToolCallConstraintSpec]:
+    descriptor_dict = _descriptor_to_dict(descriptor)
+    if descriptor_dict is None:
+        return None
+
+    constraint_type = descriptor_dict.get("constraint_type")
+    structural_tag = None
+    name_constraint = None
+    parameter_name_constraint = None
+    name_grammar = None
+    notes = [
+        "native FastLLM consumes supported tool and parameter name enums",
+        "full structure and argument schemas remain parser-validated",
+        "no xgrammar dependency is required to build this spec",
+    ]
+    if constraint_type in _DEEPSEEK_DSML_TAGS:
+        tags = _DEEPSEEK_DSML_TAGS[constraint_type]
+        structural_tag = _build_deepseek_dsml_structural_tag(
+            descriptor_dict, tags)
+        name_constraint = _build_deepseek_dsml_name_constraint(
+            descriptor_dict, tags)
+        parameter_name_constraint = (
+            _build_deepseek_dsml_parameter_name_constraint(
+                descriptor_dict, tags))
+        name_grammar = _build_deepseek_dsml_name_grammar(descriptor_dict, tags)
+    elif constraint_type == "dots_xml":
+        structural_tag = _build_dots_structural_tag(descriptor_dict)
+        name_constraint = _build_dots_name_constraint(descriptor_dict)
+        parameter_name_constraint = (
+            _build_dots_parameter_name_constraint(descriptor_dict))
+        name_grammar = _build_dots_name_grammar(descriptor_dict)
+    else:
+        notes.append(
+            f"no structural_tag prototype for constraint_type={constraint_type!r}")
+
+    return ToolCallConstraintSpec(
+        version=1,
+        backend="fastllm_toolcall_prototype",
+        descriptor=descriptor_dict,
+        structural_tag=structural_tag,
+        name_constraint=name_constraint,
+        parameter_name_constraint=parameter_name_constraint,
+        name_grammar=name_grammar,
+        json_schemas=copy.deepcopy(descriptor_dict.get("schemas") or {}),
+        notes=tuple(notes),
+    )
+
+
+def apply_tool_call_constraint_to_decoder(
+    decoder: Any,
+    descriptor_or_spec: Any,
+) -> ConstraintApplyResult:
+    spec = (
+        descriptor_or_spec
+        if isinstance(descriptor_or_spec, ToolCallConstraintSpec)
+        else compile_tool_call_constraint(descriptor_or_spec)
+    )
+    if spec is None:
+        return ConstraintApplyResult(
+            applied=False,
+            mode=None,
+            spec=None,
+            message="no toolcall constraint descriptor",
+        )
+
+    name_setter = getattr(decoder, "set_tool_name_constraint", None)
+    if spec.name_constraint is not None and callable(name_setter):
+        name_setter(copy.deepcopy(spec.name_constraint))
+        return ConstraintApplyResult(
+            applied=True,
+            mode="tool_name_constraint",
+            spec=spec,
+        )
+
+    setter = getattr(decoder, "set_tool_call_constraint", None)
+    if callable(setter):
+        setter(spec.to_dict())
+        return ConstraintApplyResult(
+            applied=True,
+            mode="tool_call_constraint",
+            spec=spec,
+        )
+
+    if spec.structural_tag is not None:
+        structural_setter = getattr(decoder, "set_structural_tag", None)
+        if callable(structural_setter):
+            structural_setter(copy.deepcopy(spec.structural_tag))
+            return ConstraintApplyResult(
+                applied=True,
+                mode="structural_tag",
+                spec=spec,
+            )
+
+        structured_outputs_setter = getattr(
+            decoder, "set_structured_outputs", None)
+        if callable(structured_outputs_setter):
+            structured_outputs_setter({
+                "structural_tag": json.dumps(
+                    spec.structural_tag, ensure_ascii=False),
+            })
+            return ConstraintApplyResult(
+                applied=True,
+                mode="structured_outputs",
+                spec=spec,
+            )
+
+    logging.debug(
+        "Decoder does not support toolcall constraint application; "
+        "continuing without backend constraint.")
+    return ConstraintApplyResult(
+        applied=False,
+        mode=None,
+        spec=spec,
+        message="decoder does not expose a supported constraint API",
+    )
+
+
+def _descriptor_to_dict(descriptor: Any) -> Optional[Dict[str, Any]]:
+    if descriptor is None:
+        return None
+    if hasattr(descriptor, "to_dict"):
+        return descriptor.to_dict()
+    if isinstance(descriptor, dict):
+        return copy.deepcopy(descriptor)
+    raise TypeError(
+        "toolcall constraint descriptor must be a dict or expose to_dict()")
+
+
+@dataclass(frozen=True)
+class _DsmlTagSet:
+    """Literal DSML spellings for one DeepSeek tool-call dialect.
+
+    V4 uses ``<｜DSML｜tool_calls>`` / ``invoke`` / ``parameter``; V4.1 keeps the
+    same markup token but gives every tag name a leading space
+    (``<｜DSML｜ calls>`` / ``<｜DSML｜ invoke>`` / ``<｜DSML｜ parameter>``).
+    Everything else about the constraint is identical, so the builders below
+    take the spellings as data instead of duplicating the logic.
+    """
+
+    format: str
+    block: str
+    invoke: str
+    parameter: str
+
+    @property
+    def tool_call_start(self) -> str:
+        return f"<｜DSML｜{self.block}>"
+
+    @property
+    def tool_call_end(self) -> str:
+        return f"</｜DSML｜{self.block}>"
+
+    @property
+    def alternate_tool_call_start(self) -> str:
+        return f"<\\DSML\\{self.block}>"
+
+    @property
+    def alternate_tool_call_end(self) -> str:
+        return f"</\\DSML\\{self.block}>"
+
+    def invoke_name_prefixes(self) -> list[str]:
+        return [
+            f'<｜DSML｜{self.invoke} name="',
+            f'<\\DSML\\{self.invoke} name="',
+        ]
+
+    def parameter_name_prefixes(self) -> list[str]:
+        return [
+            f'<｜DSML｜{self.parameter} name="',
+            f'<\\DSML\\{self.parameter} name="',
+        ]
+
+
+_DEEPSEEK_DSML_TAGS: Dict[str, _DsmlTagSet] = {
+    "deepseek_v4_dsml": _DsmlTagSet(
+        format="deepseek_v4_dsml",
+        block="tool_calls",
+        invoke="invoke",
+        parameter="parameter",
+    ),
+    "deepseek_v41_dsml": _DsmlTagSet(
+        format="deepseek_v41_dsml",
+        block=" calls",
+        invoke=" invoke",
+        parameter=" parameter",
+    ),
+}
+
+
+def _build_deepseek_dsml_structural_tag(
+    descriptor: Dict[str, Any],
+    tags: _DsmlTagSet,
+) -> Dict[str, Any]:
+    allowed_tool_names = list(descriptor.get("allowed_tool_names") or [])
+    return {
+        "type": "structural_tag",
+        "format": tags.format,
+        "tool_call_start": tags.tool_call_start,
+        "tool_call_end": tags.tool_call_end,
+        "alternate_tool_call_start": tags.alternate_tool_call_start,
+        "alternate_tool_call_end": tags.alternate_tool_call_end,
+        "invoke": {
+            "tag": tags.invoke,
+            "name_attribute": "name",
+            "allowed_names": allowed_tool_names,
+        },
+        "parameter": {
+            "tag": tags.parameter,
+            "required_attributes": ["name", "string"],
+        },
+        "requires_tool_call": bool(descriptor.get("requires_tool_call")),
+        "max_tool_calls": (
+            1 if descriptor.get("parallel_tool_calls") is False else None
+        ),
+        "schemas": copy.deepcopy(descriptor.get("schemas") or {}),
+    }
+
+
+def _build_deepseek_dsml_name_constraint(
+    descriptor: Dict[str, Any],
+    tags: _DsmlTagSet,
+) -> Dict[str, Any]:
+    allowed_tool_names = list(descriptor.get("allowed_tool_names") or [])
+    return {
+        "type": "tool_name_enum",
+        "format": tags.format,
+        "matching": "tokenizer_agnostic_string_prefix",
+        "allowed_names": allowed_tool_names,
+        "invoke_name_prefixes": tags.invoke_name_prefixes(),
+        "name_terminator": '"',
+        "notes": [
+            "name-only spike: constrains invoke name values only",
+            "arguments and full DSML structure remain parser-validated",
+        ],
+    }
+
+
+def _build_deepseek_dsml_parameter_name_constraint(
+    descriptor: Dict[str, Any],
+    tags: _DsmlTagSet,
+) -> Optional[Dict[str, Any]]:
+    parameter_names = _normalize_parameter_names(
+        descriptor.get("parameter_names") or {})
+    if not parameter_names:
+        return None
+    return {
+        "type": "tool_parameter_name_enum",
+        "format": tags.format,
+        "matching": "tokenizer_agnostic_string_prefix",
+        "parameter_names_by_tool": parameter_names,
+        "parameter_name_prefixes": tags.parameter_name_prefixes(),
+        "name_terminator": '"',
+        "notes": [
+            "constrains top-level DSML parameter name values only",
+            "argument values and nested JSON schema remain parser-validated",
+        ],
+    }
+
+
+def _build_deepseek_dsml_name_grammar(
+    descriptor: Dict[str, Any],
+    tags: _DsmlTagSet,
+) -> str:
+    allowed_tool_names = list(descriptor.get("allowed_tool_names") or [])
+    tool_name_rule = " | ".join(
+        _quote_ebnf_literal(name) for name in allowed_tool_names)
+    if not tool_name_rule:
+        tool_name_rule = '""'
+    return "\n".join([
+        'root ::= tool_calls',
+        f'tool_calls ::= "{tags.tool_call_start}" invoke+ '
+        f'"{tags.tool_call_end}"',
+        f'invoke ::= "<｜DSML｜{tags.invoke} name=\\"" tool_name "\\">" '
+        f'parameter* "</｜DSML｜{tags.invoke}>"',
+        f"tool_name ::= {tool_name_rule}",
+        f'parameter ::= "<｜DSML｜{tags.parameter}" parameter_attrs ">" '
+        f'parameter_value "</｜DSML｜{tags.parameter}>"',
+        'parameter_attrs ::= /[^>]*/',
+        'parameter_value ::= /[^<]*/',
+    ])
+
+
+def _normalize_parameter_names(value: Any) -> Dict[str, list[str]]:
+    if not isinstance(value, dict):
+        return {}
+    normalized: Dict[str, list[str]] = {}
+    for tool_name, names in value.items():
+        if not isinstance(tool_name, str) or not isinstance(names, list):
+            continue
+        clean_names = [name for name in names if isinstance(name, str)]
+        if clean_names:
+            normalized[tool_name] = clean_names
+    return normalized
+
+
+def _build_deepseek_v4_name_grammar(descriptor: Dict[str, Any]) -> str:
+    allowed_tool_names = list(descriptor.get("allowed_tool_names") or [])
+    tool_name_rule = " | ".join(
+        _quote_ebnf_literal(name) for name in allowed_tool_names)
+    if not tool_name_rule:
+        tool_name_rule = '""'
+    return "\n".join([
+        'root ::= tool_calls',
+        'tool_calls ::= "<｜DSML｜tool_calls>" invoke+ "</｜DSML｜tool_calls>"',
+        'invoke ::= "<｜DSML｜invoke name=\\"" tool_name "\\">" '
+        'parameter* "</｜DSML｜invoke>"',
+        f"tool_name ::= {tool_name_rule}",
+        'parameter ::= "<｜DSML｜parameter" parameter_attrs ">" '
+        'parameter_value "</｜DSML｜parameter>"',
+        'parameter_attrs ::= /[^>]*/',
+        'parameter_value ::= /[^<]*/',
+    ])
+
+
+def _build_dots_structural_tag(
+    descriptor: Dict[str, Any],
+) -> Dict[str, Any]:
+    allowed_tool_names = list(descriptor.get("allowed_tool_names") or [])
+    return {
+        "type": "structural_tag",
+        "format": "dots_xml",
+        "tool_call_start": "<dots_function_call>",
+        "tool_call_end": "</dots_function_call>",
+        "invoke": {
+            "tag": "invoke",
+            "name_attribute": "name",
+            "allowed_names": allowed_tool_names,
+        },
+        "parameter": {
+            "tag": "parameter",
+            "required_attributes": ["name"],
+        },
+        "requires_tool_call": bool(descriptor.get("requires_tool_call")),
+        "max_tool_calls": (
+            1 if descriptor.get("parallel_tool_calls") is False else None
+        ),
+        "schemas": copy.deepcopy(descriptor.get("schemas") or {}),
+    }
+
+
+def _build_dots_name_constraint(
+    descriptor: Dict[str, Any],
+) -> Dict[str, Any]:
+    return {
+        "type": "tool_name_enum",
+        "format": "dots_xml",
+        "matching": "tokenizer_agnostic_string_prefix",
+        "allowed_names": list(descriptor.get("allowed_tool_names") or []),
+        "invoke_name_prefixes": ['<invoke name="'],
+        "name_terminator": '"',
+        "notes": [
+            "constrains Dots invoke name values only",
+            "arguments and full XML structure remain parser-validated",
+        ],
+    }
+
+
+def _build_dots_parameter_name_constraint(
+    descriptor: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    parameter_names = _normalize_parameter_names(
+        descriptor.get("parameter_names") or {})
+    if not parameter_names:
+        return None
+    return {
+        "type": "tool_parameter_name_enum",
+        "format": "dots_xml",
+        "matching": "tokenizer_agnostic_string_prefix",
+        "parameter_names_by_tool": parameter_names,
+        "parameter_name_prefixes": ['<parameter name="'],
+        "name_terminator": '"',
+        "notes": [
+            "constrains top-level Dots parameter name values only",
+            "argument values and nested JSON schema remain parser-validated",
+        ],
+    }
+
+
+def _build_dots_name_grammar(descriptor: Dict[str, Any]) -> str:
+    allowed_tool_names = list(descriptor.get("allowed_tool_names") or [])
+    tool_name_rule = " | ".join(
+        _quote_ebnf_literal(name) for name in allowed_tool_names)
+    if not tool_name_rule:
+        tool_name_rule = '""'
+    return "\n".join([
+        "root ::= tool_calls",
+        'tool_calls ::= "<dots_function_call>" invoke+ '
+        '"</dots_function_call>"',
+        'invoke ::= "<invoke name=\\\"" tool_name "\\\">" '
+        'parameter* "</invoke>"',
+        f"tool_name ::= {tool_name_rule}",
+        'parameter ::= "<parameter name=\\\"" parameter_name "\\\">" '
+        'parameter_value "</parameter>"',
+        'parameter_name ::= /[^"<>]+/',
+        'parameter_value ::= /[^<]*/',
+    ])
+
+
+def _quote_ebnf_literal(value: str) -> str:
+    return json.dumps(str(value), ensure_ascii=False)

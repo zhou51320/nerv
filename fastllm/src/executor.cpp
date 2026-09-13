@@ -1,0 +1,518 @@
+//
+// Created by huangyuyang on 6/13/23.
+//
+
+#include "utils.h"
+
+#include "executor.h"
+
+#include "devices/cpu/cpudevice.h"
+#include "devices/disk/diskdevice.h"
+
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
+
+#ifdef USE_CUDA
+#include "devices/cuda/cudadevice.h"
+#include "devices/cuda/fastllm-cuda.cuh"
+#include "devices/multicuda/multicudadevice.h"
+#include "devices/multicuda/fastllm-multicuda.cuh"
+#endif
+
+#ifdef USE_TFACC
+#include "devices/tfacc/tfaccdevice.h"
+#endif
+
+#ifdef USE_TOPS
+#include "devices/tops/topsdevice.h"
+#endif
+
+#ifdef USE_NUMAS
+#include "devices/numas/numasdevice.h"
+#endif
+
+namespace fastllm {
+#ifdef USE_CUDA
+    static bool KeepKimiK3NumaTensorOnSource(
+            const std::string &opType, const std::string &name,
+            BaseDevice *device, const Data *data) {
+        if (opType != "KimiK3RoutedExperts" || device == nullptr ||
+            device->deviceType != "numa" || data == nullptr ||
+            data->dataDevice != DataDevice::CUDA ||
+            data->cudaData == nullptr || data->multiDeviceData) {
+            return false;
+        }
+        // NumasKimiK3RoutedExperts batches these three D2H copies into one
+        // pinned staging area and performs a single stream synchronization.
+        // Moving them here would issue three independent synchronous copies.
+        return name == "input" || name == "index" || name == "score";
+    }
+
+    static bool KeepNumasMergeMoeTensorOnSource(
+            const std::string &opType, const std::string &name,
+            BaseDevice *device, const Data *data) {
+        if (opType != "MergeMOE" || device == nullptr ||
+            device->deviceType != "numa" || data == nullptr ||
+            data->dataDevice != DataDevice::CUDA ||
+            data->cudaData == nullptr || data->multiDeviceData) {
+            return false;
+        }
+        // The hybrid NUMA/CUDA implementation stages its CPU activation in a
+        // reusable pinned buffer and keeps the CUDA mirror for GPU experts.
+        // Letting the generic executor move these tensors first creates a
+        // pageable D2H allocation and discards/reallocates the reusable CUDA
+        // output once per MoE layer.
+        return name == "input" || name == "index" || name == "score" ||
+               name == "output";
+    }
+
+#ifndef USE_ROCM
+    static bool KeepCudaMoeCacheWeightsOnHost(
+            const std::string &opType, const std::string &name,
+            BaseDevice *device, const DataDict &datas,
+            const IntDict &intParams) {
+        if (!FastllmCudaMoeCacheRequested() ||
+            opType != "MergeMOE" || name != "weights" ||
+            device == nullptr || device->deviceType != "cuda") {
+            return false;
+        }
+        auto weightsBatchIt = intParams.find("weights___batch");
+        auto inputIt = datas.find("input");
+        auto indexIt = datas.find("index");
+        auto scoreIt = datas.find("score");
+        auto weightsIt = datas.find("weights");
+        if (weightsBatchIt == intParams.end() ||
+            inputIt == datas.end() || inputIt->second == nullptr ||
+            indexIt == datas.end() || indexIt->second == nullptr ||
+            scoreIt == datas.end() || scoreIt->second == nullptr ||
+            weightsIt == datas.end() || weightsIt->second == nullptr) {
+            return false;
+        }
+        const auto gateTypeIt = intParams.find("gateType");
+        const MoeGateType gateType = gateTypeIt == intParams.end()
+            ? MoeGateSwiglu : static_cast<MoeGateType>(gateTypeIt->second);
+        return FastllmCudaCanRunMoeCacheSmallBatch(
+            *inputIt->second, *indexIt->second, *scoreIt->second,
+            reinterpret_cast<Data **>(weightsIt->second),
+            weightsBatchIt->second, gateType);
+    }
+#endif
+
+    static bool KeepMultiCudaMergeMoeTensorOnSource(const std::string &opType,
+                                                     const std::string &name,
+                                                     BaseDevice *device,
+                                                     const Data *data,
+                                                     const IntDict &intParams) {
+        auto expertParallelIt = intParams.find("expertParallel");
+        bool expertParallel =
+            expertParallelIt != intParams.end() && expertParallelIt->second != 0;
+        if (opType != "MergeMOE" || device == nullptr || device->deviceType != "multicuda" ||
+            data == nullptr || !expertParallel) {
+            return false;
+        }
+
+        // The batch-1 collective EP path accepts any participating CUDA device
+        // as its root.  Keep the hidden state and GPU route results together on
+        // the layer's current device instead of first copying all three tensors
+        // to multicuda's deviceIds[0].  That device then packs the single NCCL
+        // broadcast packet and receives the final reduce result directly.
+        if (data->dataDevice == DataDevice::CUDA && data->cudaData != nullptr &&
+            !data->multiDeviceData) {
+            if (name == "input") {
+                return data->dims.size() > 0 && data->dims[0] == 1 &&
+                       (data->dataType == DataType::FLOAT16 ||
+                        data->dataType == DataType::BFLOAT16 ||
+                        data->dataType == DataType::FLOAT32);
+            }
+            if (data->dims.size() >= 2 && data->dims[0] == 1 && data->dims[1] <= 16) {
+                return (name == "index" && data->dataType == DataType::INT32) ||
+                       (name == "score" && data->dataType == DataType::FLOAT32);
+            }
+        }
+
+        // CPU routing is retained as a fallback.  Letting the generic executor
+        // move these tiny tensors to a CUDA root would make MultiCudaMergeMOE
+        // copy them straight back before dispatching ranks.
+        if (data->dataDevice == DataDevice::CPU && (name == "index" || name == "score")) {
+            return true;
+        }
+        return false;
+    }
+
+#endif
+
+#ifdef USE_CUDA
+    static void SelectCudaDeviceForCandidate(BaseDevice *device) {
+        if (device == nullptr) {
+            return;
+        }
+        if (device->deviceType == "cuda" && !device->deviceIds.empty()) {
+            FastllmCudaSetDevice(device->deviceIds[0]);
+        } else if (device->deviceType == "multicuda" &&
+                   !device->deviceIds.empty()) {
+            // Several MultiCuda CanRun implementations use the active rank set
+            // to decide whether their true TP path is available.  Publish it
+            // before capability probing so the first invocation cannot fall
+            // through to a single-GPU CUDA implementation.
+            FastllmMultiCudaSetDevice(device->deviceIds);
+            FastllmMultiCudaSetDeviceRatio(device->deviceIdsRatio);
+        }
+    }
+
+    static void SyncCudaDeviceForProfiler(BaseDevice *device) {
+        if (!GetFastllmEnv().cudaSync || device == nullptr) {
+            return;
+        }
+        if (device->deviceType == "cuda") {
+            ForceDeviceSync();
+        } else if (device->deviceType == "multicuda") {
+            if (device->deviceIds.empty()) {
+                ForceDeviceSync();
+                return;
+            }
+            for (int deviceId : device->deviceIds) {
+                if (deviceId >= 0) {
+                    FastllmCudaSyncDevice(deviceId);
+                }
+            }
+        }
+    }
+#endif
+
+    Executor::Executor() {
+        this->devices.clear();
+#ifdef USE_CUDA
+        if (FastllmCudaGetDeviceCount() > 0) {
+            this->devices.push_back((BaseDevice*) new CudaDevice());
+            this->devices.push_back((BaseDevice*) new MultiCudaDevice((CudaDevice*)this->devices.back()));
+        }
+#endif
+#ifdef USE_TOPS
+        this->devices.push_back((BaseDevice*) new TopsDevice());
+#endif
+#ifdef USE_TFACC
+        this->devices.push_back((BaseDevice*) new TfaccDevice());
+#endif
+#ifdef USE_NUMAS
+        this->devices.push_back((BaseDevice*) new NumasDevice());
+#endif
+        this->devices.push_back((BaseDevice*) new DiskDevice());
+        this->devices.push_back((BaseDevice*) new CpuDevice());
+    }
+
+    Executor::~Executor() {
+        for (int i = 0; i < devices.size(); i++) {
+            delete devices[i];
+        }
+    }
+
+    void Executor::ClearDevices() {
+        this->devices.clear();
+    }
+
+    void Executor::AddDevice(fastllm::BaseDevice *device) {
+        this->devices.push_back(device);
+    }
+
+    std::string Executor::GetFirstDeviceType() {
+        return this->devices[0]->deviceType;
+    }
+
+    void Executor::SetFirstDevice(const std::string &device) {
+        auto temp = this->devices;
+        this->devices.clear();
+        for (int i = 0; i < temp.size(); i++) {
+            if (StartWith(device, temp[i]->deviceType)) {
+                this->devices.push_back(temp[i]);
+                this->devices.back()->deviceIds = ParseDeviceIds(device, temp[i]->deviceType, this->devices.back()->deviceIdsRatio);
+            }
+        }
+        for (int i = 0; i < temp.size(); i++) {
+            if (!StartWith(device, temp[i]->deviceType)) {
+                this->devices.push_back(temp[i]);
+            }
+        }
+
+        this->firstDevice = device;
+    }
+
+    bool Executor::HasDevice(const std::string &deviceType) {
+        for (int i = 0; i < devices.size(); i++) {
+            if (devices[i]->deviceType == deviceType) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    std::vector <int> Executor::GetDeviceIds(const std::string &device) {
+        for (int i = 0; i < devices.size(); i++) {
+            if (StartWith(devices[i]->deviceType, device)) {
+                return devices[i]->deviceIds;
+            }
+        }
+        return {0};
+    }
+
+    bool Executor::CanRunOnFirstDevice(const std::string &opType, const fastllm::DataDict &datas, const fastllm::FloatDict &floatParams,
+                       const fastllm::IntDict &intParams) {
+#ifdef USE_CUDA
+        SelectCudaDeviceForCandidate(this->devices[0]);
+#endif
+        return this->devices[0]->CanRun(opType, datas, floatParams, intParams);
+    }
+
+    void Executor::Run(const std::string &opType, const fastllm::DataDict &datas, const fastllm::FloatDict &floatParams,
+                       const fastllm::IntDict &intParams) {
+        auto st = std::chrono::system_clock::now();
+        {
+            auto positionIt = datas.find("positionIds");
+            if (positionIt != datas.end() && positionIt->second != nullptr &&
+                positionIt->second->dataType != DataType::FLOAT32 &&
+                intParams.find("positionIds___batch") == intParams.end()) {
+                this->Run("ToFloat32", {{"input", positionIt->second}}, {}, {});
+            }
+        }
+        bool lockInCPU = false;
+        if (GetKVCacheInCPU() || GetHistoryCacheInCPU()) {
+            // 暂时只有kvcache可能lock在CPU上
+            for (auto &it: datas) {
+                if (intParams.find(it.first + "___batch") != intParams.end()) {
+                    int batch = intParams.find(it.first + "___batch")->second;
+                    for (int i = 0; i < batch; i++) {
+                        lockInCPU |= (((Data**)it.second)[i] && ((Data**)it.second)[i]->lockInCPU);
+                    }
+                } else {
+                    lockInCPU |= (it.second && it.second->lockInCPU);
+                }
+            }
+        }
+
+        bool run = false;
+        for (auto device: devices) {
+            if (lockInCPU && device->deviceType != "cpu") {
+                continue;
+            }
+#ifdef USE_CUDA
+            SelectCudaDeviceForCandidate(device);
+#endif
+            if (device->CanRun(opType, datas, floatParams, intParams)) {
+                bool intParamsSize = intParams.size();
+                for (auto &it: datas) {
+                    if (intParamsSize > 0 && intParams.find(it.first + "___batch") != intParams.end()) {
+                        int batch = intParams.find(it.first + "___batch")->second;
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+                        if (KeepCudaMoeCacheWeightsOnHost(
+                                opType, it.first, device, datas, intParams)) {
+                            continue;
+                        }
+#endif
+                        // The disk Kimi operator materializes only the routed
+                        // experts selected by this invocation. Moving all 896
+                        // lazy entries here would defeat that bounded loading
+                        // policy and leaves no source buffer to copy anyway.
+                        if (opType == "KimiK3RoutedExperts" &&
+                            device->deviceType == "disk" && batch > 0 &&
+                            (it.first == "w1s" || it.first == "w2s" ||
+                             it.first == "w3s") &&
+                            ((Data**)it.second)[0] != nullptr &&
+                            ((Data**)it.second)[0]->isDiskWeight) {
+                            continue;
+                        }
+#ifdef USE_NUMAS
+                        // Kimi-K3 registers all three routed-expert tables in
+                        // NUMA arenas during model warmup.  Revalidating and
+                        // calling ToDevice() for 3 * 896 weights on every
+                        // decoded token only repeats an already established
+                        // placement decision.
+                        if (opType == "KimiK3RoutedExperts" &&
+                            device->deviceType == "numa" && batch > 0 &&
+                            (it.first == "w1s" || it.first == "w2s" ||
+                             it.first == "w3s") &&
+                            ((Data**)it.second)[0] != nullptr &&
+                            IsNumasLinearWeightRegistered(
+                                ((Data**)it.second)[0])) {
+                            continue;
+                        }
+#endif
+                        if ((it.first == "weights" || it.first == "biass") && ((Data**)it.second)[2]) {
+                            if ((device->deviceType == "cpu" || device->deviceType == "numa" || device->deviceType == "tfacc" || device->deviceType == "disk") && 
+                                ((Data**)it.second)[2]->dataDevice == DataDevice::CPU) {
+                                continue;
+                            }
+                            if ((device->deviceType == "cuda" || device->deviceType == "multicuda") && ((Data**)it.second)[2]->dataDevice == DataDevice::CUDA) {
+                                continue;
+                            }
+                        }
+                        if ((it.first == "biass") && !((Data**)it.second)[2]) {
+                            continue;
+                        }
+                        for (int i = 0; i < batch; i++) {
+                            if (((Data**)it.second)[i]) {
+                                ((Data**)it.second)[i]->ToDevice((void *) device);
+                            }
+                        }
+                    } else {
+                        if (it.second) {
+                            bool copyData = true;
+                            if (it.first == "output") {
+                                copyData = false;
+                            } else if (opType == "SelectExpert" && (it.first == "index" || it.first == "score")) {
+                                copyData = false;
+                            }
+#ifdef USE_CUDA
+                            if (!KeepKimiK3NumaTensorOnSource(
+                                    opType, it.first, device, it.second) &&
+                                !KeepNumasMergeMoeTensorOnSource(
+                                    opType, it.first, device, it.second) &&
+                                !KeepMultiCudaMergeMoeTensorOnSource(
+                                    opType, it.first, device, it.second,
+                                    intParams)) {
+                                it.second->ToDevice((void *) device, copyData);
+                            }
+#else
+                            it.second->ToDevice((void *) device, copyData);
+#endif
+                        }
+                    }
+                }
+                static const bool traceOps = std::getenv("FASTLLM_TRACE_OPS") != nullptr;
+                if (traceOps) {
+                    auto wIt = datas.find("weight");
+                    const char *wName = (wIt != datas.end() && wIt->second != nullptr &&
+                                         !wIt->second->name.empty()) ? wIt->second->name.c_str() : "";
+                    fprintf(stderr, "[op] %s on %s %s\n", opType.c_str(),
+                            device->deviceType.c_str(), wName);
+                    fflush(stderr);
+                }
+                device->Reshape(opType, datas, floatParams, intParams);
+                device->Run(opType, datas, floatParams, intParams);
+#ifdef USE_CUDA
+                SyncCudaDeviceForProfiler(device);
+#endif
+                run = true;
+                break;
+            }
+        }
+        if (!run) {
+            ErrorInFastLLM("Can't run " + opType + " in any device.");
+        }
+        float spend = GetSpan(st, std::chrono::system_clock::now());
+        profiler[opType] += spend;
+    }
+
+    void Executor::RunOnDevice(const std::string &deviceType,
+                               const std::string &opType,
+                               const fastllm::DataDict &datas,
+                               const fastllm::FloatDict &floatParams,
+                               const fastllm::IntDict &intParams) {
+        auto st = std::chrono::system_clock::now();
+        bool run = false;
+        for (auto device: devices) {
+            if (device->deviceType != deviceType) {
+                continue;
+            }
+#ifdef USE_CUDA
+            SelectCudaDeviceForCandidate(device);
+#endif
+            if (!device->CanRun(opType, datas, floatParams, intParams)) {
+                continue;
+            }
+            bool intParamsSize = intParams.size();
+            for (auto &it: datas) {
+                if (intParamsSize > 0 && intParams.find(it.first + "___batch") != intParams.end()) {
+                    int batch = intParams.find(it.first + "___batch")->second;
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+                    if (KeepCudaMoeCacheWeightsOnHost(
+                            opType, it.first, device, datas, intParams)) {
+                        continue;
+                    }
+#endif
+                    if ((it.first == "weights" || it.first == "biass") && ((Data**)it.second)[2]) {
+                        if ((device->deviceType == "cpu" || device->deviceType == "numa" || device->deviceType == "tfacc" || device->deviceType == "disk") &&
+                            ((Data**)it.second)[2]->dataDevice == DataDevice::CPU) {
+                            continue;
+                        }
+                        if ((device->deviceType == "cuda" || device->deviceType == "multicuda") && ((Data**)it.second)[2]->dataDevice == DataDevice::CUDA) {
+                            continue;
+                        }
+                    }
+                    if ((it.first == "biass") && !((Data**)it.second)[2]) {
+                        continue;
+                    }
+                    for (int i = 0; i < batch; i++) {
+                        if (((Data**)it.second)[i]) {
+                            ((Data**)it.second)[i]->ToDevice((void *) device);
+                        }
+                    }
+                } else {
+                    if (it.second) {
+                        bool copyData = true;
+                        if (it.first == "output") {
+                            copyData = false;
+                        } else if (opType == "SelectExpert" && (it.first == "index" || it.first == "score")) {
+                            copyData = false;
+                        }
+#ifdef USE_CUDA
+                        if (!KeepKimiK3NumaTensorOnSource(
+                                opType, it.first, device, it.second) &&
+                            !KeepMultiCudaMergeMoeTensorOnSource(
+                                opType, it.first, device, it.second,
+                                intParams)) {
+                            it.second->ToDevice((void *) device, copyData);
+                        }
+#else
+                        it.second->ToDevice((void *) device, copyData);
+#endif
+                    }
+                }
+            }
+            device->Reshape(opType, datas, floatParams, intParams);
+            device->Run(opType, datas, floatParams, intParams);
+#ifdef USE_CUDA
+            SyncCudaDeviceForProfiler(device);
+#endif
+            run = true;
+            break;
+        }
+        if (!run) {
+            ErrorInFastLLM("Can't run " + opType + " on device " + deviceType + ".");
+        }
+        float spend = GetSpan(st, std::chrono::system_clock::now());
+        profiler[opType] += spend;
+    }
+
+    void Executor::ClearProfiler() {
+        profiler.clear();
+    }
+
+    void Executor::AddProfiler(const std::string &opType, float spend) {
+        profiler[opType] += spend;
+    }
+
+    float Executor::GetProfilerTotal() const {
+        float sum = 0.0f;
+        for (auto &it : profiler) {
+            sum += it.second;
+        }
+        return sum;
+    }
+
+    void Executor::PrintProfiler() {
+        float sum = 0.0;
+        for (auto &it : profiler) {
+            printf("%s spend %f\n", it.first.c_str(), it.second);
+            sum += it.second;
+        }
+        printf("total spend %f\n", sum);
+#ifdef __ANDROID__
+        __android_log_print(ANDROID_LOG_INFO, "FastllmProfiler", "===== Profiler Results =====");
+        for (auto &it : profiler) {
+            __android_log_print(ANDROID_LOG_INFO, "FastllmProfiler",
+                "%s spend %.4f s (%.1f%%)", it.first.c_str(), it.second, sum > 0 ? it.second * 100.0f / sum : 0);
+        }
+        __android_log_print(ANDROID_LOG_INFO, "FastllmProfiler", "total spend %.4f s", sum);
+#endif
+    }
+}

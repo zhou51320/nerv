@@ -1,0 +1,341 @@
+# 版本日志
+
+[English](version_en.md)
+
+## V0.1.8.2
+
+- 新增网页部署启动器和 Electron 桌面启动器，支持模型下载、启动项管理、长上下文与高并发自动配置，以及推理速度和可用上下文显示
+- 重构工作室，支持多会话并发、停止生成、附件和历史记录，接入 Pi 目录智能体，增加联网搜索、文档问答、数据分析、代码处理和 PPT 生成能力
+- 完善 Qwen3.8-Flash-Next 多模态、MTP 和前缀缓存，新增 FP8/NVFP4 CUDA 专家缓存、动态混合调度和 NUMA 权重共享，改善混合推理速度与内存使用
+- 新增 GLM-5.3 MTP 推测解码，支持 DeepSeek-V4 混合推理 MTP
+- 完善 GGUF 自描述加载，支持 Qwen3.5 架构 GGUF 的内外置 MTP 和多模态投影；修复低比特量化兼容问题，通过分块反量化降低临时显存占用
+- 新增 `--low_gpu_mem` 低显存模式，为 Qwen3.5 架构增加 FP4 KV Cache，并优化张量并行权重加载内存和高分辨率视觉推理，新增图片特征缓存
+- 新增 `--rope_scaling`，为 HF Qwen2、Qwen3、Qwen3.5 系列支持静态 YaRN 上下文扩展，并增加启动时的上下文容量检查
+- 优化不同 GPU 架构下的 FP8 Linear、NVFP4、GDN 和分页注意力，改善预填充、解码及小批量推理性能
+- 修复奇数卡张量并行卡死、多卡量化权重重排死锁、MTP 验证图显存泄漏和双卡多模态越界等问题，完善工具调用流式解析与参数校验
+- Wheel 增加 SM86 原生代码，Linux 默认安装 Triton；完善绿色包依赖、命令行入口和使用说明，支持无桌面环境部署
+
+## V0.1.8.1
+
+- 完善 Qwen3.8-Flash-Next，支持 MTP 推测解码和跨请求前缀缓存，优化 CUDA/NUMA 混合推理性能
+- 完善 Qwen3.5 GGUF、DFlash2 和双卡推理，修复 CUDA Graph 相关问题
+- 完善 CUDA 12.9、多架构 Wheel、Triton 服务脚本及 Linux 绿色包的构建与打包
+
+## V0.1.8.0
+
+### 新模型与推理能力
+
+- 支持 Qwen4-Exp / Qwen3.8-Flash-Next FP8 文本模型，覆盖四路超连接、Gated DeltaNet、QSA 稀疏注意力、PLE ngram 和 FP8 MoE；当前支持文本解码，不加载视觉和 MTP 权重
+- 完善 Qwen4 CPU、CUDA 和 NUMA 混合推理、长上下文与前缀缓存、预填充和解码融合算子及 CUDA Graph；新增 `--ngram_device disk`，可从磁盘按需读取超大 PLE 表以降低主机内存占用
+- 支持 Kimi-K3，覆盖 CUDA、NUMA、CPU/GPU 专家并行、磁盘专家、KDA/MLA 分块预填充、DSpark、XTML 服务协议及工具调用
+- 支持 Dots3-Note，加入 DSA 索引、稀疏注意力、长上下文缓存、分块预填充、思考模式及工具调用
+- 支持 GLM-5.3-Flash，加入 KDA、分页历史缓存、压缩分页注意力、NUMA 解码流水及思考和工具调用协议
+- 新增 GLM-5 DSA 模型支持，并支持 GLM-5.2 量化 KV-B 的纯 CPU 推理
+- 支持 Laguna 模型及长上下文缓存，完善 CUDA Graph、八卡张量并行、混合 MoE、NVFP4 和 INT4_GROUP32 推理
+- 新增 HY-V3 模型及工具调用解析，并支持 Poolside V1 工具调用协议
+- 为 Qwen3.8/Qwen3.5 架构接入 DFlash2 投机解码，支持独立 draft checkpoint、rejection sampling、批量解码、双卡张量并行、长上下文、前缀快照和紧凑 INT4 draft 权重；双卡等权 CUDA 部署会自动启用 DFlash2 backbone TP
+- 为 DeepSeek-V4 接入模型内置 DSpark，并为 Kimi-K3 支持外部 DSpark draft 模型；统一 DSpark/DFlash2 草稿参数，新增 `--dspark`、`--draft` / `--draft_model_path` 和 `--draft_tokens` 简写，同时保留 `--speculative_*` 完整参数
+- 继续优化 Qwen3.5 MTP，支持 MoE MTP，改善批量状态备份、八 token 验证快照、并发调度和长 KV 验证性能
+
+### 性能与后端
+
+- 系统优化 Qwen3.5 的路由、FP8 MoE、RMSNorm、GDN、预填充和解码融合；符合条件的 CUDA 张量并行部署会自动启用 CUDA Graph、GPU Token Handoff 和 CUDA Embedding 快速路径
+- 将 Qwen3.5 默认分块 Prefill 大小调整为 2048
+- 深化 DeepSeek-V4 CUDA、CPU 和 NUMA 推理，加入多卡完整图执行、SM120 稀疏 MLA、路由、MoE 与 WoA 加速，并优化压缩缓存和混合 NUMA MoE 流水
+- 优化 Dots3 稀疏预填充、FP8 索引器和长 KV 搬运，优化 Kimi-K3 KDA/MLA 缓存与分块预填充，以及 GLM-5.3-Flash NUMA 解码流水
+- 新增 CUDA Q2_K GGUF、AWQ MoE Marlin、NVFP4 Marlin 张量并行、SM75+ FP8 dense Marlin、SM89 FP8 CUTLASS 自动择优及紧凑 NVFP4 CUDA/NUMA 回退
+- 支持 compressed-tensors `pack-quantized` 非对称 INT4 checkpoint，统一转换为可移植的 `INT4_GROUP` 权重，覆盖 CPU、CUDA 与多卡 TP，并补齐 TFACC 元数据兼容
+- 优化 INT4_GROUP、FP8、NVFP4、MXFP4、Q8_0/Q8_K 等量化格式在 CUDA、CPU、NUMA 和多卡场景下的加载、计算及显存使用
+- 优化自定义 AllReduce 自动选择、多卡图内通信、无 P2P 跨卡回退、CUDA Graph 显存复用及分页缓存调度
+- 优化分页注意力预填充和 SM70/SM75 D256 GQA 解码，支持磁盘流式执行 Linear 和 Embedding，并将 FlashInfer 更新至 `v0.6.16.post1`
+
+### 服务与接口
+
+- 新增 `--max_context_length` / `--max-context-length`，限制单会话输入与输出总长度；`/v1/models` 同时返回模型上下文、实际上下文、KV Cache 容量和配置上限
+- 新增 `--startup-progress ndjson`，通过标准错误输出模型加载、权重读取、预热和服务就绪进度
+- OpenAI Chat Completions、Responses API 和 Anthropic API 使用运行时原生 token 统计，返回缓存命中、未命中输入 token 和实际输出 token
+- 为 Qwen3.5、Qwen4-Exp、Kimi-K3、Dots3 和 GLM-5.3-Flash 完善 reasoning effort，并正确拆分流式和非流式 `reasoning_content`
+- 新增或完善 GLM、HY-V3、Kimi-K3、Dots3、Qwen4-Exp 和 Poolside V1 工具调用解析，改进 `tool_choice=required`、参数约束和跨分片流式解析
+- 改进 Fastllm Studio 的模型部署、启动参数、运行状态、模型选择和本地聊天界面
+
+### 稳定性与兼容性
+
+- 修复流式请求句柄复用竞态、提前终止后的资源释放、停止词约束、最小输出长度和缓存用量统计问题
+- 修复前缀缓存恢复、低 KV 预算调度、CUDA Graph KV 定容、图捕获期间通信、显存池复用和多卡量化权重拆分问题
+- 修复 DeepSeek-V4 多卡缓存恢复、纯 CPU/非 CUDA 构建、NUMA 退出卡死和双卡串行解码，以及 Qwen3.5 GGUF 合并、多卡采样和服务预热显存估算问题
+- 完善 SM60/Pascal 的纯旧架构 CUDA 构建、原生分页注意力预填充和 AWQ Marlin 兼容回退，并适配不同 CCCL 版本的采样算子接口
+- 修复 AWQ、GGUF MoE、FP8 Marlin/CUTLASS、NUMA FP8 MoE、Q8_K 和 YaRN 等量化精度或跨平台兼容性问题
+- 补充新模型、量化算子、CUDA Graph、MoE、多卡、工具调用和 API 回归测试，以及 logits 对齐、NCCL、HLE 和性能分析工具
+
+## V0.1.7.1
+
+- 完善Qwen3.5 MTP解码，支持多卡、批量和非贪婪采样，支持FP8草稿头
+- 优化Qwen3.5 MTP验证转置和单请求草稿调度，修复状态提交、批量全接受、长输入、前缀缓存命中及显存溢出问题
+- 优化Qwen3.5 MoE和TP2归约及CUDA Graph资源使用，修复TP多模态前向和非CUDA编译问题
+- 新增FP8 Linear加速路径并内置所需头文件，优化FP8算子变体选择、输入量化缩放、权重缓存及小批量回退
+- 优化Qwen3 FP8 MLP融合路径
+- 完善auto模式下的FP8权重识别、NVFP4权重加载及多卡切分，优化NVFP4单Token GEMV，修复FP8多卡缩放因子切分
+- 支持OpenAI Responses API
+- 完善工具调用解析和流式、非流式校验，支持tool_choice、strict参数校验以及工具名和参数名生成约束
+- 修复多种工具流解析状态及聊天结束原因，补充DeepSeek V4等工具调用回归和手动测试
+- 修复think模式下KV Cache复用失败，以及CPU Qwen3数据类型、重复输出和乱码问题
+- 修复分页缓存越界写入，调整分页缓存调度容量和预热采样页预算
+- 修复CUDA Graph错误熔断、MultiCUDA大权重偏移溢出和CUDA多卡内存释放死锁，完善CUDA执行同步及多Token状态快照
+- 补充CUDA多卡、状态快照和算子数值回归测试，以及FP8算子基准和算子开发支持
+
+## V0.1.7.0
+
+- 新增终端部署向导和模型向导（ftllm即可执行）
+- 优化张量并行
+- 初步支持Qwen3.5 MTP解码
+- 支持Qwen3.5 MoE路径，修复Qwen3MoE异构TP及混合MoE设备路径
+- 修复Qwen3.5前缀缓存、空注意力分片和非CUDA编译问题
+- 支持Step3.7文本模型、视觉前向和多模态预处理
+- 初步支持CUDA Graph
+- 支持MoE混合推理的层数
+- 优化多卡按层切分平衡，修复多卡分页缓存分配和分页调度饿死问题
+- 支持SM60, SM70
+- 修复Qwen工具调用解析、cuBLAS句柄表并发竞争、CUDA分页注意力崩溃、分页缓存元数据及页数统计等问题
+- 修复logits结果生命周期和潜在内存泄漏问题
+- 更新混合推理文档
+
+## V0.1.6.4
+
+- 优化DeepSeek V4解码速度
+- 优化DeepSeek V4预填重速度
+- 优化DeepSeek V4并发速度
+- 优化DeepSeek V4 NVFP4算子的速度
+- DeepSeek V4模型支持多卡串行
+- 减少NVFP4模型的内存占用
+- 优化CUDA MOE速度
+- 支持多CUDA, NUMA, Disk一起混合推理
+- 支持Step3.5模型，补充Step3.5运行时和服务适配，优化Step3.5 MoE拆分与并发解码
+- 优化Qwen3.5批量解码吞吐
+
+## V0.1.6.3
+
+- 修复transformers 5.8.0升级后不兼容的bug
+- 增加`--cuda_slab`参数，可减少大量CUDA模型权重小块分配造成的显存碎片
+
+## V0.1.6.2
+
+- 支持磁盘MoE推理，补充磁盘设备后端和SSD读取速度测试工具
+- 优化GGUF磁盘MoE推理，修复磁盘MoE及FP8磁盘MoE加载问题
+- 支持DeepSeek V4思考输出, 可以使用参数--enable_thinking控制
+- 优化DeepSeek V4显存缓存拼接，修复解码缓存内存增长问题
+- 限制DeepSeek V4稀疏预填充临时显存，降低长上下文预填充显存峰值
+- 调整DeepSeek V4默认采样参数，默认使用top_k = 5
+
+## V0.1.6.1
+
+- 更新DeepSeek V4量化配置，补充Q2、Q4、UD-Q2_K_L、UD-Q2_K_M量化示例
+- 支持CUDA NVFP4线性计算
+- 支持CUDA Q2_K_R4反量化
+- 优化DeepSeek V4 compressedKV CUDA缓存，提升稀疏解码性能
+
+## V0.1.6.0
+
+- 支持DeepSeek V4模型，补充DeepSeek V4的分词和chat_template处理
+- 修复DeepSeek V4缺少chat_template时加载出错的问题
+- 修复DeepSeek V4工具调用解析的问题
+- 支持Qwen3.5多模态推理，补充Qwen3.5多模态Python接口
+- 支持Qwen3.5 MoE模型识别和默认参数设置
+- 初步支持Gemma4多模态推理
+- 支持Minimax-M2模型，补充Minimax-M2工具调用解析
+- 初步支持Anthropic API兼容接口，新增`/v1/messages`接口
+- 修复Anthropic API工具调用的问题
+- OpenAI兼容API支持图文输入，支持http、data url和file url图片
+- 修复多模态推理资源管理的问题
+- 支持参数`--kv_cache_dtype`设置KV缓存类型
+- 增加`--chunked_prefill_size`参数设置分块prefill大小
+- 增加`--tokens`、`--page_size`、`--gpu_mem_ratio`等参数，方便控制长上下文和缓存
+- 增加`--moe_atype`参数，可指定MOE层激活类型
+- 增加`--cuda_se`参数，可控制共享专家是否使用CUDA执行
+- 支持`cudapp=N`、`cudapp=1:2:3`形式简写多卡串行执行参数
+- API server支持读取模型默认采样参数
+- API server支持通过命令行覆盖temperature、top_p、top_k、repeat_penalty等采样参数
+- 修复API server中enable_thinking和think参数透传的问题
+- API server启动时会尝试提高ulimit，减少请求较多时文件描述符不足的问题
+- 新增`ftllm.env`模块，可读取当前wheel的编译信息
+- 优化Python包版本读取，支持从`ftllm`、`ftllm-nightly`、`ftllm-rocm`读取版本号
+- 优化CUDA wheel依赖库加载，支持从pip安装的nvidia依赖中查找CUDA、cuBLAS、NCCL库
+- CUDA wheel补充NCCL依赖和SM80预编译架构
+- 修复Python历史缓存的问题
+- 修复读取GGUF模型时未加载generation_config的问题
+- 修复CPU embedding、tie weight等模型加载问题
+- 修复tool parser在tokenizer缺失时可能出错的问题
+- 修复nightly打包元数据和Python包编译脚本相关问题
+
+## V0.1.5.1
+
+- 初步支持AMX加速，在支持AMX的机器上通过参数--amx true来开启
+- 修复纯CPU执行Next模型出错的bug
+- 修复部分没有AVX512的机器执行出错的bug
+- Numa分配出错时输出提示信息和解决命令
+- 修复Cuda计算长Attention的错误 (pr from loveheart)
+- 修复Arm上的编译
+
+## V0.1.5.0
+
+- 提高moe_device为numa时的prefill速度
+- moe_device为numa时，可以不设置环境变量，通过`-t`参数设置总的线程数
+- 支持参数`--moe_dtype bfloat16`指定moe类型为bf16, 在一些情况下可以提高速度
+- 支持GLM系列的FP8模型，修复GLM模型长上下文的bug
+- 支持DeepSeek V3.2模型
+- 新增项目引用文件说明，详见[参考代码和文章](../README.md#参考代码和文章)
+
+## V0.1.4.9
+
+- 修复Qwen3-Next长上下文中出现的bug
+
+## V0.1.4.8
+
+- 增加 通用动态量化（Universal Dynamic Quantization）功能，参考[动态量化指南](dtype_config.md)
+- 修复Qwen3-Next缓存错误的Bug
+- 提升Qwen3-Next混合推理速度
+
+## V0.1.4.7
+
+- 初步适配Qwen3-Next模型
+
+## V0.1.4.6
+
+- 修复GLM4.5出错的一些bug
+- 支持一些GGUF类型
+
+## V0.1.4.5
+
+- 部分模型支持工具调用 [查看详情](../README.md#工具调用)
+- 支持GLM4.5, GLM4.5-AIR
+- 修复1.4.3版本部分模型缓存失效的bug
+- DSV3.1支持使用enable_thinking打开思考模式
+- Prefill时会发空包维持客户端连接
+- 修复部分GGUF-q8模型计算出错的bug
+- 修复部分fp16模型numa计算出错的bug
+
+## V0.1.4.3
+
+- 修复一些情况下前端退出后后端继续推理的问题
+- 修复一些情况下crtl + c无法退出的问题
+- 修复numa模式下推理GGUF出现的一些计算错误
+- 增加GGUF中q8_0类型支持
+
+## V0.1.4.2
+
+- 修复AVX512模式下出错的问题
+
+## V0.1.4.1
+
+- 修复一些可能的glibc出错问题
+
+## V0.1.4.0
+
+- 适配部分GGUF模型
+- 混合推理提升Prefill速度
+- c++中增加了一些分词器
+- 修复位置编码的一些bug
+- 修改重复惩罚因子，当last_n为0时，重复惩罚与Transfromers一致
+- 修复download可能出错的一些bug
+
+## V0.1.3.4
+
+- 修复Kimi-K2模型分词出现的一些错误
+
+## V0.1.3.3
+
+- 支持Kimi-K2模型
+- 修复8numa时的一些bug
+- 加速CPU上的AWQ计算
+
+## V0.1.3.2
+
+- 修复上个版本一些模型无法读取的bug
+
+## V0.1.3.1
+
+- 支持Hunyuan模型 （混元）
+- 支持Ernie_4.5模型 （文心）
+- 支持PanguPro模型 （盘古）
+- 支持Minimax 01, Minimax M1模型
+- 优化旧GPU上的一些计算性能
+- 在dev_mode下支持主动终止请求 [查看详情](https://github.com/ztxz16/fastllm/pull/535)
+- 修复numa模式下无法计算float16的问题
+- 修复numa个数过多时可能出现的一些错误
+
+## V0.1.3.0
+
+- DeepSeek模型中，默认改用cuda执行共享专家，可通过参数`--cuda_se false`来关闭
+- 支持使用类似`--device "{'cuda:0':1,'cuda:1':1}"`的命令来串行执行，参考[如何设定运行设备](../README.md#3-如何设定运行设备)
+- 增加动态量化功能，参考[动态量化指南](dtype_config.md)
+- 修复一些超长prompt可能引起的出错
+- 多卡张量并行时将平分显存，目前测试阶段，仅在llama系模型（如Qwen2, Qwen2.5, QwQ等）生效
+- 所有moe模型支持`--moe_expert`参数 （之前的版本中，qwen3-moe此参数不会生效）
+
+
+## V0.1.2.0
+
+- 规范版本号 a.b.c.d
+- a为保留位，目前为0
+- b为大版本号
+- c为小版本号
+- d为bug修复版本的编号
+
+## V0.0.1.2
+
+- 优化了numa加速
+- 略微提升了prefill和decode速度
+- 支持了moe的混合张量并行，参考[混合推理指南](mixforward.md)
+- 修复了multicuda的一些bug，支持了所有精度的混合张量并行
+- 修复了C++下Jinja模板的一些bug，支持Qwen3, DS等一系列模型的内置分词器
+
+## V0.0.1.1
+
+- 支持了 `FP8_E4M3` 精度（新老硬件均可）
+- MOE模型支持用`--moe_dtype`来设置混合精度
+- 可以在`ROCM`环境下使用`pip`安装了
+- 修复了C++下Jinja模板的一些bug
+- api server的默认输出token数由8K提升到32K
+
+## V0.0.1.0
+
+- 支持了千问3模型 [部署指南](qwen3.md)
+- 优化了DeepSeek模型的显存使用
+- 增加参数`--cache_fast`来指定是否使用显存缓存
+
+## V0.0.0.9
+
+- 优化了使用DeepSeek模型时的多轮对话缓存
+- 略微提升了DeepSeek模型的多并发速度
+- 减少了DeepSeek模型Prefill时的显存消耗，可以支持更长的上下文
+- 支持了DeepSeek模型的INT8量化 （使用原始模型时`--dtype int8`，或者导出时`--dtype int8`）
+- 隐藏了 "None of PyTorch, TensorFlow >= 2.0 ..." 的警告信息
+- 增加了`--cache_dir`参数来指定缓存目录
+- server增加了`--hide_input`参数来隐藏日志中的请求信息
+- webui增加了`--max_token`参数来指定最大输出，--think参数来强制思考
+
+## V0.0.0.8
+
+- api server增加api_key参数，来设定api_key
+- api server支持了一些复合输入
+- 提升了moe模型prefill的速度
+- 增加了--version参数查看版本号
+
+## V0.0.0.7
+
+- 增加config选项，可通过config.json文件来启动模型
+- 提升moe模型的速度
+
+## V0.0.0.6
+
+- 降低GLIBC版本，PIP安装包兼容更多系统
+- PIP安装包支持更多架构（目前最低支持到SM_52）
+
+## V0.0.0.5
+
+- 修改文档，增加了一些pip安装后无法使用的情况说明
+- 聊天模式下自动读取模型的生成配置文件
+- 修复一些情况下kv_cache_limit计算错误的问题
+
+## V0.0.0.4
+
+- 增加ftllm run, chat, webui, server接口

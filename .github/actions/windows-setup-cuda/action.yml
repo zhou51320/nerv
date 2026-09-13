@@ -259,14 +259,10 @@ runs:
       run: |
         $root = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.7"
         $packages = @(
-          @{ folder = "cuda_cudart"; file = "cuda_cudart-windows-x86_64-11.7.99-archive.zip" },
-          @{ folder = "cuda_nvcc"; file = "cuda_nvcc-windows-x86_64-11.7.99-archive.zip" },
-          @{ folder = "cuda_nvrtc"; file = "cuda_nvrtc-windows-x86_64-11.7.99-archive.zip" },
-          @{ folder = "libcublas"; file = "libcublas-windows-x86_64-11.7.4.6-archive.zip" },
-          @{ folder = "cuda_nvtx"; file = "cuda_nvtx-windows-x86_64-11.7.91-archive.zip" },
-          @{ folder = "visual_studio_integration"; file = "visual_studio_integration-windows-x86_64-11.7.91-archive.zip" },
-          @{ folder = "cuda_nvprof"; file = "cuda_nvprof-windows-x86_64-11.7.101-archive.zip" },
-          @{ folder = "cuda_cccl"; file = "cuda_cccl-windows-x86_64-11.7.91-archive.zip" }
+          @{ folder = "cuda_cudart"; file = "cuda_cudart-windows-x86_64-11.7.60-archive.zip" },
+          @{ folder = "cuda_nvcc"; file = "cuda_nvcc-windows-x86_64-11.7.64-archive.zip" },
+          @{ folder = "libcublas"; file = "libcublas-windows-x86_64-11.10.1.25-archive.zip" },
+          @{ folder = "cuda_cccl"; file = "cuda_cccl-windows-x86_64-11.7.58-archive.zip" }
         )
         Push-Location $env:RUNNER_TEMP
         try {

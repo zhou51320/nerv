@@ -1,0 +1,11182 @@
+//
+// Created by huangyuyang on 6/14/23.
+//
+
+#include "devices/cpu/cpudevice.h"
+#include "devices/cuda/cudadevice.h"
+
+#include "fastllm-cuda.cuh"
+
+extern "C" bool FastllmCudaDeepSeekV41HcPost(const fastllm::Data&, const fastllm::Data&,
+    const fastllm::Data&, const fastllm::Data&, fastllm::Data&);
+
+#include "utils.h"
+#include "json11.hpp"
+
+#include <cmath>
+#include <chrono>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <limits>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <sstream>
+#include <stdexcept>
+#include <thread>
+#include <tuple>
+#include <vector>
+
+#if !defined(_WIN32) && !defined(USE_ROCM)
+#include <arpa/inet.h>
+#include <dlfcn.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <unistd.h>
+#endif
+
+#ifndef FASTLLM_SOURCE_DIR
+#define FASTLLM_SOURCE_DIR "."
+#endif
+
+#ifdef FASTLLM_ENABLE_DEEPGEMM_FP8_SM90
+bool FastllmCudaDeepGemmLinearFp8Sm90(const fastllm::Data &input, fastllm::Data &weight,
+    const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
+#endif
+
+namespace fastllm {
+    // CUDA graph replay cannot reuse a MergeMOE path that picked experts on CPU.
+    static thread_local bool cudaMergeMOEUsedGraphUnsafeFallback = false;
+    static thread_local int cudaLinearExactBatchThreshold = 0;
+
+    int FastllmCudaGetLinearExactBatchThreshold() {
+        return cudaLinearExactBatchThreshold;
+    }
+
+    void FastllmCudaSetLinearExactBatchThreshold(int threshold) {
+        cudaLinearExactBatchThreshold = std::max(0, threshold);
+    }
+
+    static constexpr int kQwen4SparsePrefillTileRows = 128;
+
+    void FastllmCudaMergeMOEClearGraphUnsafeFallbackFlag() {
+        cudaMergeMOEUsedGraphUnsafeFallback = false;
+    }
+
+    bool FastllmCudaMergeMOEUsedGraphUnsafeFallback() {
+        return cudaMergeMOEUsedGraphUnsafeFallback;
+    }
+
+    static uint64_t GetConvertedBufferBytes(const Data &data) {
+        uint64_t elementCount = data.expansionSize > 0 ? data.expansionSize : data.Count(0);
+        return (elementCount * data.unitSize - 1) / data.unitSizeDiv + 1;
+    }
+
+    static bool CudaEnvFlagEnabled(const char *name) {
+        const char *v = std::getenv(name);
+        return v != nullptr && v[0] != '\0' && strcmp(v, "0") != 0 &&
+               strcmp(v, "false") != 0 && strcmp(v, "FALSE") != 0 &&
+               strcmp(v, "off") != 0 && strcmp(v, "OFF") != 0;
+    }
+
+    static bool CudaTpSpecPresent(const char *name) {
+        const char *v = std::getenv(name);
+        if (v == nullptr || v[0] == '\0') {
+            return false;
+        }
+        return strcmp(v, "false") != 0 && strcmp(v, "FALSE") != 0 &&
+               strcmp(v, "off") != 0 && strcmp(v, "OFF") != 0 &&
+               strcmp(v, "none") != 0 && strcmp(v, "NONE") != 0 &&
+               strcmp(v, "disable") != 0 && strcmp(v, "DISABLE") != 0;
+    }
+
+    static bool CudaEnvFlagDefaultEnabled(const char *name, bool fallback) {
+        const char *v = std::getenv(name);
+        if (v == nullptr || v[0] == '\0') {
+            return fallback;
+        }
+        return CudaEnvFlagEnabled(name);
+    }
+
+    static void TraceCudaLinearFp8Path(const char *path, int n, int m, int k) {
+        if (!CudaEnvFlagEnabled("FASTLLM_CUDA_LINEAR_FP8_TRACE")) {
+            return;
+        }
+        static std::mutex mutex;
+        static std::map<std::string, int> counts;
+        std::lock_guard<std::mutex> guard(mutex);
+        int &count = counts[path];
+        if (count < 16) {
+            printf("FastLLM CUDA linear fp8 path: %s n=%d m=%d k=%d\n", path, n, m, k);
+        }
+        count++;
+    }
+
+    static int CudaEnvInt(const char *name, int fallback) {
+        const char *v = std::getenv(name);
+        if (v == nullptr || v[0] == '\0') {
+            return fallback;
+        }
+        char *end = nullptr;
+        long value = std::strtol(v, &end, 10);
+        if (end == v || value <= 0 || value > 4096) {
+            return fallback;
+        }
+        return (int)value;
+    }
+
+    static int CudaEnvIntRange(const char *name, int fallback, int minValue, int maxValue) {
+        const char *v = std::getenv(name);
+        if (v == nullptr || v[0] == '\0') {
+            return fallback;
+        }
+        char *end = nullptr;
+        long value = std::strtol(v, &end, 10);
+        if (end == v || value < minValue || value > maxValue) {
+            return fallback;
+        }
+        return (int)value;
+    }
+
+#if !defined(_WIN32) && !defined(USE_ROCM)
+    static const int kCudaTritonLinearFp8Block128KernelCount = 2;
+    static const char *kCudaTritonLinearFp8Block128KernelKeys[kCudaTritonLinearFp8Block128KernelCount] = {
+        "quant_input",
+        "matmul",
+    };
+
+    static const int kCudaTritonChunkGdnPrefillKernelCount = 4;
+    static const char *kCudaTritonChunkGdnPrefillKernelKeys[kCudaTritonChunkGdnPrefillKernelCount] = {
+        "h",
+        "o",
+        "h_precomputed_scale",
+        "o_fused_decay_mask",
+    };
+    static const int kCudaTritonChunkGdnVarlenPrefillKernelCount = 5;
+    static const char *kCudaTritonChunkGdnVarlenPrefillKernelKeys[
+        kCudaTritonChunkGdnVarlenPrefillKernelCount] = {
+        "h",
+        "o",
+        "h_precomputed_scale",
+        "o_fused_decay_mask",
+        "o_direct_qk",
+    };
+    static const int kCudaTritonChunkGdnRecomputeKernelCount = 5;
+    static const char *kCudaTritonChunkGdnRecomputeKernelKeys[kCudaTritonChunkGdnRecomputeKernelCount] = {
+        "recompute",
+        "recompute_precomputed_scale",
+        "recompute_internal_exp",
+        "recompute_precomputed_scale_internal_exp",
+        "kkt",
+    };
+
+    static const int kCudaTritonDeepSeekV4SparseDecodeKernelCount = 2;
+    static const char *kCudaTritonDeepSeekV4SparseDecodeKernelKeys[
+        kCudaTritonDeepSeekV4SparseDecodeKernelCount] = {
+        "split",
+        "merge",
+    };
+
+    static const int kCudaTritonMergeMoeFp8KernelCount = 12;
+    static const char *kCudaTritonMergeMoeFp8KernelKeys[kCudaTritonMergeMoeFp8KernelCount] = {
+        "init_count",
+        "zero_route",
+        "count",
+        "prefix",
+        "fill_sorted",
+        "scatter_blocks",
+        "quant_input",
+        "gateup",
+        "gateup_fused",
+        "swiglu_quant",
+        "down",
+        "sum_output",
+    };
+
+    struct CudaTritonKernelMeta {
+        std::string cubinPath;
+        std::string kernelName;
+        int shared = 0;
+        int numWarps = 4;
+    };
+
+    struct CudaTritonLinearFp8Block128Meta {
+        CudaTritonKernelMeta kernels[kCudaTritonLinearFp8Block128KernelCount];
+        int blockM = 16;
+        int blockN = 128;
+        int blockK = 128;
+        int groupSizeM = 32;
+        int quantNumWarps = 4;
+        int matmulNumWarps = 4;
+        int numStages = 3;
+        bool hasBias = false;
+        bool packedWeight = true;
+        std::string matmulVariant = "fastllm";
+    };
+
+    struct CudaTritonChunkGdnPrefillMeta {
+        CudaTritonKernelMeta kernels[kCudaTritonChunkGdnPrefillKernelCount];
+        int chunks = 1;
+        int chunkSize = 64;
+        int kDim = 128;
+        int vDim = 128;
+        int blockV = 32;
+        int numStages = 3;
+        bool floatState = false;
+    };
+
+    struct CudaTritonChunkGdnVarlenPrefillMeta {
+        CudaTritonKernelMeta kernels[
+            kCudaTritonChunkGdnVarlenPrefillKernelCount];
+        int maxChunks = 1;
+        int chunkSize = 64;
+        int kDim = 128;
+        int vDim = 128;
+        int hBlockV = 32;
+        int oBlockV = 64;
+        int hNumStages = 2;
+        int oNumStages = 3;
+    };
+
+    struct CudaTritonChunkGdnPostConvMeta {
+        CudaTritonKernelMeta kernel;
+        int keyHeads = 1;
+        int valueHeads = 1;
+        int kDim = 128;
+        int vDim = 128;
+        int blockT = 16;
+        int numStages = 2;
+    };
+
+    struct CudaTritonQwen4SparseAttentionMeta {
+        CudaTritonKernelMeta kernel;
+        std::string dtype;
+        int groupSize = 1;
+        int headDim = 128;
+        int topk = 1;
+        int blockM = 1;
+        int blockN = 64;
+        int numStages = 2;
+    };
+
+    struct CudaTritonChunkGdnRecomputeMeta {
+        CudaTritonKernelMeta kernels[kCudaTritonChunkGdnRecomputeKernelCount];
+        int chunkSize = 64;
+        int kDim = 128;
+        int vDim = 128;
+        int blockD = 64;
+        int numStages = 2;
+    };
+
+    struct CudaTritonDeepSeekV4WoAMeta {
+        CudaTritonKernelMeta kernel;
+        int numTokens = 1;
+        int numGroups = 1;
+        int outRank = 1024;
+        int hiddenSize = 4096;
+        int blockTokens = 16;
+        int blockOut = 128;
+        int blockHidden = 128;
+    };
+
+    struct CudaTritonDeepSeekV4SparseDecodeMeta {
+        CudaTritonKernelMeta kernels[kCudaTritonDeepSeekV4SparseDecodeKernelCount];
+        int batch = 1;
+        int numHeads = 64;
+        int headDim = 512;
+        int windowSize = 128;
+        int compressRatio = 0;
+        int compressedCapacity = 1;
+        int numSplits = 1;
+        int blockSplits = 1;
+        int splitSize = 8;
+        int blockD = 512;
+        int mergeBlockD = 32;
+        int splitHeadBlock = 1;
+        std::string variant = "generic";
+    };
+
+    struct CudaTritonDeepSeekV4RouterMeta {
+        CudaTritonKernelMeta kernel;
+        int numExperts = 256;
+        int topk = 6;
+        int blockN = 256;
+    };
+
+    struct CudaTritonMergeMoeFp8Meta {
+        CudaTritonKernelMeta kernels[kCudaTritonMergeMoeFp8KernelCount];
+        int routeBlockT = 1024;
+        int maxExperts = 256;
+        int groupBlockM = 16;
+        int groupBlockN = 128;
+        int groupBlockK = 128;
+        int groupSizeM = 32;
+    };
+
+    static std::string CudaTritonHomePath() {
+        const char *home = std::getenv("HOME");
+        return home == nullptr ? std::string() : std::string(home);
+    }
+
+    static std::string CudaTritonExpandUser(const std::string &path) {
+        if (path.empty() || path[0] != '~') {
+            return path;
+        }
+        std::string home = CudaTritonHomePath();
+        if (home.empty()) {
+            return path;
+        }
+        if (path.size() == 1) {
+            return home;
+        }
+        if (path[1] == '/') {
+            return home + path.substr(1);
+        }
+        return path;
+    }
+
+    static std::string CudaTritonJoinPath(const std::string &dir, const std::string &name) {
+        if (dir.empty()) {
+            return name;
+        }
+        return dir.back() == '/' ? dir + name : dir + "/" + name;
+    }
+
+    static bool CudaTritonFileExists(const std::string &path) {
+        std::ifstream file(path, std::ios::binary);
+        return file.good();
+    }
+
+    static std::string CudaTritonCacheDir() {
+        const char *dir = std::getenv("FASTLLM_CUDA_TRITON_CACHE_DIR");
+        if (dir != nullptr && dir[0] != '\0') {
+            return CudaTritonExpandUser(dir);
+        }
+        const char *xdg = std::getenv("XDG_CACHE_HOME");
+        if (xdg != nullptr && xdg[0] != '\0') {
+            return CudaTritonJoinPath(CudaTritonExpandUser(xdg), "fastllm/triton");
+        }
+        std::string home = CudaTritonHomePath();
+        if (!home.empty()) {
+            return CudaTritonJoinPath(home, ".cache/fastllm/triton");
+        }
+        return "/tmp/fastllm-triton";
+    }
+
+    static bool CudaTritonDataTypeName(DataType type, std::string &name) {
+        if (type == DataType::FLOAT16) {
+            name = "fp16";
+            return true;
+        }
+        if (type == DataType::BFLOAT16) {
+            name = "bf16";
+            return true;
+        }
+        if (type == DataType::FLOAT32) {
+            name = "fp32";
+            return true;
+        }
+        return false;
+    }
+
+    static int CudaTritonRuntimeArch() {
+        static std::mutex mutex;
+        static std::map<int, int> archByDevice;
+        int device = FastllmCudaGetDevice();
+        {
+            std::lock_guard<std::mutex> guard(mutex);
+            auto it = archByDevice.find(device);
+            if (it != archByDevice.end()) {
+                return it->second;
+            }
+        }
+        int arch = FastllmCudaRuntimeArch();
+        if (arch > 0) {
+            std::lock_guard<std::mutex> guard(mutex);
+            archByDevice[device] = arch;
+        }
+        return arch;
+    }
+
+    static std::string CudaTritonLinearFp8Block128BaseName(
+        const std::string &inputDtype, bool hasBias, bool packedWeight, int arch,
+        int blockM, int blockN, int blockK, int groupSizeM,
+        int quantNumWarps, int matmulNumWarps, int numStages,
+        const std::string &matmulVariant) {
+        std::ostringstream os;
+        if (matmulVariant == "strided") {
+            os << "linear_fp8_block128_strided_v5_";
+        } else {
+            os << "linear_fp8_block128_v5_";
+        }
+        os << (packedWeight ? "packed" : "separate")
+           << "_" << inputDtype
+           << "_bias" << (hasBias ? 1 : 0)
+           << "_sm" << arch
+           << "_bm" << blockM << "_bn" << blockN << "_bk" << blockK
+           << "_gsm" << groupSizeM
+           << "_qnw" << quantNumWarps << "_mnw" << matmulNumWarps
+           << "_ns" << numStages;
+        return os.str();
+    }
+
+    static std::string CudaTritonChunkGdnPrefillBaseName(
+        int arch, int chunks, int chunkSize, int kDim, int vDim,
+        int blockV, int numWarps, int numStages, bool floatState) {
+        std::ostringstream os;
+        if (floatState) {
+            os << "chunk_gdn_prefill_v7_fp16_statefp32_sm";
+        } else {
+            os << "chunk_gdn_prefill_v6_fp16_sm";
+        }
+        os << arch
+           << "_c" << chunks << "_t" << chunkSize
+           << "_k" << kDim << "_v" << vDim
+           << "_bv" << blockV
+           << "_nw" << numWarps << "_ns" << numStages;
+        return os.str();
+    }
+
+    static std::string CudaTritonChunkGdnVarlenPrefillBaseName(
+        int arch, int maxChunks, int chunkSize, int kDim, int vDim,
+        int hBlockV, int oBlockV, int numWarps,
+        int hNumStages, int oNumStages) {
+        std::ostringstream os;
+        os << "chunk_gdn_varlen_prefill_v7_fp16_sm" << arch
+           << "_mc" << maxChunks << "_t" << chunkSize
+           << "_k" << kDim << "_v" << vDim
+           << "_hbv" << hBlockV << "_obv" << oBlockV
+           << "_nw" << numWarps
+           << "_hns" << hNumStages << "_ons" << oNumStages;
+        return os.str();
+    }
+
+    static std::string CudaTritonChunkGdnPostConvBaseName(
+        int arch, int keyHeads, int valueHeads, int kDim, int vDim,
+        int blockT, int numWarps, int numStages) {
+        std::ostringstream os;
+        os << "chunk_gdn_postconv_v5_fp16_sm" << arch
+           << "_hk" << keyHeads << "_hv" << valueHeads
+           << "_k" << kDim << "_v" << vDim
+           << "_bt" << blockT
+           << "_nw" << numWarps << "_ns" << numStages;
+        return os.str();
+    }
+
+    static std::string CudaTritonQwen4SparseAttentionBaseName(
+        const std::string &dtype, int arch, int groupSize, int headDim,
+        int topk, int blockN, int numWarps, int numStages) {
+        int blockM = 1;
+        while (blockM < groupSize) {
+            blockM <<= 1;
+        }
+        std::ostringstream os;
+        os << "qwen4_sparse_attention_v1_" << dtype << "_sm" << arch
+           << "_g" << groupSize
+           << "_d" << headDim << "_w" << topk
+           << "_bm" << blockM << "_bn" << blockN
+           << "_nw" << numWarps << "_ns" << numStages;
+        return os.str();
+    }
+
+    static std::string CudaTritonChunkGdnRecomputeBaseName(
+        int arch, int chunkSize, int kDim, int vDim,
+        int blockD, int numWarps, int numStages) {
+        std::ostringstream os;
+        os << "chunk_gdn_recompute_v7_fp16_sm" << arch
+           << "_t" << chunkSize
+           << "_k" << kDim << "_v" << vDim
+           << "_bd" << blockD
+           << "_nw" << numWarps << "_ns" << numStages;
+        return os.str();
+    }
+
+    static std::string CudaTritonDeepSeekV4WoABaseName(
+        int arch, int numTokens, int numGroups, int outRank, int hiddenSize,
+        int blockTokens, int blockOut, int blockHidden,
+        int numWarps, int numStages) {
+        std::ostringstream os;
+        os << "deepseek_v4_fp8_woa_v1_sm" << arch
+           << "_t" << numTokens << "_g" << numGroups
+           << "_r" << outRank << "_h" << hiddenSize
+           << "_bt" << blockTokens << "_bo" << blockOut
+           << "_bh" << blockHidden
+           << "_nw" << numWarps << "_ns" << numStages;
+        return os.str();
+    }
+
+    static std::string CudaTritonDeepSeekV4SparseDecodeBaseName(
+        int arch, int batch, int numHeads, int headDim, int windowSize,
+        int compressRatio, int compressedCapacity, int splitSize, int blockD,
+        int mergeBlockD, int blockSplits, int splitNumWarps,
+        int mergeNumWarps, int numStages, const std::string &variant) {
+        std::ostringstream os;
+        os << "deepseek_v4_sparse_decode_v3";
+        if (variant != "generic") {
+            os << "_" << variant;
+        }
+        os << "_sm" << arch
+           << "_b" << batch << "_h" << numHeads << "_d" << headDim
+           << "_w" << windowSize << "_cr" << compressRatio
+           << "_cc" << compressedCapacity << "_ss" << splitSize
+           << "_bd" << blockD << "_mbd" << mergeBlockD
+           << "_bs" << blockSplits
+           << "_snw" << splitNumWarps << "_mnw" << mergeNumWarps
+           << "_ns" << numStages;
+        return os.str();
+    }
+
+    static std::string CudaTritonDeepSeekV4RouterBaseName(
+        int arch, int numExperts, int topk, int blockN,
+        int numWarps, int numStages) {
+        std::ostringstream os;
+        os << "deepseek_v4_sqrtsoftplus_router_v1_sm" << arch
+           << "_e" << numExperts << "_k" << topk
+           << "_bn" << blockN
+           << "_nw" << numWarps << "_ns" << numStages;
+        return os.str();
+    }
+
+    static std::string CudaTritonMergeMoeFp8BaseName(
+        const std::string &inputDtype, int arch,
+        int routeBlockT, int maxExperts, int topk, int hidden, int inter,
+        int groupBlockM, int groupBlockN, int groupBlockK,
+        int groupSizeM, int routeNumWarps, int groupNumWarps, int numStages) {
+        std::ostringstream os;
+        os << "merge_moe_fp8_v34_" << inputDtype
+           << "_sm" << arch
+           << "_rt" << routeBlockT << "_me" << maxExperts
+           << "_tk" << topk
+           << "_h" << hidden << "_i" << inter
+           << "_gm" << groupBlockM << "_gn" << groupBlockN << "_gk" << groupBlockK
+           << "_gsm" << groupSizeM
+           << "_rnw" << routeNumWarps << "_gnw" << groupNumWarps
+           << "_ns" << numStages;
+        return os.str();
+    }
+
+    static bool CudaTritonReadTextFile(const std::string &path, std::string &text) {
+        std::ifstream file(path);
+        if (!file.good()) {
+            return false;
+        }
+        std::ostringstream ss;
+        ss << file.rdbuf();
+        text = ss.str();
+        return true;
+    }
+
+    static bool CudaTritonReadLinearFp8Block128Meta(
+        const std::string &path, CudaTritonLinearFp8Block128Meta &meta) {
+        std::string text;
+        if (!CudaTritonReadTextFile(path, text)) {
+            return false;
+        }
+        std::string err;
+        json11::Json json = json11::Json::parse(text, err);
+        if (!err.empty() || !json["ok"].bool_value()) {
+            return false;
+        }
+        meta.blockM = json["block_m"].int_value();
+        meta.blockN = json["block_n"].int_value();
+        meta.blockK = json["block_k"].int_value();
+        meta.groupSizeM = json["group_size_m"].int_value();
+        meta.quantNumWarps = json["quant_num_warps"].int_value();
+        meta.matmulNumWarps = json["matmul_num_warps"].int_value();
+        meta.numStages = json["num_stages"].int_value();
+        meta.hasBias = json["has_bias"].bool_value();
+        meta.packedWeight = json["packed_weight"].bool_value();
+        meta.matmulVariant = json["matmul_variant"].string_value();
+        if (meta.matmulVariant.empty()) {
+            meta.matmulVariant = "fastllm";
+        }
+        if (meta.blockM <= 0 || meta.blockN <= 0 || meta.blockK != 128 ||
+            meta.groupSizeM <= 0 || meta.quantNumWarps <= 0 || meta.matmulNumWarps <= 0 ||
+            (meta.matmulVariant != "fastllm" && meta.matmulVariant != "strided")) {
+            return false;
+        }
+        json11::Json kernels = json["kernels"];
+        for (int i = 0; i < kCudaTritonLinearFp8Block128KernelCount; i++) {
+            json11::Json item = kernels[kCudaTritonLinearFp8Block128KernelKeys[i]];
+            meta.kernels[i].cubinPath = item["cubin"].string_value();
+            meta.kernels[i].kernelName = item["kernel"].string_value();
+            meta.kernels[i].shared = item["shared"].int_value();
+            meta.kernels[i].numWarps = item["num_warps"].int_value();
+            if (meta.kernels[i].cubinPath.empty() || meta.kernels[i].kernelName.empty() ||
+                meta.kernels[i].numWarps <= 0 || !CudaTritonFileExists(meta.kernels[i].cubinPath)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static bool CudaTritonReadChunkGdnPrefillMeta(
+        const std::string &path, CudaTritonChunkGdnPrefillMeta &meta) {
+        std::string text;
+        if (!CudaTritonReadTextFile(path, text)) {
+            return false;
+        }
+        std::string err;
+        json11::Json json = json11::Json::parse(text, err);
+        if (!err.empty() || !json["ok"].bool_value() ||
+            json["op"].string_value() != "chunk_gdn_prefill" ||
+            json["dtype"].string_value() != "fp16") {
+            return false;
+        }
+        std::string stateDtype = json["state_dtype"].string_value();
+        if (stateDtype.empty()) {
+            stateDtype = "fp16";
+        }
+        if (stateDtype != "fp16" && stateDtype != "fp32") {
+            return false;
+        }
+        meta.floatState = stateDtype == "fp32";
+        meta.chunks = json["chunks"].int_value();
+        meta.chunkSize = json["chunk_size"].int_value();
+        meta.kDim = json["k_dim"].int_value();
+        meta.vDim = json["v_dim"].int_value();
+        meta.blockV = json["block_v"].int_value();
+        meta.numStages = json["num_stages"].int_value();
+        if (meta.chunks <= 0 || meta.chunkSize != 64 ||
+            meta.kDim != 128 || meta.vDim != 128 ||
+            (meta.blockV != 32 && meta.blockV != 64) ||
+            meta.numStages <= 0) {
+            return false;
+        }
+        json11::Json kernels = json["kernels"];
+        for (int i = 0; i < kCudaTritonChunkGdnPrefillKernelCount; i++) {
+            json11::Json item =
+                kernels[kCudaTritonChunkGdnPrefillKernelKeys[i]];
+            meta.kernels[i].cubinPath = item["cubin"].string_value();
+            meta.kernels[i].kernelName = item["kernel"].string_value();
+            meta.kernels[i].shared = item["shared"].int_value();
+            meta.kernels[i].numWarps = item["num_warps"].int_value();
+            if (meta.kernels[i].cubinPath.empty() ||
+                meta.kernels[i].kernelName.empty() ||
+                meta.kernels[i].numWarps <= 0 ||
+                !CudaTritonFileExists(meta.kernels[i].cubinPath)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static bool CudaTritonReadChunkGdnVarlenPrefillMeta(
+        const std::string &path,
+        CudaTritonChunkGdnVarlenPrefillMeta &meta) {
+        std::string text;
+        if (!CudaTritonReadTextFile(path, text)) {
+            return false;
+        }
+        std::string err;
+        json11::Json json = json11::Json::parse(text, err);
+        if (!err.empty() || !json["ok"].bool_value() ||
+            json["op"].string_value() !=
+                "chunk_gdn_varlen_prefill" ||
+            json["dtype"].string_value() != "fp16") {
+            return false;
+        }
+        meta.maxChunks = json["max_chunks"].int_value();
+        meta.chunkSize = json["chunk_size"].int_value();
+        meta.kDim = json["k_dim"].int_value();
+        meta.vDim = json["v_dim"].int_value();
+        meta.hBlockV = json["h_block_v"].int_value();
+        meta.oBlockV = json["o_block_v"].int_value();
+        meta.hNumStages = json["h_num_stages"].int_value();
+        meta.oNumStages = json["o_num_stages"].int_value();
+        if (meta.maxChunks <= 0 || meta.chunkSize != 64 ||
+            meta.kDim != 128 || meta.vDim != 128 ||
+            (meta.hBlockV != 32 && meta.hBlockV != 64) ||
+            (meta.oBlockV != 32 && meta.oBlockV != 64) ||
+            meta.hNumStages <= 0 || meta.oNumStages <= 0) {
+            return false;
+        }
+        json11::Json kernels = json["kernels"];
+        for (int i = 0;
+             i < kCudaTritonChunkGdnVarlenPrefillKernelCount; i++) {
+            json11::Json item =
+                kernels[kCudaTritonChunkGdnVarlenPrefillKernelKeys[i]];
+            meta.kernels[i].cubinPath = item["cubin"].string_value();
+            meta.kernels[i].kernelName = item["kernel"].string_value();
+            meta.kernels[i].shared = item["shared"].int_value();
+            meta.kernels[i].numWarps = item["num_warps"].int_value();
+            if (meta.kernels[i].cubinPath.empty() ||
+                meta.kernels[i].kernelName.empty() ||
+                meta.kernels[i].numWarps <= 0 ||
+                !CudaTritonFileExists(meta.kernels[i].cubinPath)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static bool CudaTritonReadChunkGdnPostConvMeta(
+        const std::string &path, CudaTritonChunkGdnPostConvMeta &meta) {
+        std::string text;
+        if (!CudaTritonReadTextFile(path, text)) {
+            return false;
+        }
+        std::string err;
+        json11::Json json = json11::Json::parse(text, err);
+        if (!err.empty() || !json["ok"].bool_value() ||
+            json["op"].string_value() != "chunk_gdn_postconv" ||
+            json["dtype"].string_value() != "fp16") {
+            return false;
+        }
+        meta.kernel.cubinPath = json["cubin"].string_value();
+        meta.kernel.kernelName = json["kernel"].string_value();
+        meta.kernel.shared = json["shared"].int_value();
+        meta.kernel.numWarps = json["num_warps"].int_value();
+        meta.keyHeads = json["key_heads"].int_value();
+        meta.valueHeads = json["value_heads"].int_value();
+        meta.kDim = json["k_dim"].int_value();
+        meta.vDim = json["v_dim"].int_value();
+        meta.blockT = json["block_t"].int_value();
+        meta.numStages = json["num_stages"].int_value();
+        return !meta.kernel.cubinPath.empty() &&
+               !meta.kernel.kernelName.empty() &&
+               meta.kernel.numWarps > 0 &&
+               CudaTritonFileExists(meta.kernel.cubinPath) &&
+               meta.keyHeads > 0 &&
+               meta.valueHeads >= meta.keyHeads &&
+               meta.valueHeads % meta.keyHeads == 0 &&
+               meta.kDim == 128 && meta.vDim == 128 &&
+               meta.blockT == 16 && meta.numStages > 0;
+    }
+
+    static bool CudaTritonReadQwen4SparseAttentionMeta(
+        const std::string &path,
+        CudaTritonQwen4SparseAttentionMeta &meta) {
+        std::string text;
+        if (!CudaTritonReadTextFile(path, text)) {
+            return false;
+        }
+        std::string err;
+        json11::Json json = json11::Json::parse(text, err);
+        if (!err.empty() || !json["ok"].bool_value() ||
+            json["op"].string_value() != "qwen4_sparse_attention") {
+            return false;
+        }
+        meta.kernel.cubinPath = json["cubin"].string_value();
+        meta.kernel.kernelName = json["kernel"].string_value();
+        meta.kernel.shared = json["shared"].int_value();
+        meta.kernel.numWarps = json["num_warps"].int_value();
+        meta.dtype = json["dtype"].string_value();
+        meta.groupSize = json["group_size"].int_value();
+        meta.headDim = json["head_dim"].int_value();
+        meta.topk = json["topk"].int_value();
+        meta.blockM = json["block_m"].int_value();
+        meta.blockN = json["block_n"].int_value();
+        meta.numStages = json["num_stages"].int_value();
+        return !meta.kernel.cubinPath.empty() &&
+               !meta.kernel.kernelName.empty() &&
+               meta.kernel.numWarps > 0 &&
+               CudaTritonFileExists(meta.kernel.cubinPath) &&
+               meta.dtype == "fp16" &&
+               meta.groupSize > 0 && meta.groupSize <= 16 &&
+               meta.headDim >= 16 && meta.headDim <= 256 &&
+               (meta.headDim & (meta.headDim - 1)) == 0 &&
+               meta.topk > 0 && meta.topk <= 3072 &&
+               meta.blockM >= meta.groupSize && meta.blockM <= 16 &&
+               (meta.blockM & (meta.blockM - 1)) == 0 &&
+               (meta.blockN == 16 || meta.blockN == 32 ||
+                meta.blockN == 64 || meta.blockN == 128) &&
+               meta.numStages > 0;
+    }
+
+    static bool CudaTritonReadChunkGdnRecomputeMeta(
+        const std::string &path, CudaTritonChunkGdnRecomputeMeta &meta) {
+        std::string text;
+        if (!CudaTritonReadTextFile(path, text)) {
+            return false;
+        }
+        std::string err;
+        json11::Json json = json11::Json::parse(text, err);
+        if (!err.empty() || !json["ok"].bool_value() ||
+            json["op"].string_value() != "chunk_gdn_recompute" ||
+            json["dtype"].string_value() != "fp16") {
+            return false;
+        }
+        meta.chunkSize = json["chunk_size"].int_value();
+        meta.kDim = json["k_dim"].int_value();
+        meta.vDim = json["v_dim"].int_value();
+        meta.blockD = json["block_d"].int_value();
+        meta.numStages = json["num_stages"].int_value();
+        if (meta.chunkSize != 64 ||
+            meta.kDim != 128 || meta.vDim != 128 ||
+            meta.blockD != 64 || meta.numStages <= 0) {
+            return false;
+        }
+        json11::Json kernels = json["kernels"];
+        for (int i = 0;
+             i < kCudaTritonChunkGdnRecomputeKernelCount; i++) {
+            json11::Json item =
+                kernels[kCudaTritonChunkGdnRecomputeKernelKeys[i]];
+            meta.kernels[i].cubinPath = item["cubin"].string_value();
+            meta.kernels[i].kernelName = item["kernel"].string_value();
+            meta.kernels[i].shared = item["shared"].int_value();
+            meta.kernels[i].numWarps = item["num_warps"].int_value();
+            if (meta.kernels[i].cubinPath.empty() ||
+                meta.kernels[i].kernelName.empty() ||
+                meta.kernels[i].numWarps <= 0 ||
+                !CudaTritonFileExists(meta.kernels[i].cubinPath)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static bool CudaTritonReadDeepSeekV4WoAMeta(
+        const std::string &path, CudaTritonDeepSeekV4WoAMeta &meta) {
+        std::string text;
+        if (!CudaTritonReadTextFile(path, text)) {
+            return false;
+        }
+        std::string err;
+        json11::Json json = json11::Json::parse(text, err);
+        if (!err.empty() || !json["ok"].bool_value() ||
+            json["op"].string_value() != "deepseek_v4_fp8_woa") {
+            return false;
+        }
+        meta.kernel.cubinPath = json["cubin"].string_value();
+        meta.kernel.kernelName = json["kernel"].string_value();
+        meta.kernel.shared = json["shared"].int_value();
+        meta.kernel.numWarps = json["num_warps"].int_value();
+        meta.numTokens = json["num_tokens"].int_value();
+        meta.numGroups = json["num_groups"].int_value();
+        meta.outRank = json["out_rank"].int_value();
+        meta.hiddenSize = json["hidden_size"].int_value();
+        meta.blockTokens = json["block_tokens"].int_value();
+        meta.blockOut = json["block_out"].int_value();
+        meta.blockHidden = json["block_hidden"].int_value();
+        return !meta.kernel.cubinPath.empty() && !meta.kernel.kernelName.empty() &&
+               meta.kernel.numWarps > 0 && CudaTritonFileExists(meta.kernel.cubinPath) &&
+               meta.numTokens > 0 && meta.numGroups > 0 && meta.outRank > 0 &&
+               meta.hiddenSize > 0 && meta.blockTokens > 0 &&
+               meta.blockOut == 128 && meta.blockHidden == 128;
+    }
+
+    static bool CudaTritonReadDeepSeekV4SparseDecodeMeta(
+        const std::string &path, CudaTritonDeepSeekV4SparseDecodeMeta &meta) {
+        std::string text;
+        if (!CudaTritonReadTextFile(path, text)) {
+            return false;
+        }
+        std::string err;
+        json11::Json json = json11::Json::parse(text, err);
+        if (!err.empty() || !json["ok"].bool_value() ||
+            json["op"].string_value() != "deepseek_v4_sparse_decode" ||
+            json["version"].int_value() != 3) {
+            return false;
+        }
+        json11::Json kernels = json["kernels"];
+        for (int i = 0; i < kCudaTritonDeepSeekV4SparseDecodeKernelCount; i++) {
+            json11::Json item =
+                kernels[kCudaTritonDeepSeekV4SparseDecodeKernelKeys[i]];
+            meta.kernels[i].cubinPath = item["cubin"].string_value();
+            meta.kernels[i].kernelName = item["kernel"].string_value();
+            meta.kernels[i].shared = item["shared"].int_value();
+            meta.kernels[i].numWarps = item["num_warps"].int_value();
+            if (meta.kernels[i].cubinPath.empty() ||
+                meta.kernels[i].kernelName.empty() ||
+                meta.kernels[i].numWarps <= 0 ||
+                !CudaTritonFileExists(meta.kernels[i].cubinPath)) {
+                return false;
+            }
+        }
+        meta.batch = json["batch"].int_value();
+        meta.numHeads = json["num_heads"].int_value();
+        meta.headDim = json["head_dim"].int_value();
+        meta.windowSize = json["window_size"].int_value();
+        meta.compressRatio = json["compress_ratio"].int_value();
+        meta.compressedCapacity = json["compressed_capacity"].int_value();
+        meta.numSplits = json["num_splits"].int_value();
+        meta.blockSplits = json["block_splits"].int_value();
+        meta.splitSize = json["split_size"].int_value();
+        meta.blockD = json["block_d"].int_value();
+        meta.mergeBlockD = json["merge_block_d"].int_value();
+        meta.variant = json["variant"].string_value();
+        if (meta.variant.empty()) {
+            meta.variant = "generic";
+        }
+        meta.splitHeadBlock = json["split_head_block"].int_value();
+        if (meta.splitHeadBlock <= 0) {
+            meta.splitHeadBlock = 1;
+        }
+        return meta.batch == 1 && meta.numHeads > 0 && meta.headDim > 0 &&
+               meta.windowSize > 0 && meta.compressRatio >= 0 &&
+               meta.compressedCapacity > 0 && meta.numSplits > 0 &&
+               meta.numSplits <= 256 && meta.blockSplits >= meta.numSplits &&
+               (meta.blockSplits & (meta.blockSplits - 1)) == 0 &&
+               (meta.splitSize == 8 || meta.splitSize == 16 ||
+                meta.splitSize == 32 || meta.splitSize == 64) &&
+               meta.blockD >= meta.headDim && meta.blockD <= 1024 &&
+               ((meta.variant == "generic" && meta.splitHeadBlock == 1) ||
+                (meta.variant == "sm120_tensorcore" &&
+                 meta.splitHeadBlock == 16 && meta.headDim == 512 &&
+                 meta.numHeads <= 16)) &&
+               (meta.mergeBlockD == 16 || meta.mergeBlockD == 32 ||
+                meta.mergeBlockD == 64 || meta.mergeBlockD == 128);
+    }
+
+    static bool CudaTritonReadDeepSeekV4RouterMeta(
+        const std::string &path, CudaTritonDeepSeekV4RouterMeta &meta) {
+        std::string text;
+        if (!CudaTritonReadTextFile(path, text)) {
+            return false;
+        }
+        std::string err;
+        json11::Json json = json11::Json::parse(text, err);
+        if (!err.empty() || !json["ok"].bool_value() ||
+            json["op"].string_value() !=
+                "deepseek_v4_sqrtsoftplus_router" ||
+            json["version"].int_value() != 1 ||
+            json["variant"].string_value() != "sm120") {
+            return false;
+        }
+        meta.kernel.cubinPath = json["cubin"].string_value();
+        meta.kernel.kernelName = json["kernel"].string_value();
+        meta.kernel.shared = json["shared"].int_value();
+        meta.kernel.numWarps = json["num_warps"].int_value();
+        meta.numExperts = json["num_experts"].int_value();
+        meta.topk = json["topk"].int_value();
+        meta.blockN = json["block_n"].int_value();
+        return !meta.kernel.cubinPath.empty() &&
+               !meta.kernel.kernelName.empty() &&
+               CudaTritonFileExists(meta.kernel.cubinPath) &&
+               meta.kernel.numWarps == 1 && meta.numExperts == 256 &&
+               meta.topk == 6 && meta.blockN == 256;
+    }
+
+    static bool CudaTritonReadMergeMoeFp8Meta(const std::string &path, CudaTritonMergeMoeFp8Meta &meta) {
+        std::string text;
+        if (!CudaTritonReadTextFile(path, text)) {
+            return false;
+        }
+        std::string err;
+        json11::Json json = json11::Json::parse(text, err);
+        if (!err.empty() || !json["ok"].bool_value()) {
+            return false;
+        }
+        meta.routeBlockT = json["route_block_t"].int_value();
+        meta.maxExperts = json["max_experts"].int_value();
+        meta.groupBlockM = json["group_block_m"].int_value();
+        meta.groupBlockN = json["group_block_n"].int_value();
+        meta.groupBlockK = json["group_block_k"].int_value();
+        meta.groupSizeM = json["group_size_m"].int_value();
+        if (meta.routeBlockT <= 0 || meta.maxExperts <= 0 ||
+            meta.groupBlockM <= 0 || meta.groupBlockN <= 0 || meta.groupBlockK <= 0 ||
+            meta.groupSizeM < 0) {
+            return false;
+        }
+        json11::Json kernels = json["kernels"];
+        for (int i = 0; i < kCudaTritonMergeMoeFp8KernelCount; i++) {
+            json11::Json item = kernels[kCudaTritonMergeMoeFp8KernelKeys[i]];
+            meta.kernels[i].cubinPath = item["cubin"].string_value();
+            meta.kernels[i].kernelName = item["kernel"].string_value();
+            meta.kernels[i].shared = item["shared"].int_value();
+            meta.kernels[i].numWarps = item["num_warps"].int_value();
+            if (meta.kernels[i].cubinPath.empty() || meta.kernels[i].kernelName.empty() ||
+                meta.kernels[i].numWarps <= 0 || !CudaTritonFileExists(meta.kernels[i].cubinPath)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static bool CudaTritonSendAll(int fd, const std::string &data) {
+        const char *ptr = data.data();
+        size_t left = data.size();
+        while (left > 0) {
+            ssize_t sent = send(fd, ptr, left, 0);
+            if (sent <= 0) {
+                return false;
+            }
+            ptr += sent;
+            left -= (size_t)sent;
+        }
+        return true;
+    }
+
+    static bool CudaTritonHttpRequest(
+        const std::string &method, const std::string &path, const std::string &body,
+        int *status, std::string &responseBody) {
+        std::string host = "127.0.0.1";
+        const char *hostEnv = std::getenv("FASTLLM_CUDA_TRITON_SERVER_HOST");
+        if (hostEnv != nullptr && hostEnv[0] != '\0') {
+            host = hostEnv;
+        }
+        int port = CudaEnvIntRange("FASTLLM_CUDA_TRITON_SERVER_PORT", 48989, 1, 65535);
+
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) {
+            return false;
+        }
+        sockaddr_in addr;
+        std::memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons((uint16_t)port);
+        if (inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1) {
+            close(fd);
+            return false;
+        }
+        if (connect(fd, (sockaddr*)&addr, sizeof(addr)) != 0) {
+            close(fd);
+            return false;
+        }
+
+        std::ostringstream req;
+        req << method << " " << path << " HTTP/1.1\r\n"
+            << "Host: " << host << "\r\n"
+            << "Connection: close\r\n";
+        if (method == "POST") {
+            req << "Content-Type: application/json\r\n"
+                << "Content-Length: " << body.size() << "\r\n";
+        }
+        req << "\r\n" << body;
+
+        if (!CudaTritonSendAll(fd, req.str())) {
+            close(fd);
+            return false;
+        }
+
+        std::string response;
+        char buffer[4096];
+        while (true) {
+            ssize_t got = recv(fd, buffer, sizeof(buffer), 0);
+            if (got < 0) {
+                close(fd);
+                return false;
+            }
+            if (got == 0) {
+                break;
+            }
+            response.append(buffer, (size_t)got);
+        }
+        close(fd);
+
+        size_t firstSpace = response.find(' ');
+        size_t secondSpace = firstSpace == std::string::npos ? std::string::npos : response.find(' ', firstSpace + 1);
+        if (firstSpace == std::string::npos || secondSpace == std::string::npos) {
+            return false;
+        }
+        *status = std::atoi(response.substr(firstSpace + 1, secondSpace - firstSpace - 1).c_str());
+        size_t headerEnd = response.find("\r\n\r\n");
+        if (headerEnd == std::string::npos) {
+            return false;
+        }
+        responseBody = response.substr(headerEnd + 4);
+        return true;
+    }
+
+    static bool CudaTritonServerHealthy() {
+        int status = 0;
+        std::string body;
+        return CudaTritonHttpRequest("GET", "/health", "", &status, body) && status == 200;
+    }
+
+    static std::string CudaTritonServerScript() {
+        const char *script = std::getenv("FASTLLM_CUDA_TRITON_SERVER_SCRIPT");
+        if (script != nullptr && script[0] != '\0') {
+            return CudaTritonExpandUser(script);
+        }
+        static const int libraryAnchor = 0;
+        Dl_info libraryInfo = {};
+        if (dladdr(&libraryAnchor, &libraryInfo) != 0 &&
+            libraryInfo.dli_fname != nullptr) {
+            std::string libraryPath = libraryInfo.dli_fname;
+            size_t slash = libraryPath.find_last_of('/');
+            if (slash != std::string::npos) {
+                std::string installedScript = CudaTritonJoinPath(
+                    libraryPath.substr(0, slash),
+                    "fastllm_triton_server.py");
+                if (CudaTritonFileExists(installedScript)) {
+                    return installedScript;
+                }
+            }
+        }
+        std::string sourceScript = CudaTritonJoinPath(FASTLLM_SOURCE_DIR, "tools/fastllm_triton_server.py");
+        if (CudaTritonFileExists(sourceScript)) {
+            return sourceScript;
+        }
+        return "tools/fastllm_triton_server.py";
+    }
+
+    static std::string CudaTritonDefaultPython() {
+        auto isPythonExecutable = [](const std::string &path) {
+            size_t slash = path.find_last_of('/');
+            std::string name = path.substr(
+                slash == std::string::npos ? 0 : slash + 1);
+            return name.find("python") != std::string::npos ||
+                   name.find("pypy") != std::string::npos;
+        };
+        std::ifstream cmdline("/proc/self/cmdline", std::ios::binary);
+        std::string executable;
+        if (cmdline.good() && std::getline(cmdline, executable, '\0') &&
+            isPythonExecutable(executable)) {
+            if (executable.find('/') == std::string::npos ||
+                access(executable.c_str(), X_OK) == 0) {
+                return executable;
+            }
+        }
+
+        static const char *environmentPrefixes[] = {
+            "VIRTUAL_ENV", "CONDA_PREFIX",
+        };
+        for (const char *name : environmentPrefixes) {
+            const char *prefix = std::getenv(name);
+            if (prefix != nullptr && prefix[0] != '\0') {
+                std::string candidate = CudaTritonJoinPath(prefix, "bin/python");
+                if (access(candidate.c_str(), X_OK) == 0) {
+                    return candidate;
+                }
+            }
+        }
+
+        std::vector<char> resolved(4096);
+        ssize_t length = readlink("/proc/self/exe", resolved.data(),
+                                  resolved.size() - 1);
+        if (length > 0 && static_cast<size_t>(length) < resolved.size() - 1) {
+            resolved[length] = '\0';
+            executable.assign(resolved.data());
+            if (isPythonExecutable(executable) &&
+                access(executable.c_str(), X_OK) == 0) {
+                return executable;
+            }
+        }
+        return "python3";
+    }
+
+    static bool CudaTritonStartServer() {
+        std::string script = CudaTritonServerScript();
+        if (!CudaTritonFileExists(script)) {
+            printf("Fastllm Triton: server script not found: %s\n", script.c_str());
+            return false;
+        }
+        std::string python = CudaTritonDefaultPython();
+        const char *pythonEnv = std::getenv("FASTLLM_CUDA_TRITON_PYTHON");
+        if (pythonEnv != nullptr && pythonEnv[0] != '\0') {
+            python = pythonEnv;
+        }
+        std::string host = "127.0.0.1";
+        const char *hostEnv = std::getenv("FASTLLM_CUDA_TRITON_SERVER_HOST");
+        if (hostEnv != nullptr && hostEnv[0] != '\0') {
+            host = hostEnv;
+        }
+        int port = CudaEnvIntRange("FASTLLM_CUDA_TRITON_SERVER_PORT", 48989, 1, 65535);
+        std::string portText = std::to_string(port);
+        std::string logPath = "/tmp/fastllm_triton_server.log";
+        const char *logEnv = std::getenv("FASTLLM_CUDA_TRITON_SERVER_LOG");
+        if (logEnv != nullptr && logEnv[0] != '\0') {
+            logPath = CudaTritonExpandUser(logEnv);
+        }
+
+        pid_t pid = fork();
+        if (pid < 0) {
+            return false;
+        }
+        if (pid == 0) {
+            setsid();
+            FILE *log = std::freopen(logPath.c_str(), "a", stdout);
+            if (log != nullptr) {
+                FILE *errLog = std::freopen(logPath.c_str(), "a", stderr);
+                (void)errLog;
+            }
+            execlp(python.c_str(), python.c_str(), script.c_str(), "--host", host.c_str(),
+                   "--port", portText.c_str(), (char*)nullptr);
+            _exit(127);
+        }
+        return true;
+    }
+
+    static bool CudaTritonEnsureServer() {
+        static std::mutex mutex;
+        static int state = -1;
+        std::lock_guard<std::mutex> guard(mutex);
+        if (state == 0) {
+            if (CudaTritonServerHealthy()) {
+                state = 1;
+                return true;
+            }
+            return false;
+        }
+        if (state == 1 && CudaTritonServerHealthy()) {
+            return true;
+        }
+        if (CudaTritonServerHealthy()) {
+            state = 1;
+            return true;
+        }
+        if (!CudaTritonStartServer()) {
+            state = 0;
+            return false;
+        }
+        int waitMs = CudaEnvIntRange("FASTLLM_CUDA_TRITON_SERVER_WAIT_MS", 5000, 100, 60000);
+        for (int waited = 0; waited < waitMs; waited += 100) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            if (CudaTritonServerHealthy()) {
+                state = 1;
+                return true;
+            }
+        }
+        state = 0;
+        return false;
+    }
+
+    static bool CudaTritonRequestLinearFp8Block128Kernel(
+        const std::string &cacheDir, const std::string &inputDtype, bool hasBias, bool packedWeight, int arch,
+        int blockM, int blockN, int blockK, int groupSizeM,
+        int quantNumWarps, int matmulNumWarps, int numStages,
+        const std::string &matmulVariant,
+        CudaTritonLinearFp8Block128Meta &meta) {
+        if (!CudaTritonEnsureServer()) {
+            return false;
+        }
+        json11::Json request = json11::Json::object {
+            {"op", "linear_fp8_block128"},
+            {"cache_dir", cacheDir},
+            {"arch", arch},
+            {"input_dtype", inputDtype},
+            {"weight_layout", packedWeight ? "packed" : "separate"},
+            {"has_bias", hasBias},
+            {"block_m", blockM},
+            {"block_n", blockN},
+            {"block_k", blockK},
+            {"group_size_m", groupSizeM},
+            {"quant_num_warps", quantNumWarps},
+            {"matmul_num_warps", matmulNumWarps},
+            {"num_stages", numStages},
+            {"matmul_variant", matmulVariant},
+        };
+        int status = 0;
+        std::string body;
+        if (!CudaTritonHttpRequest("POST", "/compile", request.dump(), &status, body)) {
+            return false;
+        }
+        std::string err;
+        json11::Json response = json11::Json::parse(body, err);
+        if (status != 200 || !err.empty() || !response["ok"].bool_value()) {
+            static bool warned = false;
+            if (!warned) {
+                std::string message = response["error"].string_value();
+                printf("Fastllm Triton: compile failed, fallback to built-in CUDA FP8 linear. %s\n", message.c_str());
+                warned = true;
+            }
+            return false;
+        }
+        meta.blockM = response["block_m"].int_value();
+        meta.blockN = response["block_n"].int_value();
+        meta.blockK = response["block_k"].int_value();
+        meta.groupSizeM = response["group_size_m"].int_value();
+        meta.quantNumWarps = response["quant_num_warps"].int_value();
+        meta.matmulNumWarps = response["matmul_num_warps"].int_value();
+        meta.numStages = response["num_stages"].int_value();
+        meta.hasBias = response["has_bias"].bool_value();
+        meta.packedWeight = response["packed_weight"].bool_value();
+        meta.matmulVariant = response["matmul_variant"].string_value();
+        if (meta.matmulVariant.empty()) {
+            meta.matmulVariant = "fastllm";
+        }
+        if (meta.blockM <= 0 || meta.blockN <= 0 || meta.blockK != 128 ||
+            meta.groupSizeM <= 0 || meta.quantNumWarps <= 0 || meta.matmulNumWarps <= 0 ||
+            meta.matmulVariant != matmulVariant) {
+            return false;
+        }
+        json11::Json kernels = response["kernels"];
+        for (int i = 0; i < kCudaTritonLinearFp8Block128KernelCount; i++) {
+            json11::Json item = kernels[kCudaTritonLinearFp8Block128KernelKeys[i]];
+            meta.kernels[i].cubinPath = item["cubin"].string_value();
+            meta.kernels[i].kernelName = item["kernel"].string_value();
+            meta.kernels[i].shared = item["shared"].int_value();
+            meta.kernels[i].numWarps = item["num_warps"].int_value();
+            if (meta.kernels[i].cubinPath.empty() || meta.kernels[i].kernelName.empty() ||
+                meta.kernels[i].numWarps <= 0 || !CudaTritonFileExists(meta.kernels[i].cubinPath)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static bool CudaTritonGetLinearFp8Block128Meta(
+        const std::string &cacheDir, const std::string &base, const std::string &inputDtype,
+        bool hasBias, bool packedWeight, int arch, int blockM, int blockN, int blockK, int groupSizeM,
+        int quantNumWarps, int matmulNumWarps, int numStages,
+        const std::string &matmulVariant,
+        const CudaTritonLinearFp8Block128Meta *&meta) {
+        static std::mutex mutex;
+        static std::map<std::string, CudaTritonLinearFp8Block128Meta> cachedMeta;
+        meta = nullptr;
+        std::string metaPath = CudaTritonJoinPath(cacheDir, base + ".json");
+        {
+            std::lock_guard<std::mutex> guard(mutex);
+            auto it = cachedMeta.find(metaPath);
+            if (it != cachedMeta.end()) {
+                meta = &it->second;
+                return true;
+            }
+        }
+
+        CudaTritonLinearFp8Block128Meta loaded;
+        if (!CudaTritonReadLinearFp8Block128Meta(metaPath, loaded)) {
+            if (!CudaTritonRequestLinearFp8Block128Kernel(
+                    cacheDir, inputDtype, hasBias, packedWeight, arch, blockM, blockN, blockK, groupSizeM,
+                    quantNumWarps, matmulNumWarps, numStages, matmulVariant, loaded)) {
+                return false;
+            }
+        }
+
+        std::lock_guard<std::mutex> guard(mutex);
+        auto it = cachedMeta.find(metaPath);
+        if (it == cachedMeta.end()) {
+            it = cachedMeta.emplace(metaPath, loaded).first;
+        }
+        meta = &it->second;
+        return true;
+    }
+
+    static bool CudaTritonRequestChunkGdnPrefillKernel(
+        const std::string &cacheDir, int arch, int chunks, int chunkSize,
+        int kDim, int vDim, int blockV, int numWarps, int numStages,
+        bool floatState,
+        CudaTritonChunkGdnPrefillMeta &meta) {
+        if (!CudaTritonEnsureServer()) {
+            return false;
+        }
+        json11::Json request = json11::Json::object {
+            {"op", "chunk_gdn_prefill"},
+            {"cache_dir", cacheDir},
+            {"arch", arch},
+            {"dtype", "fp16"},
+            {"state_dtype", floatState ? "fp32" : "fp16"},
+            {"chunks", chunks},
+            {"chunk_size", chunkSize},
+            {"k_dim", kDim},
+            {"v_dim", vDim},
+            {"block_v", blockV},
+            {"num_warps", numWarps},
+            {"num_stages", numStages},
+        };
+        int status = 0;
+        std::string body;
+        if (!CudaTritonHttpRequest(
+                "POST", "/compile", request.dump(), &status, body)) {
+            return false;
+        }
+        std::string err;
+        json11::Json response = json11::Json::parse(body, err);
+        if (status != 200 || !err.empty() ||
+            !response["ok"].bool_value()) {
+            static bool warned = false;
+            if (!warned) {
+                printf("Fastllm Triton: chunk GDN prefill compile failed; "
+                       "falling back to built-in CUDA. %s\n",
+                       response["error"].string_value().c_str());
+                warned = true;
+            }
+            return false;
+        }
+        meta.chunks = response["chunks"].int_value();
+        meta.chunkSize = response["chunk_size"].int_value();
+        meta.kDim = response["k_dim"].int_value();
+        meta.vDim = response["v_dim"].int_value();
+        meta.blockV = response["block_v"].int_value();
+        meta.numStages = response["num_stages"].int_value();
+        meta.floatState =
+            response["state_dtype"].string_value() == "fp32";
+        if (meta.chunks != chunks || meta.chunkSize != chunkSize ||
+            meta.kDim != kDim || meta.vDim != vDim ||
+            meta.blockV != blockV || meta.numStages != numStages ||
+            meta.floatState != floatState) {
+            return false;
+        }
+        json11::Json kernels = response["kernels"];
+        for (int i = 0; i < kCudaTritonChunkGdnPrefillKernelCount; i++) {
+            json11::Json item =
+                kernels[kCudaTritonChunkGdnPrefillKernelKeys[i]];
+            meta.kernels[i].cubinPath = item["cubin"].string_value();
+            meta.kernels[i].kernelName = item["kernel"].string_value();
+            meta.kernels[i].shared = item["shared"].int_value();
+            meta.kernels[i].numWarps = item["num_warps"].int_value();
+            if (meta.kernels[i].cubinPath.empty() ||
+                meta.kernels[i].kernelName.empty() ||
+                meta.kernels[i].numWarps <= 0 ||
+                !CudaTritonFileExists(meta.kernels[i].cubinPath)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static bool CudaTritonGetChunkGdnPrefillMeta(
+        const std::string &cacheDir, const std::string &base,
+        int arch, int chunks, int chunkSize, int kDim, int vDim,
+        int blockV, int numWarps, int numStages, bool floatState,
+        const CudaTritonChunkGdnPrefillMeta *&meta) {
+        static std::mutex mutex;
+        static std::map<std::string, CudaTritonChunkGdnPrefillMeta> cachedMeta;
+        meta = nullptr;
+        std::string metaPath = CudaTritonJoinPath(cacheDir, base + ".json");
+        {
+            std::lock_guard<std::mutex> guard(mutex);
+            auto it = cachedMeta.find(metaPath);
+            if (it != cachedMeta.end()) {
+                meta = &it->second;
+                return true;
+            }
+        }
+
+        CudaTritonChunkGdnPrefillMeta loaded;
+        if (!CudaTritonReadChunkGdnPrefillMeta(metaPath, loaded)) {
+            if (!CudaTritonRequestChunkGdnPrefillKernel(
+                    cacheDir, arch, chunks, chunkSize, kDim, vDim,
+                    blockV, numWarps, numStages, floatState, loaded)) {
+                return false;
+            }
+        }
+        if (loaded.chunks != chunks || loaded.chunkSize != chunkSize ||
+            loaded.kDim != kDim || loaded.vDim != vDim ||
+            loaded.blockV != blockV || loaded.numStages != numStages ||
+            loaded.floatState != floatState) {
+            return false;
+        }
+
+        std::lock_guard<std::mutex> guard(mutex);
+        auto it = cachedMeta.find(metaPath);
+        if (it == cachedMeta.end()) {
+            it = cachedMeta.emplace(metaPath, loaded).first;
+        }
+        meta = &it->second;
+        return true;
+    }
+
+    static bool CudaTritonRequestChunkGdnVarlenPrefillKernel(
+        const std::string &cacheDir, int arch, int maxChunks,
+        int chunkSize, int kDim, int vDim,
+        int hBlockV, int oBlockV, int numWarps,
+        int hNumStages, int oNumStages,
+        CudaTritonChunkGdnVarlenPrefillMeta &meta) {
+        if (!CudaTritonEnsureServer()) {
+            return false;
+        }
+        json11::Json request = json11::Json::object {
+            // Version the wire op as well as the cache name.  A compiler
+            // server started from older sources must reject this request
+            // instead of returning a cubin with an incompatible argument ABI.
+            {"op", "chunk_gdn_varlen_prefill_v7"},
+            {"cache_dir", cacheDir},
+            {"arch", arch},
+            {"dtype", "fp16"},
+            {"max_chunks", maxChunks},
+            {"chunk_size", chunkSize},
+            {"k_dim", kDim},
+            {"v_dim", vDim},
+            {"h_block_v", hBlockV},
+            {"o_block_v", oBlockV},
+            {"num_warps", numWarps},
+            {"h_num_stages", hNumStages},
+            {"o_num_stages", oNumStages},
+        };
+        int status = 0;
+        std::string body;
+        if (!CudaTritonHttpRequest(
+                "POST", "/compile", request.dump(), &status, body)) {
+            return false;
+        }
+        std::string err;
+        json11::Json response = json11::Json::parse(body, err);
+        if (status != 200 || !err.empty() ||
+            !response["ok"].bool_value()) {
+            static bool warned = false;
+            if (!warned) {
+                printf("Fastllm Triton: packed varlen chunk GDN prefill "
+                       "compile failed; falling back to built-in CUDA. %s\n",
+                       response["error"].string_value().c_str());
+                warned = true;
+            }
+            return false;
+        }
+        meta.maxChunks = response["max_chunks"].int_value();
+        meta.chunkSize = response["chunk_size"].int_value();
+        meta.kDim = response["k_dim"].int_value();
+        meta.vDim = response["v_dim"].int_value();
+        meta.hBlockV = response["h_block_v"].int_value();
+        meta.oBlockV = response["o_block_v"].int_value();
+        meta.hNumStages = response["h_num_stages"].int_value();
+        meta.oNumStages = response["o_num_stages"].int_value();
+        if (meta.maxChunks != maxChunks ||
+            meta.chunkSize != chunkSize || meta.kDim != kDim ||
+            meta.vDim != vDim || meta.hBlockV != hBlockV ||
+            meta.oBlockV != oBlockV ||
+            meta.hNumStages != hNumStages ||
+            meta.oNumStages != oNumStages) {
+            return false;
+        }
+        json11::Json kernels = response["kernels"];
+        for (int i = 0;
+             i < kCudaTritonChunkGdnVarlenPrefillKernelCount; i++) {
+            json11::Json item =
+                kernels[kCudaTritonChunkGdnVarlenPrefillKernelKeys[i]];
+            meta.kernels[i].cubinPath = item["cubin"].string_value();
+            meta.kernels[i].kernelName = item["kernel"].string_value();
+            meta.kernels[i].shared = item["shared"].int_value();
+            meta.kernels[i].numWarps = item["num_warps"].int_value();
+            if (meta.kernels[i].cubinPath.empty() ||
+                meta.kernels[i].kernelName.empty() ||
+                meta.kernels[i].numWarps <= 0 ||
+                !CudaTritonFileExists(meta.kernels[i].cubinPath)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static bool CudaTritonGetChunkGdnVarlenPrefillMeta(
+        const std::string &cacheDir, const std::string &base,
+        int arch, int maxChunks, int chunkSize, int kDim, int vDim,
+        int hBlockV, int oBlockV, int numWarps,
+        int hNumStages, int oNumStages,
+        const CudaTritonChunkGdnVarlenPrefillMeta *&meta) {
+        static std::mutex mutex;
+        static std::map<std::string,
+                        CudaTritonChunkGdnVarlenPrefillMeta> cachedMeta;
+        meta = nullptr;
+        std::string metaPath =
+            CudaTritonJoinPath(cacheDir, base + ".json");
+        {
+            std::lock_guard<std::mutex> guard(mutex);
+            auto it = cachedMeta.find(metaPath);
+            if (it != cachedMeta.end()) {
+                meta = &it->second;
+                return true;
+            }
+        }
+        CudaTritonChunkGdnVarlenPrefillMeta loaded;
+        if (!CudaTritonReadChunkGdnVarlenPrefillMeta(metaPath, loaded)) {
+            if (!CudaTritonRequestChunkGdnVarlenPrefillKernel(
+                    cacheDir, arch, maxChunks, chunkSize, kDim, vDim,
+                    hBlockV, oBlockV, numWarps,
+                    hNumStages, oNumStages, loaded)) {
+                return false;
+            }
+        }
+        if (loaded.maxChunks != maxChunks ||
+            loaded.chunkSize != chunkSize || loaded.kDim != kDim ||
+            loaded.vDim != vDim || loaded.hBlockV != hBlockV ||
+            loaded.oBlockV != oBlockV ||
+            loaded.hNumStages != hNumStages ||
+            loaded.oNumStages != oNumStages) {
+            return false;
+        }
+        std::lock_guard<std::mutex> guard(mutex);
+        auto it = cachedMeta.find(metaPath);
+        if (it == cachedMeta.end()) {
+            it = cachedMeta.emplace(metaPath, loaded).first;
+        }
+        meta = &it->second;
+        return true;
+    }
+
+    static bool CudaTritonRequestChunkGdnPostConvKernel(
+        const std::string &cacheDir, int arch,
+        int keyHeads, int valueHeads, int kDim, int vDim,
+        int blockT, int numWarps, int numStages,
+        CudaTritonChunkGdnPostConvMeta &meta) {
+        if (!CudaTritonEnsureServer()) {
+            return false;
+        }
+        json11::Json request = json11::Json::object {
+            {"op", "chunk_gdn_postconv"},
+            {"cache_dir", cacheDir},
+            {"arch", arch},
+            {"dtype", "fp16"},
+            {"key_heads", keyHeads},
+            {"value_heads", valueHeads},
+            {"k_dim", kDim},
+            {"v_dim", vDim},
+            {"block_t", blockT},
+            {"num_warps", numWarps},
+            {"num_stages", numStages},
+        };
+        int status = 0;
+        std::string body;
+        if (!CudaTritonHttpRequest(
+                "POST", "/compile", request.dump(), &status, body)) {
+            return false;
+        }
+        std::string err;
+        json11::Json response = json11::Json::parse(body, err);
+        if (status != 200 || !err.empty() ||
+            !response["ok"].bool_value()) {
+            static bool warned = false;
+            if (!warned) {
+                printf("Fastllm Triton: chunk GDN post-conv compile failed; "
+                       "falling back to built-in CUDA. %s\n",
+                       response["error"].string_value().c_str());
+                warned = true;
+            }
+            return false;
+        }
+        meta.kernel.cubinPath = response["cubin"].string_value();
+        meta.kernel.kernelName = response["kernel"].string_value();
+        meta.kernel.shared = response["shared"].int_value();
+        meta.kernel.numWarps = response["num_warps"].int_value();
+        meta.keyHeads = response["key_heads"].int_value();
+        meta.valueHeads = response["value_heads"].int_value();
+        meta.kDim = response["k_dim"].int_value();
+        meta.vDim = response["v_dim"].int_value();
+        meta.blockT = response["block_t"].int_value();
+        meta.numStages = response["num_stages"].int_value();
+        return !meta.kernel.cubinPath.empty() &&
+               !meta.kernel.kernelName.empty() &&
+               meta.kernel.numWarps > 0 &&
+               CudaTritonFileExists(meta.kernel.cubinPath) &&
+               meta.keyHeads == keyHeads &&
+               meta.valueHeads == valueHeads &&
+               meta.kDim == kDim && meta.vDim == vDim &&
+               meta.blockT == blockT && meta.numStages == numStages;
+    }
+
+    static bool CudaTritonGetChunkGdnPostConvMeta(
+        const std::string &cacheDir, const std::string &base,
+        int arch, int keyHeads, int valueHeads, int kDim, int vDim,
+        int blockT, int numWarps, int numStages,
+        const CudaTritonChunkGdnPostConvMeta *&meta) {
+        static std::mutex mutex;
+        static std::map<std::string, CudaTritonChunkGdnPostConvMeta> cachedMeta;
+        meta = nullptr;
+        std::string metaPath = CudaTritonJoinPath(cacheDir, base + ".json");
+        {
+            std::lock_guard<std::mutex> guard(mutex);
+            auto it = cachedMeta.find(metaPath);
+            if (it != cachedMeta.end()) {
+                meta = &it->second;
+                return true;
+            }
+        }
+
+        CudaTritonChunkGdnPostConvMeta loaded;
+        if (!CudaTritonReadChunkGdnPostConvMeta(metaPath, loaded)) {
+            if (!CudaTritonRequestChunkGdnPostConvKernel(
+                    cacheDir, arch, keyHeads, valueHeads, kDim, vDim,
+                    blockT, numWarps, numStages, loaded)) {
+                return false;
+            }
+        }
+        if (loaded.keyHeads != keyHeads ||
+            loaded.valueHeads != valueHeads ||
+            loaded.kDim != kDim || loaded.vDim != vDim ||
+            loaded.blockT != blockT || loaded.numStages != numStages) {
+            return false;
+        }
+
+        std::lock_guard<std::mutex> guard(mutex);
+        auto it = cachedMeta.find(metaPath);
+        if (it == cachedMeta.end()) {
+            it = cachedMeta.emplace(metaPath, loaded).first;
+        }
+        meta = &it->second;
+        return true;
+    }
+
+    static bool CudaTritonRequestQwen4SparseAttentionKernel(
+        const std::string &cacheDir, int arch, const std::string &dtype,
+        int groupSize, int headDim, int topk,
+        int blockN, int numWarps, int numStages,
+        CudaTritonQwen4SparseAttentionMeta &meta) {
+        if (!CudaTritonEnsureServer()) {
+            return false;
+        }
+        json11::Json request = json11::Json::object {
+            {"op", "qwen4_sparse_attention"},
+            {"cache_dir", cacheDir},
+            {"arch", arch},
+            {"dtype", dtype},
+            {"group_size", groupSize},
+            {"head_dim", headDim},
+            {"topk", topk},
+            {"block_n", blockN},
+            {"num_warps", numWarps},
+            {"num_stages", numStages},
+        };
+        int status = 0;
+        std::string body;
+        if (!CudaTritonHttpRequest(
+                "POST", "/compile", request.dump(), &status, body)) {
+            return false;
+        }
+        std::string err;
+        json11::Json response = json11::Json::parse(body, err);
+        if (status != 200 || !err.empty() ||
+            !response["ok"].bool_value()) {
+            static bool warned = false;
+            if (!warned) {
+                printf("Fastllm Triton: Qwen4 sparse attention compile "
+                       "failed; falling back to built-in CUDA. %s\n",
+                       response["error"].string_value().c_str());
+                warned = true;
+            }
+            return false;
+        }
+        meta.kernel.cubinPath = response["cubin"].string_value();
+        meta.kernel.kernelName = response["kernel"].string_value();
+        meta.kernel.shared = response["shared"].int_value();
+        meta.kernel.numWarps = response["num_warps"].int_value();
+        meta.dtype = response["dtype"].string_value();
+        meta.groupSize = response["group_size"].int_value();
+        meta.headDim = response["head_dim"].int_value();
+        meta.topk = response["topk"].int_value();
+        meta.blockM = response["block_m"].int_value();
+        meta.blockN = response["block_n"].int_value();
+        meta.numStages = response["num_stages"].int_value();
+        return !meta.kernel.cubinPath.empty() &&
+               !meta.kernel.kernelName.empty() &&
+               meta.kernel.numWarps > 0 &&
+               CudaTritonFileExists(meta.kernel.cubinPath) &&
+               meta.dtype == dtype && meta.groupSize == groupSize &&
+               meta.headDim == headDim && meta.topk == topk &&
+               meta.blockN == blockN &&
+               meta.kernel.numWarps == numWarps &&
+               meta.numStages == numStages;
+    }
+
+    static bool CudaTritonGetQwen4SparseAttentionMeta(
+        const std::string &cacheDir, const std::string &base,
+        int arch, const std::string &dtype,
+        int groupSize, int headDim, int topk,
+        int blockN, int numWarps, int numStages,
+        const CudaTritonQwen4SparseAttentionMeta *&meta) {
+        static std::mutex mutex;
+        static std::map<std::string,
+                        CudaTritonQwen4SparseAttentionMeta> cachedMeta;
+        meta = nullptr;
+        std::string metaPath = CudaTritonJoinPath(cacheDir, base + ".json");
+        {
+            std::lock_guard<std::mutex> guard(mutex);
+            auto it = cachedMeta.find(metaPath);
+            if (it != cachedMeta.end()) {
+                meta = &it->second;
+                return true;
+            }
+        }
+
+        CudaTritonQwen4SparseAttentionMeta loaded;
+        if (!CudaTritonReadQwen4SparseAttentionMeta(metaPath, loaded)) {
+            if (!CudaTritonRequestQwen4SparseAttentionKernel(
+                    cacheDir, arch, dtype, groupSize,
+                    headDim, topk, blockN, numWarps, numStages, loaded)) {
+                return false;
+            }
+        }
+        int expectedBlockM = 1;
+        while (expectedBlockM < groupSize) {
+            expectedBlockM <<= 1;
+        }
+        if (loaded.dtype != dtype || loaded.groupSize != groupSize ||
+            loaded.headDim != headDim || loaded.topk != topk ||
+            loaded.blockM != expectedBlockM || loaded.blockN != blockN ||
+            loaded.kernel.numWarps != numWarps ||
+            loaded.numStages != numStages) {
+            return false;
+        }
+
+        std::lock_guard<std::mutex> guard(mutex);
+        auto it = cachedMeta.find(metaPath);
+        if (it == cachedMeta.end()) {
+            it = cachedMeta.emplace(metaPath, loaded).first;
+        }
+        meta = &it->second;
+        return true;
+    }
+
+    static bool CudaTritonRequestChunkGdnRecomputeKernel(
+        const std::string &cacheDir, int arch,
+        int chunkSize, int kDim, int vDim, int blockD,
+        int numWarps, int numStages,
+        CudaTritonChunkGdnRecomputeMeta &meta) {
+        if (!CudaTritonEnsureServer()) {
+            return false;
+        }
+        json11::Json request = json11::Json::object {
+            {"op", "chunk_gdn_recompute_v7"},
+            {"cache_dir", cacheDir},
+            {"arch", arch},
+            {"dtype", "fp16"},
+            {"chunk_size", chunkSize},
+            {"k_dim", kDim},
+            {"v_dim", vDim},
+            {"block_d", blockD},
+            {"num_warps", numWarps},
+            {"num_stages", numStages},
+        };
+        int status = 0;
+        std::string body;
+        if (!CudaTritonHttpRequest(
+                "POST", "/compile", request.dump(), &status, body)) {
+            return false;
+        }
+        std::string err;
+        json11::Json response = json11::Json::parse(body, err);
+        if (status != 200 || !err.empty() ||
+            !response["ok"].bool_value()) {
+            static bool warned = false;
+            if (!warned) {
+                printf("Fastllm Triton: chunk GDN recompute compile failed; "
+                       "falling back to built-in CUDA. %s\n",
+                       response["error"].string_value().c_str());
+                warned = true;
+            }
+            return false;
+        }
+        meta.chunkSize = response["chunk_size"].int_value();
+        meta.kDim = response["k_dim"].int_value();
+        meta.vDim = response["v_dim"].int_value();
+        meta.blockD = response["block_d"].int_value();
+        meta.numStages = response["num_stages"].int_value();
+        if (meta.chunkSize != chunkSize ||
+            meta.kDim != kDim || meta.vDim != vDim ||
+            meta.blockD != blockD || meta.numStages != numStages) {
+            return false;
+        }
+        json11::Json kernels = response["kernels"];
+        for (int i = 0;
+             i < kCudaTritonChunkGdnRecomputeKernelCount; i++) {
+            json11::Json item =
+                kernels[kCudaTritonChunkGdnRecomputeKernelKeys[i]];
+            meta.kernels[i].cubinPath = item["cubin"].string_value();
+            meta.kernels[i].kernelName = item["kernel"].string_value();
+            meta.kernels[i].shared = item["shared"].int_value();
+            meta.kernels[i].numWarps = item["num_warps"].int_value();
+            if (meta.kernels[i].cubinPath.empty() ||
+                meta.kernels[i].kernelName.empty() ||
+                meta.kernels[i].numWarps <= 0 ||
+                !CudaTritonFileExists(meta.kernels[i].cubinPath)) {
+                return false;
+            }
+        }
+        return meta.chunkSize == chunkSize &&
+               meta.kDim == kDim && meta.vDim == vDim &&
+               meta.blockD == blockD && meta.numStages == numStages;
+    }
+
+    static bool CudaTritonGetChunkGdnRecomputeMeta(
+        const std::string &cacheDir, const std::string &base,
+        int arch, int chunkSize, int kDim, int vDim, int blockD,
+        int numWarps, int numStages,
+        const CudaTritonChunkGdnRecomputeMeta *&meta) {
+        static std::mutex mutex;
+        static std::map<std::string, CudaTritonChunkGdnRecomputeMeta>
+            cachedMeta;
+        meta = nullptr;
+        std::string metaPath =
+            CudaTritonJoinPath(cacheDir, base + ".json");
+        {
+            std::lock_guard<std::mutex> guard(mutex);
+            auto it = cachedMeta.find(metaPath);
+            if (it != cachedMeta.end()) {
+                meta = &it->second;
+                return true;
+            }
+        }
+
+        CudaTritonChunkGdnRecomputeMeta loaded;
+        if (!CudaTritonReadChunkGdnRecomputeMeta(metaPath, loaded)) {
+            if (!CudaTritonRequestChunkGdnRecomputeKernel(
+                    cacheDir, arch, chunkSize, kDim, vDim, blockD,
+                    numWarps, numStages, loaded)) {
+                return false;
+            }
+        }
+        if (loaded.chunkSize != chunkSize ||
+            loaded.kDim != kDim || loaded.vDim != vDim ||
+            loaded.blockD != blockD ||
+            loaded.numStages != numStages) {
+            return false;
+        }
+
+        std::lock_guard<std::mutex> guard(mutex);
+        auto it = cachedMeta.find(metaPath);
+        if (it == cachedMeta.end()) {
+            it = cachedMeta.emplace(metaPath, loaded).first;
+        }
+        meta = &it->second;
+        return true;
+    }
+
+    static bool CudaTritonRequestDeepSeekV4WoAKernel(
+        const std::string &cacheDir, int arch,
+        int numTokens, int numGroups, int outRank, int hiddenSize,
+        int blockTokens, int blockOut, int blockHidden,
+        int numWarps, int numStages,
+        CudaTritonDeepSeekV4WoAMeta &meta) {
+        if (!CudaTritonEnsureServer()) {
+            return false;
+        }
+        json11::Json request = json11::Json::object {
+            {"op", "deepseek_v4_fp8_woa"},
+            {"cache_dir", cacheDir},
+            {"arch", arch},
+            {"num_tokens", numTokens},
+            {"num_groups", numGroups},
+            {"out_rank", outRank},
+            {"hidden_size", hiddenSize},
+            {"block_tokens", blockTokens},
+            {"block_out", blockOut},
+            {"block_hidden", blockHidden},
+            {"num_warps", numWarps},
+            {"num_stages", numStages},
+        };
+        int status = 0;
+        std::string body;
+        if (!CudaTritonHttpRequest("POST", "/compile", request.dump(), &status, body)) {
+            return false;
+        }
+        std::string err;
+        json11::Json response = json11::Json::parse(body, err);
+        if (status != 200 || !err.empty() || !response["ok"].bool_value()) {
+            static bool warned = false;
+            if (!warned) {
+                printf("Fastllm Triton: DeepSeek-V4 FP8 WoA compile failed; "
+                       "falling back to built-in CUDA. %s\n",
+                       response["error"].string_value().c_str());
+                warned = true;
+            }
+            return false;
+        }
+        meta.kernel.cubinPath = response["cubin"].string_value();
+        meta.kernel.kernelName = response["kernel"].string_value();
+        meta.kernel.shared = response["shared"].int_value();
+        meta.kernel.numWarps = response["num_warps"].int_value();
+        meta.numTokens = response["num_tokens"].int_value();
+        meta.numGroups = response["num_groups"].int_value();
+        meta.outRank = response["out_rank"].int_value();
+        meta.hiddenSize = response["hidden_size"].int_value();
+        meta.blockTokens = response["block_tokens"].int_value();
+        meta.blockOut = response["block_out"].int_value();
+        meta.blockHidden = response["block_hidden"].int_value();
+        return !meta.kernel.cubinPath.empty() && !meta.kernel.kernelName.empty() &&
+               meta.kernel.numWarps > 0 && CudaTritonFileExists(meta.kernel.cubinPath) &&
+               meta.numTokens == numTokens && meta.numGroups == numGroups &&
+               meta.outRank == outRank && meta.hiddenSize == hiddenSize &&
+               meta.blockTokens == blockTokens && meta.blockOut == blockOut &&
+               meta.blockHidden == blockHidden;
+    }
+
+    static bool CudaTritonGetDeepSeekV4WoAMeta(
+        const std::string &cacheDir, const std::string &base, int arch,
+        int numTokens, int numGroups, int outRank, int hiddenSize,
+        int blockTokens, int blockOut, int blockHidden,
+        int numWarps, int numStages,
+        const CudaTritonDeepSeekV4WoAMeta *&meta) {
+        static std::mutex mutex;
+        static std::map<std::string, CudaTritonDeepSeekV4WoAMeta> cachedMeta;
+        meta = nullptr;
+        std::string metaPath = CudaTritonJoinPath(cacheDir, base + ".json");
+        {
+            std::lock_guard<std::mutex> guard(mutex);
+            auto it = cachedMeta.find(metaPath);
+            if (it != cachedMeta.end()) {
+                meta = &it->second;
+                return true;
+            }
+        }
+
+        CudaTritonDeepSeekV4WoAMeta loaded;
+        if (!CudaTritonReadDeepSeekV4WoAMeta(metaPath, loaded)) {
+            if (!CudaTritonRequestDeepSeekV4WoAKernel(
+                    cacheDir, arch, numTokens, numGroups, outRank, hiddenSize,
+                    blockTokens, blockOut, blockHidden, numWarps, numStages, loaded)) {
+                return false;
+            }
+        }
+        if (loaded.numTokens != numTokens || loaded.numGroups != numGroups ||
+            loaded.outRank != outRank || loaded.hiddenSize != hiddenSize ||
+            loaded.blockTokens != blockTokens || loaded.blockOut != blockOut ||
+            loaded.blockHidden != blockHidden) {
+            return false;
+        }
+
+        std::lock_guard<std::mutex> guard(mutex);
+        auto it = cachedMeta.find(metaPath);
+        if (it == cachedMeta.end()) {
+            it = cachedMeta.emplace(metaPath, loaded).first;
+        }
+        meta = &it->second;
+        return true;
+    }
+
+    static bool CudaTritonRequestDeepSeekV4SparseDecodeKernel(
+        const std::string &cacheDir, int arch, int batch, int numHeads,
+        int headDim, int windowSize, int compressRatio,
+        int compressedCapacity, int splitSize, int blockD, int mergeBlockD,
+        int splitNumWarps, int mergeNumWarps, int numStages,
+        const std::string &variant,
+        CudaTritonDeepSeekV4SparseDecodeMeta &meta) {
+        if (!CudaTritonEnsureServer()) {
+            return false;
+        }
+        json11::Json request = json11::Json::object {
+            {"op", "deepseek_v4_sparse_decode"},
+            {"variant", variant},
+            {"cache_dir", cacheDir},
+            {"arch", arch},
+            {"batch", batch},
+            {"num_heads", numHeads},
+            {"head_dim", headDim},
+            {"window_size", windowSize},
+            {"compress_ratio", compressRatio},
+            {"compressed_capacity", compressedCapacity},
+            {"split_size", splitSize},
+            {"block_d", blockD},
+            {"merge_block_d", mergeBlockD},
+            {"split_num_warps", splitNumWarps},
+            {"merge_num_warps", mergeNumWarps},
+            {"num_stages", numStages},
+        };
+        int status = 0;
+        std::string body;
+        if (!CudaTritonHttpRequest("POST", "/compile", request.dump(), &status, body)) {
+            return false;
+        }
+        std::string err;
+        json11::Json response = json11::Json::parse(body, err);
+        if (status != 200 || !err.empty() || !response["ok"].bool_value()) {
+            static bool warned = false;
+            if (!warned) {
+                printf("Fastllm Triton: DeepSeek-V4 sparse decode compile failed; "
+                       "falling back to built-in CUDA. %s\n",
+                       response["error"].string_value().c_str());
+                warned = true;
+            }
+            return false;
+        }
+        if (response["version"].int_value() != 3) {
+            return false;
+        }
+        json11::Json kernels = response["kernels"];
+        for (int i = 0; i < kCudaTritonDeepSeekV4SparseDecodeKernelCount; i++) {
+            json11::Json item =
+                kernels[kCudaTritonDeepSeekV4SparseDecodeKernelKeys[i]];
+            meta.kernels[i].cubinPath = item["cubin"].string_value();
+            meta.kernels[i].kernelName = item["kernel"].string_value();
+            meta.kernels[i].shared = item["shared"].int_value();
+            meta.kernels[i].numWarps = item["num_warps"].int_value();
+            if (meta.kernels[i].cubinPath.empty() ||
+                meta.kernels[i].kernelName.empty() ||
+                meta.kernels[i].numWarps <= 0 ||
+                !CudaTritonFileExists(meta.kernels[i].cubinPath)) {
+                return false;
+            }
+        }
+        meta.batch = response["batch"].int_value();
+        meta.numHeads = response["num_heads"].int_value();
+        meta.headDim = response["head_dim"].int_value();
+        meta.windowSize = response["window_size"].int_value();
+        meta.compressRatio = response["compress_ratio"].int_value();
+        meta.compressedCapacity = response["compressed_capacity"].int_value();
+        meta.numSplits = response["num_splits"].int_value();
+        meta.blockSplits = response["block_splits"].int_value();
+        meta.splitSize = response["split_size"].int_value();
+        meta.blockD = response["block_d"].int_value();
+        meta.mergeBlockD = response["merge_block_d"].int_value();
+        meta.variant = response["variant"].string_value();
+        if (meta.variant.empty()) {
+            meta.variant = "generic";
+        }
+        meta.splitHeadBlock = response["split_head_block"].int_value();
+        if (meta.splitHeadBlock <= 0) {
+            meta.splitHeadBlock = 1;
+        }
+        return meta.batch == batch && meta.numHeads == numHeads &&
+               meta.headDim == headDim && meta.windowSize == windowSize &&
+               meta.compressRatio == compressRatio &&
+               meta.compressedCapacity == compressedCapacity &&
+               meta.splitSize == splitSize && meta.blockD == blockD &&
+               meta.mergeBlockD == mergeBlockD && meta.variant == variant &&
+               meta.numSplits > 0 &&
+               meta.numSplits <= 256 && meta.blockSplits >= meta.numSplits;
+    }
+
+    static bool CudaTritonGetDeepSeekV4SparseDecodeMeta(
+        const std::string &cacheDir, const std::string &base, int arch,
+        int batch, int numHeads, int headDim, int windowSize, int compressRatio,
+        int compressedCapacity, int splitSize, int blockD, int mergeBlockD,
+        int splitNumWarps, int mergeNumWarps, int numStages,
+        const std::string &variant,
+        const CudaTritonDeepSeekV4SparseDecodeMeta *&meta) {
+        static std::mutex mutex;
+        static std::map<std::string, CudaTritonDeepSeekV4SparseDecodeMeta> cachedMeta;
+        meta = nullptr;
+        std::string metaPath = CudaTritonJoinPath(cacheDir, base + ".json");
+        {
+            std::lock_guard<std::mutex> guard(mutex);
+            auto it = cachedMeta.find(metaPath);
+            if (it != cachedMeta.end()) {
+                meta = &it->second;
+                return true;
+            }
+        }
+
+        CudaTritonDeepSeekV4SparseDecodeMeta loaded;
+        if (!CudaTritonReadDeepSeekV4SparseDecodeMeta(metaPath, loaded)) {
+            if (!CudaTritonRequestDeepSeekV4SparseDecodeKernel(
+                    cacheDir, arch, batch, numHeads, headDim, windowSize,
+                    compressRatio, compressedCapacity, splitSize, blockD,
+                    mergeBlockD, splitNumWarps, mergeNumWarps, numStages,
+                    variant,
+                    loaded)) {
+                return false;
+            }
+        }
+        if (loaded.batch != batch || loaded.numHeads != numHeads ||
+            loaded.headDim != headDim || loaded.windowSize != windowSize ||
+            loaded.compressRatio != compressRatio ||
+            loaded.compressedCapacity != compressedCapacity ||
+            loaded.splitSize != splitSize || loaded.blockD != blockD ||
+            loaded.mergeBlockD != mergeBlockD || loaded.variant != variant) {
+            return false;
+        }
+
+        std::lock_guard<std::mutex> guard(mutex);
+        auto it = cachedMeta.find(metaPath);
+        if (it == cachedMeta.end()) {
+            it = cachedMeta.emplace(metaPath, loaded).first;
+        }
+        meta = &it->second;
+        return true;
+    }
+
+    static bool CudaTritonRequestDeepSeekV4RouterKernel(
+        const std::string &cacheDir, int arch, int numExperts, int topk,
+        int blockN, int numWarps, int numStages,
+        CudaTritonDeepSeekV4RouterMeta &meta) {
+        if (!CudaTritonEnsureServer()) {
+            return false;
+        }
+        json11::Json request = json11::Json::object {
+            {"op", "deepseek_v4_sqrtsoftplus_router"},
+            {"cache_dir", cacheDir},
+            {"arch", arch},
+            {"num_experts", numExperts},
+            {"topk", topk},
+            {"block_n", blockN},
+            {"num_warps", numWarps},
+            {"num_stages", numStages},
+        };
+        int status = 0;
+        std::string body;
+        if (!CudaTritonHttpRequest(
+                "POST", "/compile", request.dump(), &status, body)) {
+            return false;
+        }
+        std::string err;
+        json11::Json response = json11::Json::parse(body, err);
+        if (status != 200 || !err.empty() ||
+            !response["ok"].bool_value()) {
+            static bool warned = false;
+            if (!warned) {
+                printf("Fastllm Triton: DeepSeek-V4 router compile failed; "
+                       "falling back to generic CUDA. %s\n",
+                       response["error"].string_value().c_str());
+                warned = true;
+            }
+            return false;
+        }
+        meta.kernel.cubinPath = response["cubin"].string_value();
+        meta.kernel.kernelName = response["kernel"].string_value();
+        meta.kernel.shared = response["shared"].int_value();
+        meta.kernel.numWarps = response["num_warps"].int_value();
+        meta.numExperts = response["num_experts"].int_value();
+        meta.topk = response["topk"].int_value();
+        meta.blockN = response["block_n"].int_value();
+        return response["version"].int_value() == 1 &&
+               response["variant"].string_value() == "sm120" &&
+               meta.kernel.numWarps == numWarps &&
+               meta.numExperts == numExperts && meta.topk == topk &&
+               meta.blockN == blockN &&
+               !meta.kernel.cubinPath.empty() &&
+               !meta.kernel.kernelName.empty() &&
+               CudaTritonFileExists(meta.kernel.cubinPath);
+    }
+
+    static bool CudaTritonGetDeepSeekV4RouterMeta(
+        const std::string &cacheDir, const std::string &base,
+        int arch, int numExperts, int topk, int blockN,
+        int numWarps, int numStages,
+        const CudaTritonDeepSeekV4RouterMeta *&meta) {
+        static std::mutex mutex;
+        static std::map<std::string, CudaTritonDeepSeekV4RouterMeta>
+            cachedMeta;
+        meta = nullptr;
+        std::string metaPath = CudaTritonJoinPath(cacheDir, base + ".json");
+        {
+            std::lock_guard<std::mutex> guard(mutex);
+            auto it = cachedMeta.find(metaPath);
+            if (it != cachedMeta.end()) {
+                meta = &it->second;
+                return true;
+            }
+        }
+
+        CudaTritonDeepSeekV4RouterMeta loaded;
+        if (!CudaTritonReadDeepSeekV4RouterMeta(metaPath, loaded)) {
+            if (!CudaTritonRequestDeepSeekV4RouterKernel(
+                    cacheDir, arch, numExperts, topk, blockN,
+                    numWarps, numStages, loaded)) {
+                return false;
+            }
+        }
+        if (loaded.numExperts != numExperts || loaded.topk != topk ||
+            loaded.blockN != blockN ||
+            loaded.kernel.numWarps != numWarps) {
+            return false;
+        }
+        std::lock_guard<std::mutex> guard(mutex);
+        auto it = cachedMeta.find(metaPath);
+        if (it == cachedMeta.end()) {
+            it = cachedMeta.emplace(metaPath, loaded).first;
+        }
+        meta = &it->second;
+        return true;
+    }
+
+    static bool CudaTritonRequestMergeMoeFp8Kernel(
+        const std::string &cacheDir, const std::string &inputDtype, int arch,
+        int routeBlockT, int maxExperts, int topk, int hidden, int inter,
+        int groupBlockM, int groupBlockN, int groupBlockK,
+        int groupSizeM, int routeNumWarps, int groupNumWarps, int numStages,
+        CudaTritonMergeMoeFp8Meta &meta) {
+        if (!CudaTritonEnsureServer()) {
+            return false;
+        }
+        json11::Json request = json11::Json::object {
+            {"op", "merge_moe_fp8"},
+            {"cache_dir", cacheDir},
+            {"arch", arch},
+            {"input_dtype", inputDtype},
+            {"route_block_t", routeBlockT},
+            {"max_experts", maxExperts},
+            {"topk", topk},
+            {"hidden", hidden},
+            {"inter", inter},
+            {"group_block_m", groupBlockM},
+            {"group_block_n", groupBlockN},
+            {"group_block_k", groupBlockK},
+            {"group_size_m", groupSizeM},
+            {"route_num_warps", routeNumWarps},
+            {"group_num_warps", groupNumWarps},
+            {"num_stages", numStages},
+        };
+        int status = 0;
+        std::string body;
+        if (!CudaTritonHttpRequest("POST", "/compile", request.dump(), &status, body)) {
+            return false;
+        }
+        std::string err;
+        json11::Json response = json11::Json::parse(body, err);
+        if (status != 200 || !err.empty() || !response["ok"].bool_value()) {
+            static bool warned = false;
+            if (!warned) {
+                std::string message = response["error"].string_value();
+                printf("Fastllm Triton: compile failed, fallback to built-in CUDA mergeMoe. %s\n", message.c_str());
+                warned = true;
+            }
+            return false;
+        }
+        meta.routeBlockT = response["route_block_t"].int_value();
+        meta.maxExperts = response["max_experts"].int_value();
+        meta.groupBlockM = response["group_block_m"].int_value();
+        meta.groupBlockN = response["group_block_n"].int_value();
+        meta.groupBlockK = response["group_block_k"].int_value();
+        meta.groupSizeM = response["group_size_m"].int_value();
+        if (meta.routeBlockT <= 0 || meta.maxExperts <= 0 ||
+            meta.groupBlockM <= 0 || meta.groupBlockN <= 0 || meta.groupBlockK <= 0 ||
+            meta.groupSizeM < 0) {
+            return false;
+        }
+        json11::Json kernels = response["kernels"];
+        for (int i = 0; i < kCudaTritonMergeMoeFp8KernelCount; i++) {
+            json11::Json item = kernels[kCudaTritonMergeMoeFp8KernelKeys[i]];
+            meta.kernels[i].cubinPath = item["cubin"].string_value();
+            meta.kernels[i].kernelName = item["kernel"].string_value();
+            meta.kernels[i].shared = item["shared"].int_value();
+            meta.kernels[i].numWarps = item["num_warps"].int_value();
+            if (meta.kernels[i].cubinPath.empty() || meta.kernels[i].kernelName.empty() ||
+                meta.kernels[i].numWarps <= 0 || !CudaTritonFileExists(meta.kernels[i].cubinPath)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static bool CudaTritonGetMergeMoeFp8Meta(
+        const std::string &cacheDir, const std::string &base, const std::string &inputDtype, int arch,
+        int routeBlockT, int maxExperts, int topk, int hidden, int inter,
+        int groupBlockM, int groupBlockN, int groupBlockK,
+        int groupSizeM, int routeNumWarps, int groupNumWarps, int numStages,
+        const CudaTritonMergeMoeFp8Meta *&meta) {
+        static std::mutex mutex;
+        static std::map<std::string, CudaTritonMergeMoeFp8Meta> cachedMeta;
+        meta = nullptr;
+        std::string metaPath = CudaTritonJoinPath(cacheDir, base + ".json");
+        {
+            std::lock_guard<std::mutex> guard(mutex);
+            auto it = cachedMeta.find(metaPath);
+            if (it != cachedMeta.end()) {
+                meta = &it->second;
+                return true;
+            }
+        }
+
+        CudaTritonMergeMoeFp8Meta loaded;
+        if (!CudaTritonReadMergeMoeFp8Meta(metaPath, loaded)) {
+            if (!CudaTritonRequestMergeMoeFp8Kernel(
+                    cacheDir, inputDtype, arch,
+                    routeBlockT, maxExperts, topk, hidden, inter, groupBlockM, groupBlockN, groupBlockK,
+                    groupSizeM, routeNumWarps, groupNumWarps, numStages, loaded)) {
+                return false;
+            }
+        }
+
+        std::lock_guard<std::mutex> guard(mutex);
+        auto it = cachedMeta.find(metaPath);
+        if (it == cachedMeta.end()) {
+            it = cachedMeta.emplace(metaPath, loaded).first;
+        }
+        meta = &it->second;
+        return true;
+    }
+
+#ifdef FASTLLM_ENABLE_DEEPGEMM_FP8_SM90
+    static bool TryCudaDeepGemmLinearFp8Sm90(
+        Data &input, Data &weight, const Data &bias, Data &output, int n, int m, int k) {
+        if (FastllmCudaDeepGemmLinearFp8Sm90(input, weight, bias, output, n, m, k)) {
+            TraceCudaLinearFp8Path("deepgemm-sm90-fp8-block128", n, m, k);
+            return true;
+        }
+        return false;
+    }
+#endif
+
+    static bool TryCudaCutlassLinearFp8Block128(
+        Data &input, Data &weight, const Data &bias, Data &output, int n, int m, int k) {
+        if (!CudaEnvFlagDefaultEnabled("FASTLLM_CUDA_CUTLASS_LINEAR_FP8", true)) {
+            return false;
+        }
+        if (n <= 0 || m <= 0 || k <= 0 || (m % 128) != 0 || (k % 128) != 0 ||
+            input.dataDevice != DataDevice::CUDA || input.cudaData == nullptr ||
+            weight.dataDevice != DataDevice::CUDA || weight.cudaData == nullptr ||
+            weight.dataType != DataType::FP8_E4M3 ||
+            weight.dims.size() != 2 || weight.dims[0] != k || weight.dims[1] != m ||
+            weight.blockK != 128 || weight.blockM != 128 || weight.scales.empty() ||
+            (input.dataType != DataType::FLOAT16 && input.dataType != DataType::BFLOAT16) ||
+            output.dataType != input.dataType) {
+            return false;
+        }
+        bool hasBias = bias.dims.size() > 0;
+        if (hasBias && (bias.dataType != DataType::FLOAT32 || bias.cudaData == nullptr)) {
+            return false;
+        }
+
+        int minBatch = std::max(
+            CudaEnvInt("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_MIN_BATCH", 8),
+            FastllmCudaGetLinearExactBatchThreshold());
+        if (n < minBatch) {
+            return false;
+        }
+        int arch = CudaTritonRuntimeArch();
+        if (arch != 120 && arch != 121) {
+            return false;
+        }
+        bool ok = FastllmCudaCutlassLinearFP8E4M3Block128(input, weight, bias, output, n, m, k);
+        if (ok) {
+            TraceCudaLinearFp8Path("cutlass-fp8-e4m3-block128", n, m, k);
+        }
+        return ok;
+    }
+
+    static bool CudaTritonLinearFp8Enabled(int arch) {
+        const char *globalEnv = std::getenv("FASTLLM_CUDA_TRITON");
+        if (globalEnv != nullptr && globalEnv[0] != '\0') {
+            return CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON") &&
+                   CudaEnvFlagDefaultEnabled(
+                       "FASTLLM_CUDA_TRITON_LINEAR_FP8", true);
+        }
+        return arch == 89 &&
+               CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON_LINEAR_FP8");
+    }
+
+    static std::string CudaTritonLinearFp8MatmulVariant(int arch, bool packedWeight, bool hasBias) {
+        std::string matmulVariant = arch == 89 ? "strided" : "fastllm";
+        const char *kernelEnv = std::getenv("FASTLLM_CUDA_TRITON_LINEAR_FP8_KERNEL");
+        if (kernelEnv != nullptr && kernelEnv[0] != '\0') {
+            if (strcmp(kernelEnv, "strided") == 0 || strcmp(kernelEnv, "STRIDED") == 0) {
+                matmulVariant = "strided";
+            } else if (strcmp(kernelEnv, "fastllm") == 0 || strcmp(kernelEnv, "FASTLLM") == 0) {
+                matmulVariant = "fastllm";
+            }
+        }
+        if (matmulVariant == "strided" && (packedWeight || hasBias)) {
+            matmulVariant = "fastllm";
+        }
+        return matmulVariant;
+    }
+
+    static int CudaTritonLinearFp8MaxBatch(int arch, const std::string &matmulVariant) {
+        // The SM89 strided kernel accepts dynamic row counts, so do not impose
+        // a default prefill limit. Generic SM89 and other architectures retain
+        // their conservative limits; an explicit zero also means unlimited.
+        int defaultMaxBatch = arch == 89
+            ? (matmulVariant == "strided" ? 0 : 256)
+            : 64;
+        return CudaEnvIntRange(
+            "FASTLLM_CUDA_TRITON_LINEAR_FP8_MAX_BATCH", defaultMaxBatch,
+            0, std::numeric_limits<int>::max());
+    }
+
+    static bool RunCudaTritonLinearFp8Block128(
+        Data &input, Data &weight, const Data &bias, Data &output, int n, int m, int k,
+        bool fromSwiglu = false) {
+        int arch = CudaTritonRuntimeArch();
+        if (arch < 89 || !CudaTritonLinearFp8Enabled(arch)) {
+            return false;
+        }
+        if (n <= 0 || m <= 0 || k <= 0 || (m % 128) != 0 ||
+            input.dataDevice != DataDevice::CUDA || input.cudaData == nullptr ||
+            weight.dataDevice != DataDevice::CUDA || weight.cudaData == nullptr ||
+            weight.dims.size() != 2 || weight.dims[0] != k || weight.dims[1] != m ||
+            (input.dataType != DataType::FLOAT16 && input.dataType != DataType::BFLOAT16) ||
+            output.dataType != input.dataType) {
+            return false;
+        }
+        bool packedWeight = weight.dataType == DataType::FP8_E4M3_BLOCK_128;
+        bool separateScalesWeight = weight.dataType == DataType::FP8_E4M3 &&
+                                    weight.blockK == 128 && weight.blockM == 128 &&
+                                    !weight.scales.empty();
+        if (!packedWeight && !separateScalesWeight) {
+            return false;
+        }
+        // FP16 warmup may repack separate-scale FP8 weights in place for
+        // Marlin. Triton consumes the original row-major bytes, so it must
+        // fall back once that destructive layout conversion has happened.
+        if (separateScalesWeight && FastllmCudaHasFp8MarlinLayout(weight)) {
+            return false;
+        }
+        bool hasBias = bias.dims.size() > 0;
+        if (hasBias && (bias.dataType != DataType::FLOAT32 || bias.cudaData == nullptr)) {
+            return false;
+        }
+
+        std::string inputDtype;
+        if (!CudaTritonDataTypeName(input.dataType, inputDtype)) {
+            return false;
+        }
+        std::string matmulVariant = CudaTritonLinearFp8MatmulVariant(arch, packedWeight, hasBias);
+        int maxBatch = CudaTritonLinearFp8MaxBatch(arch, matmulVariant);
+        if (maxBatch > 0 && n > maxBatch) {
+            return false;
+        }
+
+        int defaultBlockM = matmulVariant == "strided" ? 64 : (n <= 64 ? 16 : 64);
+        int defaultBlockN = matmulVariant == "strided" ? 128 : (n <= 64 ? 64 : 32);
+        int blockM = CudaEnvInt("FASTLLM_CUDA_TRITON_LINEAR_FP8_BLOCK_M", defaultBlockM);
+        int blockN = CudaEnvInt("FASTLLM_CUDA_TRITON_LINEAR_FP8_BLOCK_N", defaultBlockN);
+        int blockK = CudaEnvInt("FASTLLM_CUDA_TRITON_LINEAR_FP8_BLOCK_K", 128);
+        int groupSizeM = CudaEnvIntRange("FASTLLM_CUDA_TRITON_LINEAR_FP8_GROUP_SIZE_M", 32, 1, 4096);
+        int quantNumWarps = CudaEnvInt("FASTLLM_CUDA_TRITON_LINEAR_FP8_QUANT_NUM_WARPS", 4);
+        int matmulNumWarps = CudaEnvInt("FASTLLM_CUDA_TRITON_LINEAR_FP8_MATMUL_NUM_WARPS", 4);
+        int numStages = CudaEnvInt("FASTLLM_CUDA_TRITON_LINEAR_FP8_NUM_STAGES", 3);
+        if (blockK != 128 || blockN <= 0 || blockM <= 0) {
+            return false;
+        }
+
+        std::string cacheDir = CudaTritonCacheDir();
+        std::string base = CudaTritonLinearFp8Block128BaseName(
+            inputDtype, hasBias, packedWeight, arch, blockM, blockN, blockK, groupSizeM,
+            quantNumWarps, matmulNumWarps, numStages, matmulVariant);
+
+        const CudaTritonLinearFp8Block128Meta *meta = nullptr;
+        if (!CudaTritonGetLinearFp8Block128Meta(
+                cacheDir, base, inputDtype, hasBias, packedWeight, arch, blockM, blockN, blockK, groupSizeM,
+                quantNumWarps, matmulNumWarps, numStages, matmulVariant, meta)) {
+            return false;
+        }
+        if (meta == nullptr || meta->hasBias != hasBias || meta->packedWeight != packedWeight ||
+            meta->matmulVariant != matmulVariant) {
+            return false;
+        }
+        auto run = fromSwiglu ? FastllmCudaTritonLinearFP8E4M3Block128FromSwiglu
+                             : FastllmCudaTritonLinearFP8E4M3Block128;
+        bool ok = run(
+            meta->kernels[0].cubinPath.c_str(), meta->kernels[0].kernelName.c_str(),
+            meta->kernels[0].numWarps, meta->kernels[0].shared,
+            meta->kernels[1].cubinPath.c_str(), meta->kernels[1].kernelName.c_str(),
+            meta->kernels[1].numWarps, meta->kernels[1].shared,
+            meta->blockM, meta->blockN, meta->blockK, meta->groupSizeM,
+            meta->packedWeight, meta->matmulVariant == "strided",
+            input, weight, bias, output, n, m, k);
+        if (ok) {
+            if (fromSwiglu) {
+                TraceCudaLinearFp8Path("triton-fp8-e4m3-block128-swiglu-quant", n, m, k);
+            } else if (meta->matmulVariant == "strided") {
+                TraceCudaLinearFp8Path("triton-fp8-e4m3-block128-strided", n, m, k);
+            } else {
+                TraceCudaLinearFp8Path(meta->packedWeight ? "triton-fp8-e4m3-packed-block128" :
+                                                            "triton-fp8-e4m3-block128",
+                                       n, m, k);
+            }
+        }
+        return ok;
+    }
+
+    bool CanUseCudaTritonSwigluLinear(int rows, bool hasBias, bool packedWeight) {
+        int arch = CudaTritonRuntimeArch();
+#ifdef FASTLLM_ENABLE_DEEPGEMM_FP8_SM90
+        // Preserve the native backend selected ahead of Triton on Hopper.
+        if (arch == 90) {
+            return false;
+        }
+#endif
+        if (rows > 0) {
+            int minBatch = std::max(128, FastllmCudaGetLinearExactBatchThreshold());
+            minBatch = std::max(minBatch, CudaEnvInt("FASTLLM_CUDA_TRITON_LINEAR_FP8_MIN_BATCH", 0));
+            int maxBatch = CudaTritonLinearFp8MaxBatch(
+                arch, CudaTritonLinearFp8MatmulVariant(arch, packedWeight, hasBias));
+            if (rows < minBatch || (maxBatch > 0 && rows > maxBatch)) {
+                return false;
+            }
+        }
+        return arch >= 89 && CudaTritonLinearFp8Enabled(arch) &&
+               CudaEnvFlagDefaultEnabled("FASTLLM_CUDA_TRITON_LINEAR_FP8_SWIGLU_QUANT", true) &&
+               CudaEnvFlagDefaultEnabled("FASTLLM_CUDA_TRITON_LINEAR_FP8_NATIVE_QUANT", true);
+    }
+
+    bool DoCudaTritonSwigluLinear(Data &input, Data &weight, const Data &bias, Data &output) {
+        if (input.dims.empty() ||
+            input.dims.back() <= 0 || (input.dims.back() % 256) != 0 ||
+            weight.dims.size() != 2) {
+            return false;
+        }
+        std::vector<int> outputDims = input.dims;
+        outputDims.back() = weight.dims[0];
+        if (output.dims != outputDims || output.dataDevice != DataDevice::CUDA ||
+            output.cudaData == nullptr || output.cudaData == weight.cudaData) {
+            return false;
+        }
+        // The fused reader consumes contiguous [gate, up] rows.
+        for (const Data *data : {&input, &output}) {
+            uint64_t stride = 1;
+            if (data->strides.size() != data->dims.size()) {
+                return false;
+            }
+            for (int i = (int)data->dims.size() - 1; i >= 0; --i) {
+                if (data->dims[i] <= 0 || data->strides[i] != stride) {
+                    return false;
+                }
+                stride *= data->dims[i];
+            }
+        }
+        int n = input.Count(0) / input.dims.back();
+        // Keep the existing small-batch GEMV/decode dispatch.
+        if (!CanUseCudaTritonSwigluLinear(n, !bias.dims.empty(), weight.dataType == DataType::FP8_E4M3_BLOCK_128)) {
+            return false;
+        }
+        return RunCudaTritonLinearFp8Block128(
+            input, weight, bias, output, n, input.dims.back() / 2, weight.dims[0], true);
+    }
+
+    struct CudaLinearFp8AutotuneKey {
+        int device;
+        int dataType;
+        int cudaGraph;
+        int n;
+        int m;
+        int k;
+
+        bool operator<(const CudaLinearFp8AutotuneKey &other) const {
+            return std::tie(device, dataType, cudaGraph, n, m, k) <
+                   std::tie(other.device, other.dataType, other.cudaGraph,
+                            other.n, other.m, other.k);
+        }
+    };
+
+    static bool RunCudaNativeLinearFp8Block128(
+        Data &input, Data &weight, const Data &bias, Data &output,
+        int n, int m, int k) {
+        if (input.dataType == DataType::FLOAT16) {
+            return FastllmCudaHalfMatMulFloatFP8E4M3(
+                input, weight, bias, output, n, m, k);
+        }
+        if (input.dataType == DataType::BFLOAT16) {
+            return FastllmCudaBFloat16MatMulFP8E4M3(
+                input, weight, bias, output, n, m, k);
+        }
+        return false;
+    }
+
+    struct CudaLinearFp8PerChannelAutotuneKey {
+        int device;
+        int dataType;
+        int cudaGraph;
+        int hasBias;
+        int n;
+        int m;
+        int k;
+
+        bool operator<(const CudaLinearFp8PerChannelAutotuneKey &other) const {
+            return std::tie(device, dataType, cudaGraph, hasBias, n, m, k) <
+                   std::tie(other.device, other.dataType, other.cudaGraph,
+                            other.hasBias, other.n, other.m, other.k);
+        }
+    };
+
+    static bool CudaLinearFp8IsPerChannelWeight(
+        const Data &weight, int m, int k) {
+        return m > 0 && k > 0 && weight.dataDevice == DataDevice::CUDA &&
+               weight.cudaData != nullptr &&
+               weight.dataType == DataType::FP8_E4M3 &&
+               weight.dims.size() == 2 && weight.dims[0] == k &&
+               weight.dims[1] == m && weight.blockK == 1 &&
+               weight.blockM >= m && weight.scales.size() == (size_t)k &&
+               !FastllmCudaHasFp8MarlinLayout(weight);
+    }
+
+    static bool RunCudaCutlassLinearFp8PerChannel(
+        Data &input, Data &weight, const Data &bias, Data &output,
+        int n, int m, int k) {
+        return FastllmCudaCutlassLinearFP8E4M3PerChannel(
+            input, weight, bias, output, n, m, k);
+    }
+
+    static float BenchmarkCudaLinearFp8PerChannelPath(
+        bool cutlass, bool cudaGraph, int iterations,
+        Data &input, Data &weight, const Data &bias, Data &output,
+        int n, int m, int k, bool &ok) {
+        auto run = [&]() {
+            return cutlass
+                ? RunCudaCutlassLinearFp8PerChannel(
+                      input, weight, bias, output, n, m, k)
+                : RunCudaNativeLinearFp8Block128(
+                      input, weight, bias, output, n, m, k);
+        };
+        if (!cudaGraph) {
+            FastllmCudaSyncCurrentThreadStream();
+            auto start = std::chrono::steady_clock::now();
+            int completed = 0;
+            for (; completed < iterations; ++completed) {
+                bool currentOk = run();
+                ok = ok && currentOk;
+                if (!currentOk) {
+                    break;
+                }
+            }
+            FastllmCudaSyncCurrentThreadStream();
+            auto end = std::chrono::steady_clock::now();
+            float elapsedMs = std::chrono::duration<float, std::milli>(
+                end - start).count();
+            return elapsedMs / std::max(completed, 1);
+        }
+
+        void *start = FastllmCudaEventCreateTiming();
+        void *end = FastllmCudaEventCreateTiming();
+        FastllmCudaEventRecordCurrentThread(start);
+        int completed = 0;
+        for (; completed < iterations; ++completed) {
+            bool currentOk = run();
+            ok = ok && currentOk;
+            if (!currentOk) {
+                break;
+            }
+        }
+        FastllmCudaEventRecordCurrentThread(end);
+        FastllmCudaEventSynchronize(end);
+        float elapsedMs = FastllmCudaEventElapsedTime(start, end);
+        FastllmCudaEventDestroy(start);
+        FastllmCudaEventDestroy(end);
+        return elapsedMs / std::max(completed, 1);
+    }
+
+    // Returns true once the operation has been handled by either CUTLASS or
+    // native.  A false return means this is not an eligible per-channel FP8
+    // shape and lets the existing blockwise/Triton/native dispatch continue.
+    static bool TryCudaCutlassLinearFp8PerChannel(
+        Data &input, Data &weight, const Data &bias, Data &output,
+        int n, int m, int k) {
+        if (!CudaEnvFlagDefaultEnabled(
+                "FASTLLM_CUDA_CUTLASS_LINEAR_FP8", true) ||
+            !CudaLinearFp8IsPerChannelWeight(weight, m, k) ||
+            n <= 0 || (m % 16) != 0 || (k % 4) != 0 ||
+            n < FastllmCudaGetLinearExactBatchThreshold() ||
+            input.dataDevice != DataDevice::CUDA ||
+            input.cudaData == nullptr ||
+            (input.dataType != DataType::FLOAT16 &&
+             input.dataType != DataType::BFLOAT16) ||
+            output.dataType != input.dataType ||
+            (bias.dims.size() > 0 &&
+             (bias.dataType != DataType::FLOAT32 ||
+              bias.cudaData == nullptr))) {
+            return false;
+        }
+        // The compiled CUTLASS 2.x specialization is intentionally limited
+        // to Ada. Hopper and newer use different CUTLASS 3.x kernels.
+        if (CudaTritonRuntimeArch() != 89) {
+            return false;
+        }
+
+        // Honor the same minimum batch as blockwise CUTLASS FP8. Small-batch
+        // native Linear keeps FP16/BF16 activations; switching to W8A8 based
+        // only on isolated kernel timing can reduce speculative acceptance.
+        int minBatch = std::max(
+            CudaEnvInt("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_MIN_BATCH", 8),
+            FastllmCudaGetLinearExactBatchThreshold());
+        if (n < minBatch) {
+            return false;
+        }
+
+        bool cudaGraph = GetFastllmEnv().cudaGraph;
+        CudaLinearFp8PerChannelAutotuneKey key = {
+            FastllmCudaGetDevice(), (int)input.dataType,
+            cudaGraph ? 1 : 0, bias.dims.empty() ? 0 : 1,
+            n, m, k};
+        // Model warmup and request execution can run on different host
+        // threads. Cache by CUDA device rather than by host thread so the
+        // measured choice is reused by the first real request as well.
+        static std::mutex decisionsMutex;
+        static std::map<CudaLinearFp8PerChannelAutotuneKey, bool> decisions;
+        bool foundDecision = false;
+        bool cachedUseCutlass = false;
+        {
+            std::lock_guard<std::mutex> guard(decisionsMutex);
+            auto found = decisions.find(key);
+            if (found != decisions.end()) {
+                foundDecision = true;
+                cachedUseCutlass = found->second;
+            }
+        }
+        if (foundDecision) {
+            if (cachedUseCutlass) {
+                bool ok = RunCudaCutlassLinearFp8PerChannel(
+                    input, weight, bias, output, n, m, k);
+                if (ok) {
+                    TraceCudaLinearFp8Path(
+                        "cutlass-fp8-e4m3-perchannel", n, m, k);
+                }
+                return ok;
+            }
+            bool ok = RunCudaNativeLinearFp8Block128(
+                input, weight, bias, output, n, m, k);
+            if (ok) {
+                TraceCudaLinearFp8Path(
+                    "native-fp8-e4m3-perchannel-autotuned", n, m, k);
+            }
+            return ok;
+        }
+
+        // Synchronizing an event during stream capture is illegal. The graph
+        // warmup normally fills this cache; if it did not, retain native until
+        // an eager execution can make an evidence-based decision.
+        if (FastllmCudaGraphIsCapturingFast()) {
+            bool ok = RunCudaNativeLinearFp8Block128(
+                input, weight, bias, output, n, m, k);
+            if (ok) {
+                TraceCudaLinearFp8Path(
+                    "native-fp8-e4m3-perchannel-capture", n, m, k);
+            }
+            return ok;
+        }
+
+        bool cutlassOk = RunCudaCutlassLinearFp8PerChannel(
+            input, weight, bias, output, n, m, k);
+        if (!cutlassOk) {
+            std::lock_guard<std::mutex> guard(decisionsMutex);
+            decisions[key] = false;
+            return RunCudaNativeLinearFp8Block128(
+                input, weight, bias, output, n, m, k);
+        }
+        bool nativeOk = RunCudaNativeLinearFp8Block128(
+            input, weight, bias, output, n, m, k);
+        if (!nativeOk) {
+            std::lock_guard<std::mutex> guard(decisionsMutex);
+            decisions[key] = true;
+            return RunCudaCutlassLinearFp8PerChannel(
+                input, weight, bias, output, n, m, k);
+        }
+        for (int i = 0; i < 2; ++i) {
+            cutlassOk = RunCudaCutlassLinearFp8PerChannel(
+                input, weight, bias, output, n, m, k) && cutlassOk;
+            nativeOk = RunCudaNativeLinearFp8Block128(
+                input, weight, bias, output, n, m, k) && nativeOk;
+        }
+        FastllmCudaSyncCurrentThreadStream();
+
+        int iterations = n >= 32 ? 8 : 16;
+        float cutlassMs = BenchmarkCudaLinearFp8PerChannelPath(
+            true, cudaGraph, iterations,
+            input, weight, bias, output, n, m, k, cutlassOk);
+        float nativeMs = BenchmarkCudaLinearFp8PerChannelPath(
+            false, cudaGraph, iterations,
+            input, weight, bias, output, n, m, k, nativeOk);
+        float nativeMs2 = BenchmarkCudaLinearFp8PerChannelPath(
+            false, cudaGraph, iterations,
+            input, weight, bias, output, n, m, k, nativeOk);
+        float cutlassMs2 = BenchmarkCudaLinearFp8PerChannelPath(
+            true, cudaGraph, iterations,
+            input, weight, bias, output, n, m, k, cutlassOk);
+        cutlassMs = std::min(cutlassMs, cutlassMs2);
+        nativeMs = std::min(nativeMs, nativeMs2);
+
+        // A small margin prevents timer noise from moving a shape to CUTLASS
+        // when the two implementations are effectively tied.
+        bool useCutlass = cutlassOk &&
+                          (!nativeOk || cutlassMs < nativeMs * 0.98f);
+        {
+            std::lock_guard<std::mutex> guard(decisionsMutex);
+            decisions[key] = useCutlass;
+        }
+        if (CudaEnvFlagEnabled("FASTLLM_CUDA_LINEAR_FP8_TRACE")) {
+            printf("FastLLM CUDA FP8 per-channel autotune: "
+                   "n=%d m=%d k=%d cutlass=%.4fms native=%.4fms -> %s\n",
+                   n, m, k, cutlassMs, nativeMs,
+                   useCutlass ? "cutlass" : "native");
+        }
+
+        bool ok = useCutlass
+            ? RunCudaCutlassLinearFp8PerChannel(
+                  input, weight, bias, output, n, m, k)
+            : RunCudaNativeLinearFp8Block128(
+                  input, weight, bias, output, n, m, k);
+        if (ok) {
+            TraceCudaLinearFp8Path(
+                useCutlass ? "cutlass-fp8-e4m3-perchannel" :
+                             "native-fp8-e4m3-perchannel-autotuned",
+                n, m, k);
+        }
+        return ok;
+    }
+
+    static bool PreferCudaTritonLinearFp8Sm89Fallback(
+        DataType inputType, int n, int m, int k) {
+        // At n >= 32 the native implementation dequantizes the full weight
+        // before cuBLAS. Isolated repetitions can make that path look fast by
+        // keeping one layer's weight in L2, but full-model decode continually
+        // changes weights and is consistently faster with direct FP8 Triton.
+        if (n >= 32) {
+            return true;
+        }
+        if (n < 12) {
+            return false;
+        }
+        int64_t weightElements = (int64_t)m * k;
+        if (n < 16) {
+            int64_t minWeightElements = inputType == DataType::BFLOAT16
+                ? 8LL * 1024 * 1024 : 12LL * 1024 * 1024;
+            return k > m && weightElements >= minWeightElements;
+        }
+        if (n < 24) {
+            return k > m && weightElements >= 8LL * 1024 * 1024;
+        }
+        return k > m || (k == m && weightElements >= 8LL * 1024 * 1024);
+    }
+
+    static float BenchmarkCudaLinearFp8Path(
+        bool triton, bool cudaGraph, int iterations,
+        Data &input, Data &weight, const Data &bias, Data &output,
+        int n, int m, int k, bool &ok) {
+        if (!cudaGraph) {
+            FastllmCudaSyncCurrentThreadStream();
+            auto start = std::chrono::steady_clock::now();
+            for (int i = 0; i < iterations; i++) {
+                bool currentOk = triton
+                    ? RunCudaTritonLinearFp8Block128(
+                          input, weight, bias, output, n, m, k)
+                    : RunCudaNativeLinearFp8Block128(
+                          input, weight, bias, output, n, m, k);
+                ok = ok && currentOk;
+                if (!currentOk) {
+                    break;
+                }
+            }
+            FastllmCudaSyncCurrentThreadStream();
+            auto end = std::chrono::steady_clock::now();
+            float elapsedMs = std::chrono::duration<float, std::milli>(
+                end - start).count();
+            return elapsedMs / std::max(iterations, 1);
+        }
+
+        void *start = FastllmCudaEventCreateTiming();
+        void *end = FastllmCudaEventCreateTiming();
+        FastllmCudaEventRecordCurrentThread(start);
+        for (int i = 0; i < iterations; i++) {
+            bool currentOk = triton
+                ? RunCudaTritonLinearFp8Block128(
+                      input, weight, bias, output, n, m, k)
+                : RunCudaNativeLinearFp8Block128(
+                      input, weight, bias, output, n, m, k);
+            ok = ok && currentOk;
+            if (!currentOk) {
+                break;
+            }
+        }
+        FastllmCudaEventRecordCurrentThread(end);
+        FastllmCudaEventSynchronize(end);
+        float elapsedMs = FastllmCudaEventElapsedTime(start, end);
+        FastllmCudaEventDestroy(start);
+        FastllmCudaEventDestroy(end);
+        return elapsedMs / std::max(iterations, 1);
+    }
+
+    static bool TryCudaTritonLinearFp8Block128(
+        Data &input, Data &weight, const Data &bias, Data &output, int n, int m, int k) {
+        int arch = CudaTritonRuntimeArch();
+        if (arch < 89 || !CudaTritonLinearFp8Enabled(arch)) {
+            return false;
+        }
+        int minBatchOverride = FastllmCudaGetLinearExactBatchThreshold();
+        if (n < minBatchOverride) {
+            return false;
+        }
+
+        bool hasBias = bias.dims.size() > 0;
+        bool separateScalesWeight = weight.dataType == DataType::FP8_E4M3 &&
+                                    weight.blockK == 128 && weight.blockM == 128 &&
+                                    !weight.scales.empty();
+
+        const char *minBatchEnv = std::getenv(
+            "FASTLLM_CUDA_TRITON_LINEAR_FP8_MIN_BATCH");
+        if (minBatchEnv != nullptr && minBatchEnv[0] != '\0') {
+            int defaultMinBatch =
+                arch == 89 && separateScalesWeight && !hasBias ? 32 : 8;
+            int minBatch = CudaEnvInt(
+                "FASTLLM_CUDA_TRITON_LINEAR_FP8_MIN_BATCH", defaultMinBatch);
+            if (n < minBatch) {
+                return false;
+            }
+            return RunCudaTritonLinearFp8Block128(
+                input, weight, bias, output, n, m, k);
+        }
+
+        bool canAutotune = arch == 89 && separateScalesWeight && !hasBias &&
+                           n >= 12 && n < 32;
+        if (!canAutotune) {
+            if (arch == 89 && separateScalesWeight && !hasBias) {
+                if (!PreferCudaTritonLinearFp8Sm89Fallback(
+                        input.dataType, n, m, k)) {
+                    return false;
+                }
+            } else if (n < 8) {
+                return false;
+            }
+            return RunCudaTritonLinearFp8Block128(
+                input, weight, bias, output, n, m, k);
+        }
+
+        bool cudaGraph = GetFastllmEnv().cudaGraph;
+        CudaLinearFp8AutotuneKey key = {
+            FastllmCudaGetDevice(), (int)input.dataType, cudaGraph ? 1 : 0,
+            n, m, k};
+        // The cache is per inference thread, avoiding a mutex in every eager
+        // linear call while still keeping decisions isolated by CUDA device.
+        static thread_local std::map<CudaLinearFp8AutotuneKey, bool> decisions;
+        auto decision = decisions.find(key);
+        if (decision != decisions.end()) {
+            if (!decision->second) {
+                return false;
+            }
+            return RunCudaTritonLinearFp8Block128(
+                input, weight, bias, output, n, m, k);
+        }
+
+        // Event synchronization is illegal during graph capture. Qwen3.5 and
+        // the other graph users execute an eager warmup before capture, so the
+        // normal path reaches this point and populates the cache first.
+        if (FastllmCudaGraphIsCapturingFast()) {
+            if (!PreferCudaTritonLinearFp8Sm89Fallback(
+                    input.dataType, n, m, k)) {
+                return false;
+            }
+            return RunCudaTritonLinearFp8Block128(
+                input, weight, bias, output, n, m, k);
+        }
+
+        // Warm both implementations before timing so one-time scale uploads,
+        // scratch allocation, kernel loading and GPU clock ramp do not decide
+        // the steady-state path.
+        if (!RunCudaTritonLinearFp8Block128(
+                input, weight, bias, output, n, m, k)) {
+            decisions[key] = false;
+            return false;
+        }
+        if (!RunCudaNativeLinearFp8Block128(
+                input, weight, bias, output, n, m, k)) {
+            decisions[key] = true;
+            return RunCudaTritonLinearFp8Block128(
+                input, weight, bias, output, n, m, k);
+        }
+        for (int i = 0; i < 2; i++) {
+            RunCudaTritonLinearFp8Block128(
+                input, weight, bias, output, n, m, k);
+            RunCudaNativeLinearFp8Block128(
+                input, weight, bias, output, n, m, k);
+        }
+        FastllmCudaSyncCurrentThreadStream();
+
+        constexpr int iterations = 32;
+        bool tritonOk = true, nativeOk = true;
+        float tritonMs = BenchmarkCudaLinearFp8Path(
+            true, cudaGraph, iterations,
+            input, weight, bias, output, n, m, k, tritonOk);
+        float nativeMs = BenchmarkCudaLinearFp8Path(
+            false, cudaGraph, iterations,
+            input, weight, bias, output, n, m, k, nativeOk);
+        // Repeat in the opposite order and keep the best sample for each path
+        // to reduce clock and cache-order bias.
+        float nativeMs2 = BenchmarkCudaLinearFp8Path(
+            false, cudaGraph, iterations,
+            input, weight, bias, output, n, m, k, nativeOk);
+        float tritonMs2 = BenchmarkCudaLinearFp8Path(
+            true, cudaGraph, iterations,
+            input, weight, bias, output, n, m, k, tritonOk);
+        tritonMs = std::min(tritonMs, tritonMs2);
+        nativeMs = std::min(nativeMs, nativeMs2);
+
+        // Eager dispatch has a few microseconds of framework overhead that is
+        // hidden once the GPU work is long enough and disappears on graph
+        // replay. Require a wider eager margin for very small kernels; graph
+        // mode can use the direct GPU-event comparison.
+        float tritonMargin = cudaGraph ? 0.98f : 0.90f;
+        bool useTriton = tritonOk &&
+                         (!nativeOk || tritonMs < nativeMs * tritonMargin);
+        decisions[key] = useTriton;
+
+        if (useTriton) {
+            return RunCudaTritonLinearFp8Block128(
+                input, weight, bias, output, n, m, k);
+        }
+        return RunCudaNativeLinearFp8Block128(
+            input, weight, bias, output, n, m, k);
+    }
+
+    struct CudaTritonChunkGdnPrefillConfig {
+        int arch = 0;
+        int blockV = 0;
+        int numWarps = 0;
+        int hNumStages = 0;
+        int oNumStages = 0;
+        std::string cacheDir;
+        const CudaTritonChunkGdnPrefillMeta *meta = nullptr;
+    };
+
+    static bool CudaTritonResolveChunkGdnPrefillConfig(
+        int batch, int chunks, int chunkSize,
+        int kDim, int vDim, bool floatState,
+        CudaTritonChunkGdnPrefillConfig &config) {
+        if (!CudaEnvFlagDefaultEnabled(
+                "FASTLLM_CUDA_TRITON_CHUNK_GDN_PREFILL", true) ||
+            batch <= 0 || chunks < 2 || chunkSize != 64 ||
+            kDim != 128 || vDim != 128) {
+            return false;
+        }
+        int minBatch = CudaEnvIntRange(
+            "FASTLLM_CUDA_TRITON_CHUNK_GDN_PREFILL_MIN_BATCH", 1, 1, 4096);
+        int maxChunks = CudaEnvIntRange(
+            "FASTLLM_CUDA_TRITON_CHUNK_GDN_PREFILL_MAX_CHUNKS", 64, 1, 256);
+        if (batch < minBatch || chunks > maxChunks) {
+            return false;
+        }
+
+        config.arch = CudaTritonRuntimeArch();
+        if (config.arch < 80) {
+            return false;
+        }
+        config.blockV = CudaEnvIntRange(
+            "FASTLLM_CUDA_TRITON_CHUNK_GDN_PREFILL_BLOCK_V", 32, 32, 64);
+        if (config.blockV != 32 && config.blockV != 64) {
+            return false;
+        }
+        config.numWarps = CudaEnvIntRange(
+            "FASTLLM_CUDA_TRITON_CHUNK_GDN_PREFILL_NUM_WARPS", 4, 1, 32);
+        constexpr const char *commonStagesKey =
+            "FASTLLM_CUDA_TRITON_CHUNK_GDN_PREFILL_NUM_STAGES";
+        const char *commonStagesValue = std::getenv(commonStagesKey);
+        bool commonStagesSet =
+            commonStagesValue != nullptr && commonStagesValue[0] != '\0';
+        int commonNumStages =
+            CudaEnvIntRange(commonStagesKey, 3, 1, 8);
+        config.hNumStages = CudaEnvIntRange(
+            "FASTLLM_CUDA_TRITON_CHUNK_GDN_PREFILL_H_NUM_STAGES",
+            commonStagesSet ? commonNumStages : 2, 1, 8);
+        config.oNumStages = CudaEnvIntRange(
+            "FASTLLM_CUDA_TRITON_CHUNK_GDN_PREFILL_O_NUM_STAGES",
+            commonStagesSet ? commonNumStages : 3, 1, 8);
+        config.cacheDir = CudaTritonCacheDir();
+        std::string base = CudaTritonChunkGdnPrefillBaseName(
+            config.arch, chunks, chunkSize, kDim, vDim,
+            config.blockV, config.numWarps,
+            config.hNumStages, floatState);
+        return CudaTritonGetChunkGdnPrefillMeta(
+                   config.cacheDir, base, config.arch,
+                   chunks, chunkSize, kDim, vDim,
+                   config.blockV, config.numWarps,
+                   config.hNumStages, floatState, config.meta) &&
+               config.meta != nullptr;
+    }
+
+    bool FastllmCudaCanUseTritonChunkGdnPrefill(
+        int batch, int chunks, int chunkSize,
+        int kDim, int vDim, bool floatState) {
+        CudaTritonChunkGdnPrefillConfig config;
+        return CudaTritonResolveChunkGdnPrefillConfig(
+            batch, chunks, chunkSize, kDim, vDim, floatState, config);
+    }
+
+    static bool TryCudaTritonChunkGdnPrefill(
+        Data &q, Data &k, Data &v, Data &g, Data &attn,
+        Data *decayMask, Data &kCumdecay,
+        Data &lastRecurrentState, Data &coreAttnOut,
+        bool fuseDecayMask) {
+        auto isDense = [](const Data &data) {
+            if (data.dims.empty() ||
+                data.strides.size() != data.dims.size()) {
+                return false;
+            }
+            uint64_t expected = 1;
+            for (int i = (int)data.dims.size() - 1; i >= 0; i--) {
+                if (data.strides[i] != expected) {
+                    return false;
+                }
+                expected *= (uint64_t)data.dims[i];
+            }
+            return true;
+        };
+        auto isCudaFp16 = [&](const Data &data) {
+            return data.dataDevice == DataDevice::CUDA &&
+                   data.dataType == DataType::FLOAT16 &&
+                   data.cudaData != nullptr && isDense(data);
+        };
+        const bool floatState =
+            lastRecurrentState.dataDevice == DataDevice::CUDA &&
+            lastRecurrentState.dataType == DataType::FLOAT32 &&
+            lastRecurrentState.cudaData != nullptr &&
+            isDense(lastRecurrentState);
+        const bool halfState = isCudaFp16(lastRecurrentState);
+        if (!isCudaFp16(q) || !isCudaFp16(k) || !isCudaFp16(v) ||
+            !isCudaFp16(g) || !isCudaFp16(attn) ||
+            (fuseDecayMask &&
+             (decayMask == nullptr || !isCudaFp16(*decayMask))) ||
+            !isCudaFp16(kCumdecay) || (!halfState && !floatState) ||
+            q.dims.size() != 5 || k.dims != q.dims) {
+            return false;
+        }
+        int batch = q.dims[0];
+        int heads = q.dims[1];
+        int chunks = q.dims[2];
+        int chunkSize = q.dims[3];
+        int kDim = q.dims[4];
+        int vDim = v.dims.size() == 5 ? v.dims[4] : 0;
+        // Keep the single-chunk path on the native kernels.  It is also used
+        // by decode/CUDA-graph warmup, where the Triton prefill scratch and
+        // driver launches would prevent the optimized decode graph path.
+        if (batch <= 0 || heads <= 0 || chunks < 2 ||
+            chunkSize != 64 || kDim != 128 || vDim != 128 ||
+            v.dims != std::vector<int>({batch, heads, chunks,
+                                        chunkSize, vDim}) ||
+            g.dims != std::vector<int>({batch, heads, chunks, chunkSize}) ||
+            attn.dims != std::vector<int>({batch, heads, chunks,
+                                           chunkSize, chunkSize}) ||
+            (fuseDecayMask && decayMask->dims != attn.dims) ||
+            kCumdecay.dims != q.dims ||
+            lastRecurrentState.dims !=
+                std::vector<int>({batch, heads, kDim, vDim})) {
+            return false;
+        }
+        CudaTritonChunkGdnPrefillConfig config;
+        if (!CudaTritonResolveChunkGdnPrefillConfig(
+                batch, chunks, chunkSize, kDim, vDim,
+                floatState, config)) {
+            return false;
+        }
+        const CudaTritonChunkGdnPrefillMeta *meta = config.meta;
+        const CudaTritonChunkGdnPrefillMeta *oMeta = meta;
+        int oBlockV = config.blockV;
+        if (config.blockV == 32 && CudaEnvFlagDefaultEnabled(
+                "FASTLLM_CUDA_TRITON_CHUNK_GDN_PREFILL_SPLIT_BLOCK_V",
+                true)) {
+            oBlockV = 64;
+        }
+        if (oBlockV != config.blockV ||
+            config.oNumStages != config.hNumStages) {
+            std::string oBase = CudaTritonChunkGdnPrefillBaseName(
+                config.arch, chunks, chunkSize, kDim, vDim,
+                oBlockV, config.numWarps,
+                config.oNumStages, floatState);
+            const CudaTritonChunkGdnPrefillMeta *candidate = nullptr;
+            if (CudaTritonGetChunkGdnPrefillMeta(
+                    config.cacheDir, oBase, config.arch,
+                    chunks, chunkSize, kDim, vDim,
+                    oBlockV, config.numWarps,
+                    config.oNumStages, floatState,
+                    candidate) &&
+                candidate != nullptr) {
+                oMeta = candidate;
+            }
+        }
+        // Only the Qwen3.5 direct path passes decay_mask together with the
+        // one-layer scale handoff.  Public callers such as Qwen4 do not, so
+        // they must not accidentally consume a stale handoff with matching
+        // dimensions from an earlier request.
+        bool precomputeScale = decayMask != nullptr &&
+            CudaEnvFlagDefaultEnabled(
+                "FASTLLM_CUDA_TRITON_CHUNK_GDN_PREFILL_PRECOMPUTE_SCALE",
+                true);
+        Data &decayMaskArg =
+            decayMask == nullptr ? attn : *decayMask;
+        return FastllmCudaTritonChunkGatedDeltaRulePrefill(
+            meta->kernels[0].cubinPath.c_str(),
+            meta->kernels[0].kernelName.c_str(),
+            meta->kernels[0].numWarps, meta->kernels[0].shared,
+            oMeta->kernels[1].cubinPath.c_str(),
+            oMeta->kernels[1].kernelName.c_str(),
+            oMeta->kernels[1].numWarps, oMeta->kernels[1].shared,
+            oMeta->kernels[3].cubinPath.c_str(),
+            oMeta->kernels[3].kernelName.c_str(),
+            oMeta->kernels[3].numWarps, oMeta->kernels[3].shared,
+            meta->kernels[2].cubinPath.c_str(),
+            meta->kernels[2].kernelName.c_str(),
+            meta->kernels[2].numWarps, meta->kernels[2].shared,
+            precomputeScale, fuseDecayMask,
+            meta->chunks, meta->chunkSize, meta->kDim, meta->vDim,
+            meta->blockV, oMeta->blockV,
+            q, k, v, g, attn, decayMaskArg, kCumdecay,
+            lastRecurrentState, coreAttnOut);
+    }
+
+    static bool TryCudaTritonChunkGdnVarlenPrefill(
+        Data &q, Data &k, Data &v, Data &g, Data &attn,
+        Data *decayMask, Data &kCumdecay, Data &lastRecurrentState,
+        bool fuseDecayMask, bool directOutputQk,
+        const std::vector<int> &seqLens, Data &coreAttnOut) {
+        if (!CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON") ||
+            !CudaEnvFlagDefaultEnabled(
+                "FASTLLM_CUDA_TRITON_CHUNK_GDN_VARLEN_PREFILL", true) ||
+            seqLens.empty()) {
+            return false;
+        }
+        auto isDense = [](const Data &data) {
+            if (data.dims.empty() ||
+                data.strides.size() != data.dims.size()) {
+                return false;
+            }
+            uint64_t expected = 1;
+            for (int i = (int)data.dims.size() - 1; i >= 0; i--) {
+                if (data.strides[i] != expected) {
+                    return false;
+                }
+                expected *= (uint64_t)data.dims[i];
+            }
+            return true;
+        };
+        auto isCudaFp16 = [&](const Data &data) {
+            return data.dataDevice == DataDevice::CUDA &&
+                   data.dataType == DataType::FLOAT16 &&
+                   data.cudaData != nullptr && isDense(data);
+        };
+        if (!isCudaFp16(q) || !isCudaFp16(k) || !isCudaFp16(v) ||
+            !isCudaFp16(g) ||
+            (!directOutputQk && !isCudaFp16(attn)) ||
+            ((fuseDecayMask || directOutputQk) &&
+             (decayMask == nullptr || !isCudaFp16(*decayMask))) ||
+            !isCudaFp16(kCumdecay) ||
+            !isCudaFp16(lastRecurrentState) ||
+            q.dims.size() != 5 || q.dims[0] != 1 || k.dims != q.dims) {
+            return false;
+        }
+        int batch = (int)seqLens.size();
+        int keyHeads = q.dims[1];
+        int valueHeads = v.dims.size() == 5 ? v.dims[1] : 0;
+        int totalChunks = q.dims[2];
+        int chunkSize = q.dims[3];
+        int kDim = q.dims[4];
+        int vDim = v.dims.size() == 5 ? v.dims[4] : 0;
+        if (batch <= 1 || keyHeads <= 0 || valueHeads < keyHeads ||
+            valueHeads % keyHeads != 0 || totalChunks <= 0 ||
+            chunkSize != 64 || kDim != 128 || vDim != 128 ||
+            v.dims != std::vector<int>({1, valueHeads, totalChunks,
+                                        chunkSize, vDim}) ||
+            g.dims != std::vector<int>({1, valueHeads, totalChunks, chunkSize}) ||
+            (!directOutputQk && attn.dims !=
+                std::vector<int>({1, keyHeads, totalChunks,
+                                  chunkSize, chunkSize})) ||
+            ((fuseDecayMask || directOutputQk) && decayMask->dims !=
+                std::vector<int>({1, valueHeads, totalChunks,
+                                  chunkSize, chunkSize})) ||
+            kCumdecay.dims !=
+                std::vector<int>({1, valueHeads, totalChunks,
+                                  chunkSize, kDim}) ||
+            lastRecurrentState.dims !=
+                std::vector<int>({batch, valueHeads, kDim, vDim})) {
+            return false;
+        }
+        int countedChunks = 0;
+        int actualMaxChunks = 0;
+        for (int len : seqLens) {
+            if (len <= 0) {
+                return false;
+            }
+            int requestChunks = (len + chunkSize - 1) / chunkSize;
+            countedChunks += requestChunks;
+            actualMaxChunks = std::max(actualMaxChunks, requestChunks);
+        }
+        int maxChunks = CudaEnvIntRange(
+            "FASTLLM_CUDA_TRITON_CHUNK_GDN_VARLEN_PREFILL_MAX_CHUNKS",
+            256, 1, 1024);
+        if (countedChunks != totalChunks || actualMaxChunks > maxChunks) {
+            return false;
+        }
+        int compiledMaxChunks = 1;
+        while (compiledMaxChunks < actualMaxChunks) {
+            compiledMaxChunks <<= 1;
+        }
+
+        int arch = CudaTritonRuntimeArch();
+        if (arch < 80) {
+            return false;
+        }
+        int hBlockV = CudaEnvIntRange(
+            "FASTLLM_CUDA_TRITON_CHUNK_GDN_PREFILL_BLOCK_V", 32, 32, 64);
+        int oBlockV = CudaEnvFlagDefaultEnabled(
+            "FASTLLM_CUDA_TRITON_CHUNK_GDN_PREFILL_SPLIT_BLOCK_V", true)
+            ? 64 : hBlockV;
+        if ((hBlockV != 32 && hBlockV != 64) ||
+            (oBlockV != 32 && oBlockV != 64)) {
+            return false;
+        }
+        int numWarps = CudaEnvIntRange(
+            "FASTLLM_CUDA_TRITON_CHUNK_GDN_PREFILL_NUM_WARPS", 4, 1, 32);
+        constexpr const char *commonStagesKey =
+            "FASTLLM_CUDA_TRITON_CHUNK_GDN_PREFILL_NUM_STAGES";
+        const char *commonStagesValue = std::getenv(commonStagesKey);
+        bool commonStagesSet =
+            commonStagesValue != nullptr && commonStagesValue[0] != '\0';
+        int commonNumStages =
+            CudaEnvIntRange(commonStagesKey, 3, 1, 8);
+        int hNumStages = CudaEnvIntRange(
+            "FASTLLM_CUDA_TRITON_CHUNK_GDN_PREFILL_H_NUM_STAGES",
+            commonStagesSet ? commonNumStages : 2, 1, 8);
+        int oNumStages = CudaEnvIntRange(
+            "FASTLLM_CUDA_TRITON_CHUNK_GDN_PREFILL_O_NUM_STAGES",
+            commonStagesSet ? commonNumStages : 3, 1, 8);
+        std::string cacheDir = CudaTritonCacheDir();
+        std::string base = CudaTritonChunkGdnVarlenPrefillBaseName(
+            arch, compiledMaxChunks, chunkSize, kDim, vDim,
+            hBlockV, oBlockV, numWarps, hNumStages, oNumStages);
+        const CudaTritonChunkGdnVarlenPrefillMeta *meta = nullptr;
+        if (!CudaTritonGetChunkGdnVarlenPrefillMeta(
+                cacheDir, base, arch, compiledMaxChunks,
+                chunkSize, kDim, vDim, hBlockV, oBlockV,
+                numWarps, hNumStages, oNumStages, meta) ||
+            meta == nullptr) {
+            return false;
+        }
+        bool precomputeScale = CudaEnvFlagDefaultEnabled(
+            "FASTLLM_CUDA_TRITON_CHUNK_GDN_PREFILL_PRECOMPUTE_SCALE",
+            true);
+        Data &decayMaskArg =
+            decayMask == nullptr ? attn : *decayMask;
+        return FastllmCudaTritonChunkGatedDeltaRuleVarlenPrefill(
+            meta->kernels[0].cubinPath.c_str(),
+            meta->kernels[0].kernelName.c_str(),
+            meta->kernels[0].numWarps, meta->kernels[0].shared,
+            meta->kernels[1].cubinPath.c_str(),
+            meta->kernels[1].kernelName.c_str(),
+            meta->kernels[1].numWarps, meta->kernels[1].shared,
+            meta->kernels[3].cubinPath.c_str(),
+            meta->kernels[3].kernelName.c_str(),
+            meta->kernels[3].numWarps, meta->kernels[3].shared,
+            meta->kernels[2].cubinPath.c_str(),
+            meta->kernels[2].kernelName.c_str(),
+            meta->kernels[2].numWarps, meta->kernels[2].shared,
+            meta->kernels[4].cubinPath.c_str(),
+            meta->kernels[4].kernelName.c_str(),
+            meta->kernels[4].numWarps, meta->kernels[4].shared,
+            precomputeScale, fuseDecayMask, directOutputQk,
+            meta->maxChunks, meta->chunkSize, meta->kDim, meta->vDim,
+            meta->hBlockV, meta->oBlockV, seqLens,
+            q, k, v, g, attn, decayMaskArg, kCumdecay,
+            lastRecurrentState, coreAttnOut);
+    }
+
+    bool FastllmCudaTryCombinedBaSigmoidMambaSoftplus(
+        const Data &input, const Data &aLog, const Data &dtBias,
+        int batch, int seqLen, int inputChannels,
+        int baOffset, int channels,
+        Data &sigmoidOutput, Data &softplusOutput) {
+        if (!CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON") ||
+            !CudaEnvFlagDefaultEnabled(
+                "FASTLLM_CUDA_TRITON_CHUNK_GDN_COMBINED_BA", true)) {
+            return false;
+        }
+        return FastllmCudaSigmoidMambaSoftplusCombinedFloat16(
+            input, aLog, dtBias,
+            batch, seqLen, inputChannels,
+            baOffset, channels,
+            sigmoidOutput, softplusOutput);
+    }
+
+    bool FastllmCudaTryCombinedGdnConvInput(
+        const std::vector<Data*> &caches,
+        const Data &combinedInput,
+        Data &weight, Data &bias, Data &output) {
+        if (!CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON") ||
+            !CudaEnvFlagDefaultEnabled(
+                "FASTLLM_CUDA_TRITON_CHUNK_GDN_COMBINED_CONV_INPUT",
+                true)) {
+            return false;
+        }
+        static const std::vector<Data*> noTokenCaches;
+        return FastllmCudaShiftAppendConv1DPerChannelSiluMultiTokenFloat16BatchPointers(
+            caches, combinedInput, weight, bias, output,
+            noTokenCaches, 0, 0);
+    }
+
+    bool FastllmCudaTryCombinedGdnZGate(
+        const Data &input, Data &weight,
+        const Data &combinedGateInput,
+        int gateOffset, int gateHeads,
+        Data &output, float eps) {
+        // This native CUDA fusion does not require the Triton backend.
+        // Retain the existing per-operation switches for fallback selection.
+        if (!CudaEnvFlagDefaultEnabled(
+                "FASTLLM_CUDA_TRITON_CHUNK_GDN_COMBINED_Z", true)) {
+            return false;
+        }
+        return FastllmCudaRMSNormSiluMulFloat16CombinedGate(
+            input, weight, combinedGateInput,
+            gateOffset, gateHeads, output, eps);
+    }
+
+    bool FastllmCudaTryCombinedGdnOutputGate(
+        const Data &headMajorInput, Data &weight,
+        const Data &combinedGateInput,
+        int batch, int seqLen,
+        int gateOffset, int gateHeads,
+        Data &output, float eps) {
+        // This native CUDA fusion does not require the Triton backend.
+        // Retain the existing per-operation switches for fallback selection.
+        if (!CudaEnvFlagDefaultEnabled(
+                "FASTLLM_CUDA_TRITON_CHUNK_GDN_COMBINED_Z", true) ||
+            !CudaEnvFlagDefaultEnabled(
+                "FASTLLM_CUDA_TRITON_CHUNK_GDN_FUSED_OUTPUT_GATE",
+                true)) {
+            return false;
+        }
+        return FastllmCudaRMSNormSiluMulFloat16HeadMajorCombinedGate(
+            headMajorInput, weight, combinedGateInput,
+            batch, seqLen, gateOffset, gateHeads,
+            output, eps);
+    }
+
+    bool FastllmCudaTryTritonChunkGdnPostConv(
+        const Data &qkvInput, const Data &normWeight,
+        const Data &gInput, const Data &betaInput,
+        int batch, int seqLen, int keyHeads, int valueHeads,
+        int kDim, int vDim, float normEps, float qScale,
+        Data &normalizedQ, Data &normalizedK,
+        Data &q, Data &k, Data &v, Data &g, Data &beta,
+        Data &kBeta, Data &vBeta) {
+        if (!CudaEnvFlagDefaultEnabled(
+                "FASTLLM_CUDA_TRITON_CHUNK_GDN_POSTCONV", true)) {
+            return false;
+        }
+        auto isDense = [](const Data &data) {
+            if (data.dims.empty() ||
+                data.strides.size() != data.dims.size()) {
+                return false;
+            }
+            uint64_t expected = 1;
+            for (int i = (int)data.dims.size() - 1; i >= 0; i--) {
+                if (data.strides[i] != expected) {
+                    return false;
+                }
+                expected *= (uint64_t)data.dims[i];
+            }
+            return true;
+        };
+        auto isCudaFp16 = [&](const Data &data) {
+            return data.dataDevice == DataDevice::CUDA &&
+                   data.dataType == DataType::FLOAT16 &&
+                   data.cudaData != nullptr && isDense(data);
+        };
+        auto isCudaFp32 = [&](const Data &data) {
+            return data.dataDevice == DataDevice::CUDA &&
+                   data.dataType == DataType::FLOAT32 &&
+                   data.cudaData != nullptr && isDense(data);
+        };
+        int chunks = (seqLen + 63) / 64;
+        if (batch <= 0 || seqLen <= 1 || chunks <= 0 ||
+            keyHeads <= 0 || valueHeads < keyHeads ||
+            valueHeads % keyHeads != 0 ||
+            kDim != 128 || vDim != 128 ||
+            !std::isfinite(normEps) || normEps < 0.0f ||
+            !std::isfinite(qScale) ||
+            !isCudaFp16(qkvInput) || !isCudaFp32(normWeight) ||
+            !isCudaFp16(gInput) || !isCudaFp16(betaInput) ||
+            qkvInput.Count(0) !=
+                (uint64_t)batch * seqLen *
+                (keyHeads * kDim * 2 + valueHeads * vDim) ||
+            normWeight.Count(0) != (uint64_t)kDim ||
+            gInput.Count(0) !=
+                (uint64_t)batch * seqLen * valueHeads ||
+            betaInput.Count(0) !=
+                (uint64_t)batch * seqLen * valueHeads) {
+            return false;
+        }
+        int minBatch = CudaEnvIntRange(
+            "FASTLLM_CUDA_TRITON_CHUNK_GDN_POSTCONV_MIN_BATCH",
+            1, 1, 4096);
+        int maxChunks = CudaEnvIntRange(
+            "FASTLLM_CUDA_TRITON_CHUNK_GDN_POSTCONV_MAX_CHUNKS",
+            64, 1, 256);
+
+        if (CudaEnvFlagDefaultEnabled(
+                "FASTLLM_CUDA_QWEN35_GDN_FUSED_RMSNORM_POSTCONV",
+                true) &&
+            FastllmCudaQwen35GdnPostConvExactFloat16(
+                qkvInput, normWeight, gInput, betaInput,
+                batch, seqLen, keyHeads, valueHeads,
+                kDim, vDim, normEps, qScale,
+                q, k, v, g, beta, kBeta, vBeta)) {
+            return true;
+        }
+
+        // The native exact path accepts runtime sequence lengths and is not
+        // specialized by chunk count. Keep the tuning limit on the Triton
+        // fallback only; otherwise a long single-request prefill needlessly
+        // falls back to split/repeat/transpose operators.
+        if (batch < minBatch || chunks > maxChunks) {
+            return false;
+        }
+
+        int arch = CudaTritonRuntimeArch();
+        if (arch < 80) {
+            return false;
+        }
+        int blockT = 16;
+        int numWarps = CudaEnvIntRange(
+            "FASTLLM_CUDA_TRITON_CHUNK_GDN_POSTCONV_NUM_WARPS",
+            4, 1, 32);
+        int numStages = CudaEnvIntRange(
+            "FASTLLM_CUDA_TRITON_CHUNK_GDN_POSTCONV_NUM_STAGES",
+            2, 1, 8);
+        std::string cacheDir = CudaTritonCacheDir();
+        std::string base = CudaTritonChunkGdnPostConvBaseName(
+            arch, keyHeads, valueHeads, kDim, vDim,
+            blockT, numWarps, numStages);
+        const CudaTritonChunkGdnPostConvMeta *meta = nullptr;
+        if (!CudaTritonGetChunkGdnPostConvMeta(
+                cacheDir, base, arch, keyHeads, valueHeads, kDim, vDim,
+                blockT, numWarps, numStages, meta) ||
+            meta == nullptr) {
+            return false;
+        }
+        if (!FastllmCudaRMSNormCombinedQKFloat16(
+                qkvInput, normWeight,
+                batch, seqLen, keyHeads, valueHeads,
+                kDim, vDim, normEps,
+                normalizedQ, normalizedK)) {
+            return false;
+        }
+        return FastllmCudaTritonChunkGdnPostConv(
+            meta->kernel.cubinPath.c_str(),
+            meta->kernel.kernelName.c_str(),
+            meta->kernel.numWarps, meta->kernel.shared,
+            meta->blockT, normalizedQ, normalizedK,
+            qkvInput, gInput, betaInput,
+            batch, seqLen, keyHeads, valueHeads,
+            kDim, vDim, qScale,
+            q, k, v, g, beta, kBeta, vBeta);
+    }
+
+    bool FastllmCudaTryTritonQwen4SparseAttention(
+        const Data &query, const Data &key, const Data &value,
+        const Data &indices, int group, float scale, Data &output) {
+        if (!CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON") ||
+            !CudaEnvFlagDefaultEnabled(
+                "FASTLLM_CUDA_TRITON_QWEN4_SPARSE_ATTENTION", true)) {
+            return false;
+        }
+        auto isDense = [](const Data &data) {
+            if (data.dims.empty() ||
+                data.strides.size() != data.dims.size()) {
+                return false;
+            }
+            uint64_t expected = 1;
+            for (int i = (int)data.dims.size() - 1; i >= 0; i--) {
+                if (data.strides[i] != expected) {
+                    return false;
+                }
+                expected *= (uint64_t)data.dims[i];
+            }
+            return true;
+        };
+        auto isCudaDense = [&](const Data &data) {
+            return data.dataDevice == DataDevice::CUDA &&
+                   data.cudaData != nullptr && isDense(data);
+        };
+        if (query.dims.size() != 3 || key.dims.size() != 3 ||
+            value.dims != key.dims || indices.dims.size() != 2 ||
+            query.dataType != key.dataType ||
+            query.dataType != value.dataType ||
+            query.dataType != DataType::FLOAT16 ||
+            indices.dataType != DataType::INT32 ||
+            !isCudaDense(query) || !isCudaDense(key) ||
+            !isCudaDense(value) || !isCudaDense(indices) ||
+            group <= 0 || group > 16 ||
+            query.dims[0] != key.dims[0] * group ||
+            query.dims[1] != indices.dims[0] ||
+            query.dims[2] != key.dims[2] ||
+            query.dims[1] <= 1 || key.dims[1] <= 0 ||
+            query.dims[2] < 16 || query.dims[2] > 256 ||
+            (query.dims[2] & (query.dims[2] - 1)) != 0 ||
+            indices.dims[1] <= 0 || indices.dims[1] > 3072 ||
+            !std::isfinite(scale)) {
+            return false;
+        }
+
+        std::string dtype;
+        if (!CudaTritonDataTypeName(query.dataType, dtype)) {
+            return false;
+        }
+        int arch = CudaTritonRuntimeArch();
+        if (arch < 80) {
+            return false;
+        }
+        int blockN = CudaEnvIntRange(
+            "FASTLLM_CUDA_TRITON_QWEN4_SPARSE_ATTENTION_BLOCK_N",
+            64, 16, 128);
+        if (blockN != 16 && blockN != 32 &&
+            blockN != 64 && blockN != 128) {
+            return false;
+        }
+        int numWarps = CudaEnvIntRange(
+            "FASTLLM_CUDA_TRITON_QWEN4_SPARSE_ATTENTION_NUM_WARPS",
+            2, 1, 32);
+        int numStages = CudaEnvIntRange(
+            "FASTLLM_CUDA_TRITON_QWEN4_SPARSE_ATTENTION_NUM_STAGES",
+            2, 1, 8);
+        int headDim = query.dims[2];
+        int topk = indices.dims[1];
+        std::string cacheDir = CudaTritonCacheDir();
+        std::string base = CudaTritonQwen4SparseAttentionBaseName(
+            dtype, arch, group, headDim, topk,
+            blockN, numWarps, numStages);
+        const CudaTritonQwen4SparseAttentionMeta *meta = nullptr;
+        if (!CudaTritonGetQwen4SparseAttentionMeta(
+                cacheDir, base, arch, dtype, group,
+                headDim, topk, blockN,
+                numWarps, numStages, meta) || meta == nullptr) {
+            return false;
+        }
+        return FastllmCudaTritonQwen4SparseAttention(
+            meta->kernel.cubinPath.c_str(),
+            meta->kernel.kernelName.c_str(),
+            meta->kernel.numWarps, meta->kernel.shared,
+            query, key, value, indices, group, scale, output);
+    }
+
+    bool FastllmCudaTryChunkGdnRaggedPostConv(
+        const Data &qkvInput, const Data &normWeight,
+        const Data &combinedBaInput, const Data &aLog,
+        const Data &dtBias, int baOffset,
+        const std::vector<int> &seqLens, int chunkSize,
+        int keyHeads, int valueHeads, int kDim, int vDim,
+        float normEps, float qScale,
+        Data &q, Data &k, Data &g,
+        Data &kBeta, Data &vBeta) {
+        if (!CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON") ||
+            !CudaEnvFlagDefaultEnabled(
+                "FASTLLM_CUDA_TRITON_CHUNK_GDN_RAGGED_POSTCONV", true) ||
+            !CudaEnvFlagDefaultEnabled(
+                "FASTLLM_CUDA_TRITON_CHUNK_GDN_MAPPED_KKT", true) ||
+            !CudaEnvFlagDefaultEnabled(
+                "FASTLLM_CUDA_QWEN35_GDN_FUSED_RMSNORM_POSTCONV", true)) {
+            return false;
+        }
+        return FastllmCudaQwen35GdnPostConvRaggedExactFloat16(
+            qkvInput, normWeight, combinedBaInput, aLog, dtBias,
+            baOffset, seqLens, chunkSize, keyHeads, valueHeads,
+            kDim, vDim, normEps, qScale,
+            q, k, g, kBeta, vBeta);
+    }
+
+    bool FastllmCudaMappedGdnKkt(
+        const Data &kBeta, const Data &k,
+        int headGroup, Data &output) {
+        if (headGroup <= 1 ||
+            !CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON") ||
+            !CudaEnvFlagDefaultEnabled(
+                "FASTLLM_CUDA_TRITON_CHUNK_GDN_MAPPED_KKT", true)) {
+            return false;
+        }
+        // The Triton logical-head KKT kernel is numerically close, but it does
+        // not reproduce cuBLAS Hgemm bit-for-bit and showed no stable
+        // end-to-end gain. Keep the exact mapped-cuBLAS path as the default.
+        if (CudaEnvFlagDefaultEnabled(
+                "FASTLLM_CUDA_TRITON_CHUNK_GDN_KKT", false) &&
+            kBeta.dataDevice == DataDevice::CUDA &&
+            kBeta.dataType == DataType::FLOAT16 &&
+            kBeta.cudaData != nullptr && kBeta.dims.size() == 5 &&
+            k.dataDevice == DataDevice::CUDA &&
+            k.dataType == DataType::FLOAT16 &&
+            k.cudaData != nullptr && k.dims.size() == 5 &&
+            kBeta.dims[0] == 1 && k.dims[0] == 1 &&
+            kBeta.dims[1] == k.dims[1] * headGroup &&
+            kBeta.dims[2] == k.dims[2] &&
+            kBeta.dims[3] == 64 && k.dims[3] == 64 &&
+            kBeta.dims[4] == 128 && k.dims[4] == 128) {
+            int arch = CudaTritonRuntimeArch();
+            constexpr int chunkSize = 64;
+            constexpr int kDim = 128;
+            constexpr int vDim = 128;
+            constexpr int blockD = 64;
+            int numWarps = CudaEnvIntRange(
+                "FASTLLM_CUDA_TRITON_CHUNK_GDN_RECOMPUTE_NUM_WARPS",
+                4, 1, 32);
+            int numStages = CudaEnvIntRange(
+                "FASTLLM_CUDA_TRITON_CHUNK_GDN_RECOMPUTE_NUM_STAGES",
+                2, 1, 8);
+            if (arch >= 80) {
+                std::string cacheDir = CudaTritonCacheDir();
+                std::string base = CudaTritonChunkGdnRecomputeBaseName(
+                    arch, chunkSize, kDim, vDim,
+                    blockD, numWarps, numStages);
+                const CudaTritonChunkGdnRecomputeMeta *meta = nullptr;
+                if (CudaTritonGetChunkGdnRecomputeMeta(
+                        cacheDir, base, arch, chunkSize, kDim, vDim,
+                        blockD, numWarps, numStages, meta) &&
+                    meta != nullptr) {
+                    const CudaTritonKernelMeta &kernel = meta->kernels[4];
+                    if (FastllmCudaTritonChunkGdnKkt(
+                            kernel.cubinPath.c_str(),
+                            kernel.kernelName.c_str(),
+                            kernel.numWarps, kernel.shared,
+                            kBeta, k, headGroup, output)) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return FastllmCudaBatchMatMulTransBHeadMapped(
+            kBeta, k, output, headGroup, 1.0f);
+    }
+
+    bool FastllmCudaTryTritonChunkGdnRecompute(
+        const Data &attn, const Data &vBeta,
+        const Data &kBeta, const Data &gExp, const Data &g,
+        Data &vOutput, Data &kOutput) {
+        if (!CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON") ||
+            !CudaEnvFlagDefaultEnabled(
+                "FASTLLM_CUDA_TRITON_CHUNK_GDN_RECOMPUTE", true)) {
+            return false;
+        }
+        auto isDenseCudaFp16 = [](const Data &data) {
+            if (data.dataDevice != DataDevice::CUDA ||
+                data.dataType != DataType::FLOAT16 ||
+                data.cudaData == nullptr || data.dims.empty() ||
+                data.strides.size() != data.dims.size()) {
+                return false;
+            }
+            uint64_t expected = 1;
+            for (int i = (int)data.dims.size() - 1; i >= 0; i--) {
+                if (data.strides[i] != expected) {
+                    return false;
+                }
+                expected *= (uint64_t)data.dims[i];
+            }
+            return true;
+        };
+        bool internalExp = CudaEnvFlagDefaultEnabled(
+            "FASTLLM_CUDA_TRITON_CHUNK_GDN_RECOMPUTE_INTERNAL_EXP",
+            true);
+        if (!isDenseCudaFp16(attn) ||
+            !isDenseCudaFp16(vBeta) ||
+            !isDenseCudaFp16(kBeta) ||
+            (!internalExp && !isDenseCudaFp16(gExp)) ||
+            !isDenseCudaFp16(g) ||
+            attn.dims.size() != 5 ||
+            vBeta.dims.size() != 5 ||
+            kBeta.dims.size() != 5 ||
+            (!internalExp && gExp.dims.size() != 4) ||
+            g.dims.size() != 4) {
+            return false;
+        }
+        int batch = attn.dims[0];
+        int heads = attn.dims[1];
+        int chunks = attn.dims[2];
+        int chunkSize = attn.dims[3];
+        int kDim = kBeta.dims[4];
+        int vDim = vBeta.dims[4];
+        if (batch <= 0 || heads <= 0 || chunks < 2 ||
+            chunkSize != 64 || attn.dims[4] != chunkSize ||
+            kDim != 128 || vDim != 128 ||
+            vBeta.dims != std::vector<int>(
+                {batch, heads, chunks, chunkSize, vDim}) ||
+            kBeta.dims != std::vector<int>(
+                {batch, heads, chunks, chunkSize, kDim}) ||
+            (!internalExp &&
+             gExp.dims != std::vector<int>(
+                 {batch, heads, chunks, chunkSize})) ||
+            g.dims != std::vector<int>(
+                {batch, heads, chunks, chunkSize})) {
+            return false;
+        }
+        int maxChunks = CudaEnvIntRange(
+            "FASTLLM_CUDA_TRITON_CHUNK_GDN_RECOMPUTE_MAX_CHUNKS",
+            64, 1, 256);
+        if (chunks > maxChunks) {
+            return false;
+        }
+
+        int arch = CudaTritonRuntimeArch();
+        if (arch < 80) {
+            return false;
+        }
+        constexpr int blockD = 64;
+        int numWarps = CudaEnvIntRange(
+            "FASTLLM_CUDA_TRITON_CHUNK_GDN_RECOMPUTE_NUM_WARPS",
+            4, 1, 32);
+        int numStages = CudaEnvIntRange(
+            "FASTLLM_CUDA_TRITON_CHUNK_GDN_RECOMPUTE_NUM_STAGES",
+            2, 1, 8);
+        std::string cacheDir = CudaTritonCacheDir();
+        std::string base = CudaTritonChunkGdnRecomputeBaseName(
+            arch, chunkSize, kDim, vDim,
+            blockD, numWarps, numStages);
+        const CudaTritonChunkGdnRecomputeMeta *meta = nullptr;
+        if (!CudaTritonGetChunkGdnRecomputeMeta(
+                cacheDir, base, arch, chunkSize, kDim, vDim,
+                blockD, numWarps, numStages, meta) ||
+            meta == nullptr) {
+            return false;
+        }
+        bool precomputeScale = CudaEnvFlagDefaultEnabled(
+            "FASTLLM_CUDA_TRITON_CHUNK_GDN_PREFILL_PRECOMPUTE_SCALE",
+            true);
+        int kernelIndex =
+            (internalExp ? 2 : 0) + (precomputeScale ? 1 : 0);
+        const CudaTritonKernelMeta &kernel = meta->kernels[kernelIndex];
+        return FastllmCudaTritonChunkGdnRecompute(
+            kernel.cubinPath.c_str(),
+            kernel.kernelName.c_str(),
+            kernel.numWarps, kernel.shared,
+            precomputeScale, internalExp,
+            meta->blockD,
+            attn, vBeta, kBeta, gExp, g,
+            vOutput, kOutput);
+    }
+
+    bool FastllmCudaTryTritonDeepSeekV4WoA(
+        const Data &input, Data &weight, int groups, int oRank, Data &output) {
+        const bool dsparkAuto =
+            CudaEnvIntRange("FASTLLM_DSPARK_TOKENS", 0, 0, 1024) > 0;
+        if ((!CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON") && !dsparkAuto) ||
+            !CudaEnvFlagDefaultEnabled(
+                "FASTLLM_CUDA_TRITON_DEEPSEEK_V4_FP8_WOA", true)) {
+            return false;
+        }
+        if (input.dataDevice != DataDevice::CUDA || input.cudaData == nullptr ||
+            input.dataType != DataType::BFLOAT16 || input.dims.size() != 4 ||
+            weight.dataDevice != DataDevice::CUDA || weight.cudaData == nullptr ||
+            weight.dataType != DataType::FP8_E4M3 || weight.blockK != 128 ||
+            weight.blockM != 128 || weight.scales.empty() ||
+            output.dataDevice != DataDevice::CUDA || output.cudaData == nullptr ||
+            output.dataType != DataType::BFLOAT16 || groups <= 0 || oRank <= 0) {
+            return false;
+        }
+        int numTokens = input.dims[0] * input.dims[1];
+        int heads = input.dims[2];
+        int headDim = input.dims[3];
+        // The AOT kernel tiles tokens in blocks of 16 and already masks the
+        // tail.  DSpark-7 verifies eight target rows at once, so restricting
+        // this path to scalar decode needlessly sent that hot shape through
+        // the generic one-output-per-CTA reduction kernel.
+        if (numTokens <= 0 || numTokens > 16 || heads <= 0 || headDim <= 0 ||
+            heads % groups != 0 || (oRank % 128) != 0) {
+            return false;
+        }
+        int hiddenSize = (heads / groups) * headDim;
+        int weightRows = groups * oRank;
+        if ((hiddenSize % 128) != 0 ||
+            weight.Count(0) != (uint64_t)weightRows * hiddenSize ||
+            weight.scales.size() !=
+                (size_t)(weightRows / 128) * (hiddenSize / 128)) {
+            return false;
+        }
+
+        int arch = CudaTritonRuntimeArch();
+        if (arch != 89 && arch != 120 && arch != 121) {
+            return false;
+        }
+        constexpr int blockTokens = 16;
+        constexpr int blockOut = 128;
+        constexpr int blockHidden = 128;
+        constexpr int numWarps = 4;
+        constexpr int numStages = 3;
+
+        std::string cacheDir = CudaTritonCacheDir();
+        std::string base = CudaTritonDeepSeekV4WoABaseName(
+            arch, numTokens, groups, oRank, hiddenSize,
+            blockTokens, blockOut, blockHidden, numWarps, numStages);
+        const CudaTritonDeepSeekV4WoAMeta *meta = nullptr;
+        if (!CudaTritonGetDeepSeekV4WoAMeta(
+                cacheDir, base, arch, numTokens, groups, oRank, hiddenSize,
+                blockTokens, blockOut, blockHidden, numWarps, numStages, meta) ||
+            meta == nullptr) {
+            return false;
+        }
+
+        bool ok = FastllmCudaTritonDeepSeekV4WoA(
+            meta->kernel.cubinPath.c_str(), meta->kernel.kernelName.c_str(),
+            meta->kernel.numWarps, meta->kernel.shared,
+            meta->blockTokens, meta->blockOut, meta->blockHidden,
+            input, weight, output, numTokens, groups, oRank, hiddenSize);
+        return ok;
+    }
+
+    static bool FastllmCudaTryTritonDeepSeekV4SparseAttentionDecodeGraphImpl(
+        const Data &q, const Data &windowKV, const Data &compressedKV,
+        const Data &attnSink, int windowSize, int compressRatio,
+        const int32_t *decodeMeta, float softmaxScale, float *output) {
+        if (!CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON") ||
+            !CudaEnvFlagDefaultEnabled(
+                "FASTLLM_CUDA_TRITON_DEEPSEEK_V4_SPARSE_DECODE", true)) {
+            return false;
+        }
+        if (decodeMeta == nullptr || output == nullptr || windowSize <= 0 ||
+            compressRatio < 0 || q.dataDevice != DataDevice::CUDA ||
+            q.dataType != DataType::BFLOAT16 || q.cudaData == nullptr ||
+            q.dims.size() != 4 || q.dims[0] != 1 || q.dims[1] != 1 ||
+            windowKV.dataDevice != DataDevice::CUDA ||
+            windowKV.dataType != DataType::FLOAT32 || windowKV.cudaData == nullptr ||
+            windowKV.dims.size() != 3 || windowKV.dims[0] != 1 ||
+            windowKV.dims[1] != windowSize ||
+            compressedKV.dataDevice != DataDevice::CUDA ||
+            compressedKV.dataType != DataType::BFLOAT16 ||
+            compressedKV.cudaData == nullptr || compressedKV.dims.size() != 3 ||
+            compressedKV.dims[0] != 1 ||
+            attnSink.dataDevice != DataDevice::CUDA ||
+            attnSink.dataType != DataType::FLOAT32 || attnSink.cudaData == nullptr) {
+            return false;
+        }
+        int numHeads = q.dims[2];
+        int headDim = q.dims[3];
+        if (numHeads <= 0 || headDim <= 0 || headDim > 1024 ||
+            windowKV.dims[2] != headDim || compressedKV.dims[2] != headDim ||
+            attnSink.Count(0) != (uint64_t)numHeads) {
+            return false;
+        }
+
+        int blockD = 1;
+        while (blockD < headDim) {
+            blockD <<= 1;
+        }
+        int compressedCapacity = compressedKV.dims[1];
+        if (compressedKV.expansionDims.size() >= 3) {
+            compressedCapacity = std::max(
+                compressedCapacity, compressedKV.expansionDims[1]);
+        }
+        int mergeBlockD = CudaEnvIntRange(
+            "FASTLLM_CUDA_TRITON_DSV4_SPARSE_MERGE_BLOCK_D", 32, 16, 128);
+        if (mergeBlockD != 16 && mergeBlockD != 32 &&
+            mergeBlockD != 64 && mergeBlockD != 128) {
+            mergeBlockD = 32;
+        }
+        int mergeNumWarps = CudaEnvIntRange(
+            "FASTLLM_CUDA_TRITON_DSV4_SPARSE_MERGE_WARPS", 4, 1, 8);
+        constexpr int numStages = 2;
+        if (compressedCapacity <= 0) {
+            return false;
+        }
+        int arch = CudaTritonRuntimeArch();
+        if (arch != 89 && arch != 120 && arch != 121) {
+            return false;
+        }
+
+        std::string cacheDir = CudaTritonCacheDir();
+        auto tryVariant = [&](const std::string &variant, int splitSize,
+                              int splitNumWarps) -> bool {
+            int numSplits =
+                (windowSize + compressedCapacity + splitSize - 1) / splitSize;
+            if (numSplits <= 0 || numSplits > 256) {
+                return false;
+            }
+            int blockSplits = 1;
+            while (blockSplits < numSplits) {
+                blockSplits <<= 1;
+            }
+            std::string base = CudaTritonDeepSeekV4SparseDecodeBaseName(
+                arch, 1, numHeads, headDim, windowSize, compressRatio,
+                compressedCapacity, splitSize, blockD, mergeBlockD,
+                blockSplits, splitNumWarps, mergeNumWarps, numStages,
+                variant);
+            const CudaTritonDeepSeekV4SparseDecodeMeta *meta = nullptr;
+            if (!CudaTritonGetDeepSeekV4SparseDecodeMeta(
+                    cacheDir, base, arch, 1, numHeads, headDim, windowSize,
+                    compressRatio, compressedCapacity, splitSize, blockD,
+                    mergeBlockD, splitNumWarps, mergeNumWarps, numStages,
+                    variant, meta) || meta == nullptr) {
+                return false;
+            }
+            return FastllmCudaTritonDeepSeekV4SparseAttentionDecodeGraph(
+                meta->kernels[0].cubinPath.c_str(),
+                meta->kernels[0].kernelName.c_str(),
+                meta->kernels[0].numWarps, meta->kernels[0].shared,
+                meta->kernels[1].cubinPath.c_str(),
+                meta->kernels[1].kernelName.c_str(),
+                meta->kernels[1].numWarps, meta->kernels[1].shared,
+                meta->compressedCapacity, meta->numSplits, meta->splitSize,
+                meta->splitHeadBlock, meta->blockD, meta->mergeBlockD,
+                q, windowKV, compressedKV, attnSink, windowSize,
+                compressRatio, decodeMeta, softmaxScale, output);
+        };
+
+        bool trySm120 = (arch == 120 || arch == 121) && numHeads <= 16 &&
+                        headDim == 512 &&
+                        CudaEnvFlagDefaultEnabled(
+                            "FASTLLM_CUDA_TRITON_DSV4_SPARSE_SM120", true);
+        if (trySm120) {
+            int sm120SplitSize = CudaEnvIntRange(
+                "FASTLLM_CUDA_TRITON_DSV4_SPARSE_SM120_SPLIT_SIZE",
+                16, 16, 64);
+            if (sm120SplitSize != 16 && sm120SplitSize != 32 &&
+                sm120SplitSize != 64) {
+                sm120SplitSize = 16;
+            }
+            int sm120SplitWarps = CudaEnvIntRange(
+                "FASTLLM_CUDA_TRITON_DSV4_SPARSE_SM120_SPLIT_WARPS",
+                8, 4, 8);
+            if (tryVariant("sm120_tensorcore", sm120SplitSize,
+                           sm120SplitWarps)) {
+                return true;
+            }
+        }
+
+        int splitSize = CudaEnvIntRange(
+            "FASTLLM_CUDA_TRITON_DSV4_SPARSE_SPLIT_SIZE", 8, 8, 64);
+        if (splitSize != 8 && splitSize != 16 &&
+            splitSize != 32 && splitSize != 64) {
+            splitSize = 8;
+        }
+        int splitNumWarps = CudaEnvIntRange(
+            "FASTLLM_CUDA_TRITON_DSV4_SPARSE_SPLIT_WARPS", 4, 1, 8);
+        return tryVariant("generic", splitSize, splitNumWarps);
+    }
+
+    bool FastllmCudaTryTritonDeepSeekV4SparseAttentionDecodeGraph(
+        const Data &q, const Data &windowKV, const Data &compressedKV,
+        const Data &attnSink, int windowSize, int compressRatio,
+        const int32_t *decodeMeta, float softmaxScale, float *output) {
+        return FastllmCudaTryTritonDeepSeekV4SparseAttentionDecodeGraphImpl(
+            q, windowKV, compressedKV, attnSink, windowSize, compressRatio,
+            decodeMeta, softmaxScale, output);
+    }
+
+    bool FastllmCudaTryTritonDeepSeekV4SqrtSoftplusRouter(
+        const Data &logits, const Data &gateBias, float routeScale,
+        Data &expertIndex, Data &expertScore) {
+        if (!CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON") ||
+            !CudaEnvFlagDefaultEnabled(
+                "FASTLLM_CUDA_TRITON_DEEPSEEK_V4_ROUTER", true) ||
+            !CudaEnvFlagDefaultEnabled(
+                "FASTLLM_CUDA_TRITON_DSV4_ROUTER_SM120", true)) {
+            return false;
+        }
+        constexpr int numExperts = 256;
+        constexpr int topk = 6;
+        constexpr int blockN = 256;
+        constexpr int numWarps = 1;
+        constexpr int numStages = 1;
+        if (logits.dataDevice != DataDevice::CUDA ||
+            logits.dataType != DataType::FLOAT32 ||
+            logits.cudaData == nullptr || logits.dims.empty() ||
+            logits.dims.back() != numExperts ||
+            logits.Count(0) == 0 || logits.Count(0) % numExperts != 0 ||
+            gateBias.dataDevice != DataDevice::CUDA ||
+            gateBias.dataType != DataType::FLOAT32 ||
+            gateBias.cudaData == nullptr ||
+            gateBias.Count(0) != numExperts ||
+            expertIndex.dataDevice != DataDevice::CUDA ||
+            expertIndex.dataType != DataType::INT32 ||
+            expertIndex.cudaData == nullptr ||
+            expertScore.dataDevice != DataDevice::CUDA ||
+            expertScore.dataType != DataType::FLOAT32 ||
+            expertScore.cudaData == nullptr || !std::isfinite(routeScale)) {
+            return false;
+        }
+        int tokens = (int)(logits.Count(0) / numExperts);
+        if (expertIndex.Count(0) != (uint64_t)tokens * topk ||
+            expertScore.Count(0) != (uint64_t)tokens * topk) {
+            return false;
+        }
+        int arch = CudaTritonRuntimeArch();
+        if (arch != 120 && arch != 121) {
+            return false;
+        }
+        std::string cacheDir = CudaTritonCacheDir();
+        std::string base = CudaTritonDeepSeekV4RouterBaseName(
+            arch, numExperts, topk, blockN, numWarps, numStages);
+        const CudaTritonDeepSeekV4RouterMeta *meta = nullptr;
+        if (!CudaTritonGetDeepSeekV4RouterMeta(
+                cacheDir, base, arch, numExperts, topk, blockN,
+                numWarps, numStages, meta) || meta == nullptr) {
+            return false;
+        }
+        return FastllmCudaTritonDeepSeekV4SqrtSoftplusRouter(
+            meta->kernel.cubinPath.c_str(),
+            meta->kernel.kernelName.c_str(),
+            meta->kernel.numWarps, meta->kernel.shared,
+            meta->numExperts, meta->topk, meta->blockN,
+            logits, gateBias, routeScale, expertIndex, expertScore);
+    }
+
+    static bool TryCudaTritonMergeMOEFp8Indexed(
+        Data &input, Data &output, Data &index, Data &score, int batch, int topk,
+        Data &w1, Data **weights, int weightsBatch, float sharedScale, MoeGateType gateType) {
+        if (!CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON")) {
+            return false;
+        }
+        const char *moeEnv = std::getenv("FASTLLM_CUDA_TRITON_MERGE_MOE");
+        if (moeEnv != nullptr && moeEnv[0] != '\0' && !CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON_MERGE_MOE")) {
+            return false;
+        }
+        if (batch <= 0 || topk <= 0 || gateType != MoeGateSwiglu ||
+            input.dataDevice != DataDevice::CUDA ||
+            (input.dataType != DataType::FLOAT16 && input.dataType != DataType::BFLOAT16) ||
+            input.cudaData == nullptr || input.dims.size() == 0 || input.dims[0] != batch ||
+            index.dataDevice != DataDevice::CUDA || index.dataType != DataType::INT32 || index.cudaData == nullptr ||
+            score.dataDevice != DataDevice::CUDA || score.dataType != DataType::FLOAT32 || score.cudaData == nullptr ||
+            weights == nullptr || weightsBatch < 4 || (weightsBatch & 1)) {
+            return false;
+        }
+        if (weights[0] != nullptr && sharedScale != 0.0f) {
+            return false;
+        }
+
+        int hidden = input.dims.back();
+        Data *gateup = weights[2];
+        Data *down = weights[3];
+        if (gateup == nullptr || down == nullptr ||
+            gateup->dataType != DataType::FP8_E4M3 || down->dataType != DataType::FP8_E4M3 ||
+            gateup->dims.size() != 2 || down->dims.size() != 2 ||
+            gateup->dims[1] != hidden || gateup->dims[0] != down->dims[1] * 2 ||
+            down->dims[0] != hidden) {
+            return false;
+        }
+        int inter = down->dims[1];
+        if (hidden <= 0 || inter <= 0) {
+            return false;
+        }
+
+        std::string inputDtype;
+        if (!CudaTritonDataTypeName(input.dataType, inputDtype)) {
+            return false;
+        }
+        int arch = CudaTritonRuntimeArch();
+        if (arch <= 0) {
+            return false;
+        }
+
+        int routeBlockT = CudaEnvInt("FASTLLM_CUDA_TRITON_MERGE_MOE_ROUTE_BLOCK_T", 1024);
+        int maxExperts = CudaEnvInt("FASTLLM_CUDA_TRITON_MERGE_MOE_MAX_EXPERTS", 256);
+        int experts = weightsBatch / 2 - 1;
+        int groupBlockM = batch <= 64 ? 16 : 64;
+        int groupBlockN = 128;
+        int groupBlockK = 128;
+        int groupSizeM = batch <= 16 ? 1 : 32;
+        int minBatch = CudaEnvInt("FASTLLM_CUDA_TRITON_MERGE_MOE_MIN_BATCH", 16);
+        bool packedTableReady = FastllmCudaTritonMergeMOEFP8E4M3IndexedIsPacked(
+            weights, weightsBatch, hidden, inter);
+        if (batch < minBatch && !packedTableReady) {
+            return false;
+        }
+        int routeNumWarps = CudaEnvInt("FASTLLM_CUDA_TRITON_MERGE_MOE_ROUTE_NUM_WARPS", 4);
+        int groupNumWarps = 4;
+        int numStages = CudaEnvInt("FASTLLM_CUDA_TRITON_MERGE_MOE_NUM_STAGES", 3);
+        if (experts <= 0 || experts > maxExperts || groupBlockN != groupBlockK) {
+            return false;
+        }
+        std::string cacheDir = CudaTritonCacheDir();
+        std::string base = CudaTritonMergeMoeFp8BaseName(
+            inputDtype, arch,
+            routeBlockT, maxExperts, topk, hidden, inter, groupBlockM, groupBlockN, groupBlockK,
+            groupSizeM, routeNumWarps, groupNumWarps, numStages);
+
+        const CudaTritonMergeMoeFp8Meta *meta = nullptr;
+        if (!CudaTritonGetMergeMoeFp8Meta(
+                cacheDir, base, inputDtype, arch,
+                routeBlockT, maxExperts, topk, hidden, inter, groupBlockM, groupBlockN, groupBlockK,
+                groupSizeM, routeNumWarps, groupNumWarps, numStages, meta)) {
+            if (packedTableReady) {
+                ErrorInFastLLM("Fastllm Triton MergeMOE source weights have been released, but Triton metadata is unavailable.\n");
+            }
+            return false;
+        }
+        if (meta == nullptr || experts > meta->maxExperts) {
+            if (packedTableReady) {
+                ErrorInFastLLM("Fastllm Triton MergeMOE source weights have been released, but Triton metadata is incompatible.\n");
+            }
+            return false;
+        }
+        const char *cubinPaths[kCudaTritonMergeMoeFp8KernelCount];
+        const char *kernelNames[kCudaTritonMergeMoeFp8KernelCount];
+        int kernelWarps[kCudaTritonMergeMoeFp8KernelCount];
+        int kernelShared[kCudaTritonMergeMoeFp8KernelCount];
+        for (int i = 0; i < kCudaTritonMergeMoeFp8KernelCount; i++) {
+            cubinPaths[i] = meta->kernels[i].cubinPath.c_str();
+            kernelNames[i] = meta->kernels[i].kernelName.c_str();
+            kernelWarps[i] = meta->kernels[i].numWarps;
+            kernelShared[i] = meta->kernels[i].shared;
+        }
+        bool ok = FastllmCudaTritonMergeMOEFP8E4M3Indexed(
+            cubinPaths, kernelNames, kernelWarps, kernelShared,
+            meta->routeBlockT, meta->maxExperts, meta->groupBlockM, meta->groupBlockN, meta->groupBlockK,
+            meta->groupSizeM,
+            input, w1, output, weights, weightsBatch,
+            (const int32_t*)index.cudaData, (const float*)score.cudaData,
+            batch, topk, hidden, inter);
+        if (!ok && packedTableReady) {
+            ErrorInFastLLM("Fastllm Triton MergeMOE source weights have been released, but Triton launch failed.\n");
+        }
+        return ok;
+    }
+
+    static bool TryCudaTritonFusedMOEFp8(
+        Data &input, Data &output, Data &index, Data &score,
+        Data &gate, Data &up, Data &down, Data &w1,
+        int batch, int topk, int hidden, int inter, int experts,
+        MoeGateType gateType, float swigluLimit) {
+        if (!CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON")) {
+            return false;
+        }
+        const char *moeEnv = std::getenv("FASTLLM_CUDA_TRITON_MERGE_MOE");
+        if (moeEnv != nullptr && moeEnv[0] != '\0' && !CudaEnvFlagEnabled("FASTLLM_CUDA_TRITON_MERGE_MOE")) {
+            return false;
+        }
+        if (batch <= 0 || topk <= 0 || hidden <= 0 || inter <= 0 || experts <= 0 ||
+            gateType != MoeGateSwiglu || swigluLimit != 0.0f ||
+            input.dataDevice != DataDevice::CUDA ||
+            (input.dataType != DataType::FLOAT16 && input.dataType != DataType::BFLOAT16) ||
+            input.cudaData == nullptr || input.Count(0) != (uint64_t)batch * hidden ||
+            index.dataDevice != DataDevice::CUDA || index.dataType != DataType::INT32 || index.cudaData == nullptr ||
+            score.dataDevice != DataDevice::CUDA || score.dataType != DataType::FLOAT32 || score.cudaData == nullptr ||
+            index.Count(0) != (uint64_t)batch * topk || score.Count(0) != (uint64_t)batch * topk ||
+            gate.dataDevice != DataDevice::CUDA || up.dataDevice != DataDevice::CUDA || down.dataDevice != DataDevice::CUDA ||
+            gate.dataType != DataType::FP8_E4M3 || up.dataType != DataType::FP8_E4M3 || down.dataType != DataType::FP8_E4M3 ||
+            gate.cudaData == nullptr || up.cudaData == nullptr || down.cudaData == nullptr ||
+            gate.extraCudaData.empty() || up.extraCudaData.empty() || down.extraCudaData.empty() ||
+            gate.dims.size() != 3 || up.dims.size() != 3 || down.dims.size() != 3 ||
+            gate.dims[0] != experts || gate.dims[1] != inter || gate.dims[2] != hidden ||
+            up.dims[0] != experts || up.dims[1] != inter || up.dims[2] != hidden ||
+            down.dims[0] != experts || down.dims[1] != hidden || down.dims[2] != inter) {
+            return false;
+        }
+
+        std::string inputDtype;
+        if (!CudaTritonDataTypeName(input.dataType, inputDtype)) {
+            return false;
+        }
+        int arch = CudaTritonRuntimeArch();
+        if (arch <= 0) {
+            return false;
+        }
+
+        int routeBlockT = CudaEnvInt("FASTLLM_CUDA_TRITON_MERGE_MOE_ROUTE_BLOCK_T", 1024);
+        int maxExperts = CudaEnvInt("FASTLLM_CUDA_TRITON_MERGE_MOE_MAX_EXPERTS", 256);
+        int groupBlockM = batch <= 64 ? 16 : 64;
+        int groupBlockN = 128;
+        int groupBlockK = 128;
+        int groupSizeM = batch <= 16 ? 1 : 32;
+        int minBatch = CudaEnvInt("FASTLLM_CUDA_TRITON_MERGE_MOE_MIN_BATCH", 16);
+        if (batch < minBatch) {
+            return false;
+        }
+        int routeNumWarps = CudaEnvInt("FASTLLM_CUDA_TRITON_MERGE_MOE_ROUTE_NUM_WARPS", 4);
+        int groupNumWarps = 4;
+        int numStages = CudaEnvInt("FASTLLM_CUDA_TRITON_MERGE_MOE_NUM_STAGES", 3);
+        if (experts > maxExperts || groupBlockN != groupBlockK) {
+            return false;
+        }
+        std::string cacheDir = CudaTritonCacheDir();
+        std::string base = CudaTritonMergeMoeFp8BaseName(
+            inputDtype, arch,
+            routeBlockT, maxExperts, topk, hidden, inter, groupBlockM, groupBlockN, groupBlockK,
+            groupSizeM, routeNumWarps, groupNumWarps, numStages);
+
+        const CudaTritonMergeMoeFp8Meta *meta = nullptr;
+        if (!CudaTritonGetMergeMoeFp8Meta(
+                cacheDir, base, inputDtype, arch,
+                routeBlockT, maxExperts, topk, hidden, inter, groupBlockM, groupBlockN, groupBlockK,
+                groupSizeM, routeNumWarps, groupNumWarps, numStages, meta)) {
+            return false;
+        }
+        if (meta == nullptr || experts > meta->maxExperts) {
+            return false;
+        }
+        const char *cubinPaths[kCudaTritonMergeMoeFp8KernelCount];
+        const char *kernelNames[kCudaTritonMergeMoeFp8KernelCount];
+        int kernelWarps[kCudaTritonMergeMoeFp8KernelCount];
+        int kernelShared[kCudaTritonMergeMoeFp8KernelCount];
+        for (int i = 0; i < kCudaTritonMergeMoeFp8KernelCount; i++) {
+            cubinPaths[i] = meta->kernels[i].cubinPath.c_str();
+            kernelNames[i] = meta->kernels[i].kernelName.c_str();
+            kernelWarps[i] = meta->kernels[i].numWarps;
+            kernelShared[i] = meta->kernels[i].shared;
+        }
+        return FastllmCudaTritonFusedMOEFP8E4M3(
+            cubinPaths, kernelNames, kernelWarps, kernelShared,
+            meta->routeBlockT, meta->maxExperts, meta->groupBlockM, meta->groupBlockN, meta->groupBlockK,
+            meta->groupSizeM,
+            input, gate, up, down, index, score, w1, output,
+            batch, topk, hidden, inter, experts);
+    }
+#else
+    bool CanUseCudaTritonSwigluLinear(int, bool, bool) {
+        return false;
+    }
+
+    bool DoCudaTritonSwigluLinear(Data &, Data &, const Data &, Data &) {
+        return false;
+    }
+
+    bool FastllmCudaTryTritonDeepSeekV4WoA(
+        const Data &, Data &, int, int, Data &) {
+        return false;
+    }
+
+    bool FastllmCudaTryTritonDeepSeekV4SparseAttentionDecodeGraph(
+        const Data &, const Data &, const Data &, const Data &, int, int,
+        const int32_t *, float, float *) {
+        return false;
+    }
+
+    bool FastllmCudaTryTritonDeepSeekV4SqrtSoftplusRouter(
+        const Data &, const Data &, float, Data &, Data &) {
+        return false;
+    }
+
+    static bool TryCudaTritonLinearFp8Block128(
+        Data &, Data &, const Data &, Data &, int, int, int) {
+        return false;
+    }
+
+    bool FastllmCudaCanUseTritonChunkGdnPrefill(
+        int, int, int, int, int, bool) {
+        return false;
+    }
+
+    static bool TryCudaTritonChunkGdnPrefill(
+        Data &, Data &, Data &, Data &, Data &, Data *, Data &, Data &,
+        Data &, bool) {
+        return false;
+    }
+
+    static bool TryCudaTritonChunkGdnVarlenPrefill(
+        Data &, Data &, Data &, Data &, Data &, Data *, Data &, Data &,
+        bool, bool,
+        const std::vector<int> &, Data &) {
+        return false;
+    }
+
+    bool FastllmCudaTryCombinedBaSigmoidMambaSoftplus(
+        const Data &, const Data &, const Data &,
+        int, int, int, int, int, Data &, Data &) {
+        return false;
+    }
+
+    bool FastllmCudaTryCombinedGdnConvInput(
+        const std::vector<Data*> &, const Data &,
+        Data &, Data &, Data &) {
+        return false;
+    }
+
+    bool FastllmCudaTryCombinedGdnZGate(
+        const Data &, Data &, const Data &,
+        int, int, Data &, float) {
+        return false;
+    }
+
+    bool FastllmCudaTryCombinedGdnOutputGate(
+        const Data &, Data &, const Data &,
+        int, int, int, int, Data &, float) {
+        return false;
+    }
+
+    bool FastllmCudaTryTritonChunkGdnPostConv(
+        const Data &, const Data &, const Data &, const Data &,
+        int, int, int, int, int, int, float, float,
+        Data &, Data &,
+        Data &, Data &, Data &, Data &, Data &,
+        Data &, Data &) {
+        return false;
+    }
+
+    bool FastllmCudaTryTritonQwen4SparseAttention(
+        const Data &, const Data &, const Data &, const Data &,
+        int, float, Data &) {
+        return false;
+    }
+
+    bool FastllmCudaTryChunkGdnRaggedPostConv(
+        const Data &, const Data &, const Data &, const Data &,
+        const Data &, int, const std::vector<int> &, int,
+        int, int, int, int, float, float,
+        Data &, Data &, Data &, Data &, Data &) {
+        return false;
+    }
+
+    bool FastllmCudaMappedGdnKkt(
+        const Data &, const Data &, int, Data &) {
+        return false;
+    }
+
+    bool FastllmCudaTryTritonChunkGdnRecompute(
+        const Data &, const Data &, const Data &, const Data &,
+        const Data &,
+        Data &, Data &) {
+        return false;
+    }
+
+    static bool TryCudaTritonMergeMOEFp8Indexed(
+        Data &, Data &, Data &, Data &, int, int, Data &, Data **, int, float, MoeGateType) {
+        return false;
+    }
+
+    static bool TryCudaTritonFusedMOEFp8(
+        Data &, Data &, Data &, Data &, Data &, Data &, Data &, Data &,
+        int, int, int, int, int, MoeGateType, float) {
+        return false;
+    }
+#endif
+
+    bool FastllmCudaTryTritonChunkGdnVarlenPrefill(
+        Data &q, Data &k, Data &v, Data &g, Data &attn,
+        Data &decayMask, Data &kCumdecay, Data &lastRecurrentState,
+        bool fuseDecayMask, bool directOutputQk,
+        const std::vector<int> &seqLens, Data &coreAttnOut) {
+        return TryCudaTritonChunkGdnVarlenPrefill(
+            q, k, v, g, attn, &decayMask, kCumdecay,
+            lastRecurrentState, fuseDecayMask, directOutputQk,
+            seqLens, coreAttnOut);
+    }
+
+    bool FastllmCudaChunkGatedDeltaRuleVarlenPrefill(
+        Data &q, Data &k, Data &v, Data &g, Data &attn,
+        Data &decayMask, Data &kCumdecay, Data &lastRecurrentState,
+        bool fuseDecayMask, bool directOutputQk,
+        const std::vector<int> &seqLens, Data &coreAttnOut) {
+        if (FastllmCudaTryTritonChunkGdnVarlenPrefill(
+                q, k, v, g, attn, decayMask, kCumdecay,
+                lastRecurrentState, fuseDecayMask, directOutputQk,
+                seqLens, coreAttnOut)) {
+            return true;
+        }
+        // The direct Triton O kernel does not require the materialized QK^T
+        // tensor. If its launch is unavailable, reconstruct the exact legacy
+        // input before entering the native fallback so this optimization can
+        // never change correctness or availability.
+        if (directOutputQk) {
+            if (q.dims.size() != 5 || k.dims != q.dims ||
+                q.dims[0] != 1 || q.dims[3] != 64 || q.dims[4] != 128) {
+                return false;
+            }
+            int keyHeads = q.dims[1];
+            int totalChunks = q.dims[2];
+            attn.dataType = DataType::FLOAT16;
+            attn.dataDevice = q.dataDevice;
+            attn.dataDeviceIds = q.dataDeviceIds;
+            attn.Resize({1, keyHeads, totalChunks, 64, 64});
+            attn.Allocate(false);
+            if (!FastllmCudaBatchMatMulTransB(
+                    q, k, attn,
+                    64 * 128, 64 * 128, 64 * 64,
+                    128, 128, keyHeads * totalChunks,
+                    64, 128, 64, 1.0f)) {
+                return false;
+            }
+        }
+        return ::FastllmChunkGatedDeltaRuleVarlenPrefillNative(
+            q, k, v, g, attn, kCumdecay,
+            lastRecurrentState, seqLens, coreAttnOut,
+            &decayMask, fuseDecayMask);
+    }
+
+    static void InvalidateCpuMirror(Data &data) {
+        if (data.cpuData == nullptr) {
+            return;
+        }
+#ifdef USE_MMAP
+        if (data.name.empty()) {
+            delete[] data.cpuData;
+        }
+#else
+        delete[] data.cpuData;
+#endif
+        data.cpuData = nullptr;
+    }
+
+    CudaDevice::CudaDevice() {
+        this->deviceType = "cuda";
+        this->ops["ToFloat16"] = (BaseOperator*)(new CudaToFloat16());
+        this->ops["ToFloat32"] = (BaseOperator*)(new CudaToFloat32());
+        this->ops["ConvertToFloat16"] = (BaseOperator*)(new CudaConvertToFloat16());
+        this->ops["ConvertToFloat32"] = (BaseOperator*)(new CudaConvertToFloat32());
+        this->ops["ToBFloat16"] = (BaseOperator*)(new CudaToBFloat16());
+        this->ops["ConvertToBFloat16"] = (BaseOperator*)(new CudaConvertToBFloat16());
+
+        this->ops["Attention"] = (BaseOperator*)(new CudaAttention());
+        // this->ops["MergeAttention"] = (BaseOperator*)(new CudaMergeAttention());
+        this->ops["CopyKVCache"] = (BaseOperator*)(new CudaCopyKVCacheOp());
+        this->ops["Embedding"] = (BaseOperator*)(new CudaEmbedding());
+        this->ops["EmbeddingDirect"] = (BaseOperator*)(new CudaEmbeddingDirect());
+        this->ops["LayerNorm"] = (BaseOperator*)(new CudaLayerNormOp());
+        this->ops["RMSNorm"] = (BaseOperator*)(new CudaRMSNormOp());
+        this->ops["RMSNormPart"] = (BaseOperator*)(new CudaRMSNormPartOp());
+        this->ops["Qwen4GroupedRMSNorm"] = (BaseOperator*)(new CudaQwen4GroupedRMSNormOp());
+        this->ops["Qwen4PLEGate"] = (BaseOperator*)(new CudaQwen4PLEGateOp());
+        this->ops["Qwen4PLECausalConv"] = (BaseOperator*)(new CudaQwen4PLECausalConvOp());
+        this->ops["Qwen4HyperMix"] = (BaseOperator*)(new CudaQwen4HyperMixOp());
+        this->ops["Qwen4HyperProject"] = (BaseOperator*)(new CudaQwen4HyperProjectOp());
+        this->ops["Qwen4HyperPrepare"] = (BaseOperator*)(new CudaQwen4HyperPrepareOp());
+        this->ops["Qwen4HyperInject"] = (BaseOperator*)(new CudaQwen4HyperInjectOp());
+        this->ops["Qwen4HyperCombine"] = (BaseOperator*)(new CudaQwen4HyperCombineOp());
+        this->ops["Qwen4HyperCombineRMSNorm"] = (BaseOperator*)(new CudaQwen4HyperCombineRMSNormOp());
+        this->ops["Qwen4QSASelect"] = (BaseOperator*)(new CudaQwen4QSASelectOp());
+        this->ops["Qwen4QSABuildMask"] = (BaseOperator*)(new CudaQwen4QSABuildMaskOp());
+        this->ops["Qwen4SparseAttention"] = (BaseOperator*)(new CudaQwen4SparseAttentionOp());
+        this->ops["CausalDepthwiseConv1DDecode"] = (BaseOperator*)(new CudaCausalDepthwiseConv1DDecodeOp());
+        this->ops["CausalDepthwiseConv1DPrefill"] = (BaseOperator*)(new CudaCausalDepthwiseConv1DPrefillOp());
+        this->ops["GatedDeltaRuleDecode"] = (BaseOperator*)(new CudaQwen4GatedDeltaRuleDecodeOp());
+        this->ops["GatedDeltaRuleSequence"] = (BaseOperator*)(new CudaQwen4GatedDeltaRuleDecodeOp());
+        this->ops["Qwen4GatedDeltaRuleDecode"] = (BaseOperator*)(new CudaQwen4GatedDeltaRuleDecodeOp());
+        this->ops["KimiK3RMSNorm"] =
+            (BaseOperator*)(new CudaKimiK3RMSNormOp());
+        this->ops["KimiK3CausalConv1D"] =
+            (BaseOperator*)(new CudaKimiK3CausalConv1DOp());
+        this->ops["KimiK3UpdatePackedConvCache"] =
+            (BaseOperator*)(new CudaKimiK3UpdatePackedConvCacheOp());
+        this->ops["KimiK3L2Norm"] =
+            (BaseOperator*)(new CudaKimiK3L2NormOp());
+        this->ops["KimiK3RecurrentKDA"] =
+            (BaseOperator*)(new CudaKimiK3RecurrentKDAOp());
+        this->ops["KimiK3RMSNormSigmoidGate"] =
+            (BaseOperator*)(new CudaKimiK3RMSNormSigmoidGateOp());
+        this->ops["KimiK3AttnRes"] =
+            (BaseOperator*)(new CudaKimiK3AttnResOp());
+        this->ops["KimiK3SiTUAndMul"] =
+            (BaseOperator*)(new CudaKimiK3SiTUAndMulOp());
+        this->ops["KimiK3CausalAttention"] =
+            (BaseOperator*)(new CudaKimiK3CausalAttentionOp());
+        this->ops["Linear"] = (BaseOperator*)(new CudaLinearOp());
+        this->ops["LinearAdd"] = (BaseOperator*)(new CudaLinearAddOp());
+        this->ops["SwigluLinearAdd"] = (BaseOperator*)(new CudaSwigluLinearAddOp());
+        this->ops["LinearSwiglu"] = (BaseOperator*)(new CudaLinearSwigluOp());
+        this->ops["Conv1DPerChannel"] = (BaseOperator*)(new CudaConv1DPerChannel());
+        this->ops["Conv2D"] = (BaseOperator*)(new CudaConv2DOp());
+        this->ops["Split"] = (BaseOperator*)(new CudaSplitOp());
+        this->ops["Repeat"] = (BaseOperator*)(new CudaRepeatOp());
+        this->ops["RepeatAddTo"] = (BaseOperator*)(new CudaRepeatAddToOp());
+        this->ops["Copy"] = (BaseOperator*)(new CudaCopyOp());
+        this->ops["DeepSeekV4HcPre"] = (BaseOperator*)(new CudaDeepSeekV4HcPreOp());
+        this->ops["DeepSeekV4HcPost"] = (BaseOperator*)(new CudaDeepSeekV4HcPostOp());
+        this->ops["DeepSeekV41HcPost"] = (BaseOperator*)(new CudaDeepSeekV4HcPostOp());
+        this->ops["ScaleQRatory"] = (BaseOperator*)(new CudaScaleQRatoryOp());
+        this->ops["DeepSeekV4RotaryQuant"] = (BaseOperator*)(new CudaDeepSeekV4RotaryQuantOp());
+        this->ops["DeepSeekV4WoA"] = (BaseOperator*)(new CudaDeepSeekV4WoAOp());
+        this->ops["DeepSeekV4BuildCompressedKVFromRaw"] = (BaseOperator*)(new CudaDeepSeekV4BuildCompressedKVFromRawOp());
+        this->ops["DeepSeekV4StoreWindowKVCache"] = (BaseOperator*)(new CudaDeepSeekV4StoreWindowKVCacheOp());
+        this->ops["DeepSeekV4UpdateWindowKVCache"] = (BaseOperator*)(new CudaDeepSeekV4UpdateWindowKVCacheOp());
+        this->ops["DeepSeekV41HcMix"] = (BaseOperator*)(new CudaDeepSeekV41HcMixOp());
+        this->ops["DeepSeekV41HcApplyPre"] = (BaseOperator*)(new CudaDeepSeekV41HcApplyPreOp());
+        this->ops["DeepSeekV41EngramApply"] = (BaseOperator*)(new CudaDeepSeekV41EngramApplyOp());
+        this->ops["DeepSeekV41RotaryQuant"] = (BaseOperator*)(new CudaDeepSeekV41RotaryQuantOp());
+        this->ops["DeepSeekV41Compress"] = (BaseOperator*)(new CudaDeepSeekV41CompressOp());
+        this->ops["DeepSeekV41IndexerScore"] = (BaseOperator*)(new CudaDeepSeekV41IndexerScoreOp());
+        this->ops["DeepSeekV41CandidateBlocks"] = (BaseOperator*)(new CudaDeepSeekV41CandidateBlocksOp());
+        this->ops["DeepSeekV41IndexerTopK"] = (BaseOperator*)(new CudaDeepSeekV41IndexerTopKOp());
+        this->ops["DeepSeekV41SparseAttention"] = (BaseOperator*)(new CudaDeepSeekV41SparseAttentionOp());
+        this->ops["DeepSeekV41WindowStore"] = (BaseOperator*)(new CudaDeepSeekV41WindowStoreOp());
+        this->ops["DeepSeekV41QuantizeActivation"] = (BaseOperator*)(new CudaDeepSeekV41QuantizeActivationOp());
+        this->ops["DeepSeekV41QuantizeKV"] = (BaseOperator*)(new CudaDeepSeekV41QuantizeKVOp());
+        this->ops["Cat"] = (BaseOperator*)(new CudaCatOp());
+        this->ops["Pad"] = (BaseOperator*)(new CudaPadOp());
+        this->ops["CatDirect"] = (BaseOperator*)(new CudaCatDirectOp());
+        this->ops["MatMul"] = (BaseOperator*)(new CudaMatMulOp());
+        this->ops["MatMulTransB"] = (BaseOperator*)(new CudaMatMulTransBOp());
+        this->ops["SoftMax"] = (BaseOperator*)(new CudaSoftMaxOp());
+        this->ops["Exp"] = (BaseOperator*)(new CudaExpOp());
+        this->ops["Relu"] = (BaseOperator*)(new CudaReluOp());
+        this->ops["Gelu"] = (BaseOperator*)(new CudaGeluOp());
+        this->ops["GeluNew"] = (BaseOperator*)(new CudaGeluNewOp());
+        this->ops["Geglu"] = (BaseOperator*)(new CudaGegluOp());
+        this->ops["Silu"] = (BaseOperator*)(new CudaSiluOp());
+        this->ops["Sigmoid"] = (BaseOperator*)(new CudaSigmoidOp());
+        this->ops["SigmoidMulTo"] = (BaseOperator*)(new CudaSigmoidMulToOp());
+        this->ops["MambaSoftplus"] = (BaseOperator*)(new CudaMambaSoftplusOp());
+        this->ops["SigmoidMambaSoftplus"] = (BaseOperator*)(new CudaSigmoidMambaSoftplusOp());
+        this->ops["Swiglu"] = (BaseOperator*)(new CudaSwigluOp());
+        this->ops["CrossSwiglu"] = (BaseOperator*)(new CudaCrossSwigluOp());
+        this->ops["Add"] = (BaseOperator*)(new CudaAddOp());
+        this->ops["Mul"] = (BaseOperator*)(new CudaMulOp());
+        this->ops["AddTo"] = (BaseOperator*)(new CudaAddToOp());
+        this->ops["MulTo"] = (BaseOperator*)(new CudaMulToOp());
+        this->ops["AttentionMask"] = (BaseOperator*)(new CudaAttentionMaskOp());
+        this->ops["AlibiMask"] = (BaseOperator*)(new CudaAlibiMaskOp());
+        this->ops["TransferAttn"] = (BaseOperator*)(new CudaTransferAttnOp());
+        this->ops["ApplyChunkDecayByLastLogG"] = (BaseOperator*)(new CudaApplyChunkDecayByLastLogGOp());
+        this->ops["CumSumLastDim"] = (BaseOperator*)(new CudaCumSumLastDimOp());
+        this->ops["TopK"] = (BaseOperator*)(new CudaTopKOp());
+        this->ops["SelectExpert"] = (BaseOperator*)(new CudaSelectExpertOp());
+        this->ops["FusedSoftmaxSelectExpert"] = (BaseOperator*)(new CudaFusedSelectExpertOp());
+        this->ops["FusedSigmoidSelectExpert"] = (BaseOperator*)(new CudaFusedSelectExpertOp());
+        this->ops["PermuteSelf"] = (BaseOperator*)(new CudaPermuteSelfOp());
+        this->ops["RotatePosition2D"] = (BaseOperator*)(new CudaRotatePosition2DOp());
+        this->ops["NearlyRotatePosition2D"] = (BaseOperator*)(new CudaNearlyRotatePosition2DOp());
+        this->ops["LlamaRotatePosition2D"] = (BaseOperator*)(new CudaLlamaRotatePosition2DOp());
+        this->ops["LlamaRotatePosition2DPart"] = (BaseOperator*)(new CudaLlamaRotatePosition2DPartOp());
+        this->ops["RopeEncoding"] = (BaseOperator*)(new CudaRopeEncodingOp());
+        this->ops["Llama3RopeEncoding"] = (BaseOperator*)(new CudaLlama3RopeEncodingOp());
+        this->ops["YarnRopeEncoding"] = (BaseOperator*)(new CudaYarnRopeEncodingOp());
+        this->ops["Qwen35InterleavedRope"] = (BaseOperator*)(new CudaQwen35InterleavedRopeOp());
+        this->ops["QKVRMSNormRope"] = (BaseOperator*)(new CudaQKVRMSNormRopeOp());
+        this->ops["QKVRMSNormRopeSplitAppendPagedCache"] = (BaseOperator*)(new CudaQKVRMSNormRopeSplitAppendPagedCacheOp());
+        this->ops["Step3p5QKVRMSNormRopeSplitAppendPagedCache"] = (BaseOperator*)(new CudaQKVRMSNormRopeSplitAppendPagedCacheOp());
+        this->ops["Qwen35QGateKVRMSNormRopeSplitAppendPagedCache"] =
+                (BaseOperator*)(new CudaQwen35QGateKVRMSNormRopeSplitAppendPagedCacheOp());
+        this->ops["RepeatPenalty"] = (BaseOperator*)(new CudaRepeatPenaltyOp());
+        this->ops["ApplyLognAttn"] = (BaseOperator*)(new CudaApplyLognAttnOp());
+        this->ops["MergeMOE"] = (BaseOperator*)(new CudaMergeMOE());
+        this->ops["FusedMOE"] = (BaseOperator*)(new CudaFusedMOE());
+        this->ops["MergeMLA"] = (BaseOperator*)(new CudaMergeMLA());
+        this->ops["MergeMLAPaged"] = (BaseOperator*)(new CudaMergeMLAPaged());
+        this->ops["RecurrentGatedDeltaRule"] = (BaseOperator*)(new CudaRecurrentGatedDeltaRuleOp());
+        this->ops["ChunkGatedDeltaRulePrefill"] = (BaseOperator*)(new CudaChunkGatedDeltaRulePrefillOp());
+        this->ops["CausalMask"] = (BaseOperator*)(new CudaCausalMaskOp());
+        this->ops["MakeDecayMask"] = (BaseOperator*)(new CudaMakeDecayMaskOp());
+
+        this->ops["SplitBatch"] = (BaseOperator*)(new CudaSplitBatchOp());
+        this->ops["CatBatch"] = (BaseOperator*)(new CudaCatBatchOp());
+        this->ops["MulBatch"] = (BaseOperator*)(new CudaMulBatchOp());
+        this->ops["MatMulBatch"] = (BaseOperator*)(new CudaMatMulBatchOp());
+        this->ops["MatMulTransBBatch"] = (BaseOperator*)(new CudaMatMulTransBBatchOp());
+        this->ops["SoftMaxBatch"] = (BaseOperator*)(new CudaSoftmaxBatchOp());
+        this->ops["CatDirectBatch"] = (BaseOperator*)(new CudaCatDirectBatchOp());
+        this->ops["AppendKVCachebatch"] = (BaseOperator*)(new CudaAppendKVCacheBatchOp());
+        this->ops["AttentionBatch"] = (BaseOperator*)(new CudaAttentionBatchOp());
+
+        this->ops["AttentionPaged"] = (BaseOperator*)(new CudaAttentionPagedOp());
+        this->ops["AppendPagedCache"] = (BaseOperator*)(new CudaAppendPagedCacheOp());
+        this->ops["AppendPagedCacheBatch"] = (BaseOperator*)(new CudaAppendPagedCacheBatchOp());
+        this->ops["AttentionPagedBatch"] = (BaseOperator*)(new CudaAttentionPagedBatchOp());
+        this->ops["GeneratePagedBatchParams"] = (BaseOperator*)(new CudaGeneratePagedBatchParamsOp());
+        this->ops["GenerateAppendPagedCacheBatchParams"] = (BaseOperator*)(new CudaGenerateAppendPagedCacheBatchParamsOp());
+    }
+
+    bool CudaDevice::Malloc(void **ret, size_t size) {
+        *ret = FastllmCudaMalloc(size);
+        return true;
+    }
+
+    bool CudaDevice::Free(void *ret) {
+        FastllmCudaFree(ret);
+        return true;
+    }
+
+    bool CudaDevice::CopyDataFromCPU(void *dst, void *src, size_t size) {
+        FastllmCudaCopyFromHostToDevice(dst, src, size);
+        return true;
+    }
+
+    bool CudaDevice::CopyDataToCPU(void *dst, void *src, size_t size) {
+        FastllmCudaCopyFromDeviceToHost(dst, src, size);
+        return true;
+    }
+
+    void CudaToFloat16::Run(const std::string &opType, const fastllm::DataDict &datas,
+                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &data = *(datas.find("input")->second);
+        if (data.dataType == DataType::FLOAT16) {
+            return;
+        }
+        if (data.dims.size() == 0) {
+            data.dataType = DataType::FLOAT16;
+            data.UpdateUnitSize();
+            return;
+        }
+        if (data.dataType == DataType::FLOAT32) {
+            float *old = (float*)data.cudaData;
+            data.dataType = DataType::FLOAT16;
+            data.UpdateUnitSize();
+            uint64_t newBytes = GetConvertedBufferBytes(data);
+            data.cudaData = FastllmCudaMalloc(newBytes);
+            int len = data.Count(0);
+            FastllmFloatToHalf(old, data.cudaData, len);
+            FastllmCudaFree(old);
+        } else if (data.dataType == DataType::BFLOAT16) {
+            data.dataType = DataType::FLOAT16;
+            data.UpdateUnitSize();
+            int len = data.Count(0);
+            FastllmBF16ToHalf(data.cudaData, data.cudaData, len);
+        } else {
+            ErrorInFastLLM("ToFloat16: unsupport dataType.\n");
+        }
+        data.expansionBytes = GetConvertedBufferBytes(data);
+        InvalidateCpuMirror(data);
+    }
+
+    void CudaToFloat32::Run(const std::string &opType, const fastllm::DataDict &datas,
+                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &data = *(datas.find("input")->second);
+        if (data.dataType == DataType::FLOAT32) {
+            return;
+        }
+        if (data.dims.size() == 0) {
+            // Empty KV caches can already own pre-expanded storage. Widening an
+            // empty BF16/FP16 cache by only changing unitSize leaves the old
+            // two-byte allocation in place, so the first FP32 append writes
+            // past the buffer. There are no logical elements to preserve, but
+            // the capacity must be reallocated for the new element width.
+            uint64_t oldExpansionSize = data.expansionSize;
+            bool hadStorage = data.cudaData != nullptr;
+            if (hadStorage) {
+                data.FreeSpace();
+            }
+            data.dataType = DataType::FLOAT32;
+            data.UpdateUnitSize();
+            if (hadStorage && oldExpansionSize > 0) {
+                data.MallocSpace(oldExpansionSize);
+            }
+            return;
+        }
+        if (data.dataType == DataType::FLOAT16) {
+            uint16_t *old = (uint16_t*)data.cudaData;
+            data.dataType = DataType::FLOAT32;
+            data.UpdateUnitSize();
+            uint64_t newBytes = GetConvertedBufferBytes(data);
+            data.cudaData = FastllmCudaMalloc(newBytes);
+            int len = data.Count(0);
+            FastllmHalfToFloat(old, data.cudaData, len);
+            FastllmCudaFree(old);
+        } else if (data.dataType == DataType::BFLOAT16) {
+            uint16_t *old = (uint16_t*)data.cudaData;
+            data.dataType = DataType::FLOAT32;
+            data.UpdateUnitSize();
+            uint64_t newBytes = GetConvertedBufferBytes(data);
+            data.cudaData = FastllmCudaMalloc(newBytes);
+            int len = data.Count(0);
+            FastllmBF16ToFloat(old, data.cudaData, len);
+            FastllmCudaFree(old);
+        } else {
+            ErrorInFastLLM("ToFloat32: unsupport dataType.\n");
+        }
+        data.expansionBytes = GetConvertedBufferBytes(data);
+        InvalidateCpuMirror(data);
+    }
+
+    void CudaConvertToFloat16::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+        const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data *input = (datas.find("input")->second);
+        Data *output = (datas.find("output")->second);
+        output->dataType = DataType::FLOAT16;
+        output->Resize(input->dims);
+        output->UpdateUnitSize();
+        if (input->expansionDims.size() != 0)
+            output->Expansion(input->expansionDims);
+    }
+
+    void CudaConvertToFloat16::Run(const std::string &opType, const fastllm::DataDict &datas,
+                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        output.Allocate(false);
+        if (input.dataType == DataType::FLOAT16) {
+            FastllmCudaCopyFromDeviceToDevice(output.cudaData, input.cudaData, input.GetBytes());
+            return;
+        }
+        if (input.dataType == DataType::FLOAT32) {
+            FastllmFloatToHalf(input.cudaData, output.cudaData, input.Count(0));
+        } else if (input.dataType == DataType::BFLOAT16) {
+            FastllmBF16ToHalf(input.cudaData, output.cudaData, input.Count(0));
+        } else {
+            ErrorInFastLLM("ToFloat16: unsupport dataType.\n");
+        }
+    }
+
+    void CudaConvertToFloat32::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+        const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data *input = (datas.find("input")->second);
+        Data *output = (datas.find("output")->second);
+        output->dataType = DataType::FLOAT32;
+        output->Resize(input->dims);
+        output->UpdateUnitSize();
+        if (input->expansionDims.size() != 0)
+            output->Expansion(input->expansionDims);
+    }
+
+    void CudaConvertToFloat32::Run(const std::string &opType, const fastllm::DataDict &datas,
+                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        output.Allocate(false);
+        if (input.dataType == DataType::FLOAT32) {
+            FastllmCudaCopyFromDeviceToDevice(output.cudaData, input.cudaData, input.GetBytes());
+            return;
+        }
+        if (input.dataType == DataType::FLOAT16) {
+            FastllmHalfToFloat(input.cudaData, output.cudaData, input.Count(0));
+        } else if (input.dataType == DataType::BFLOAT16) {
+            FastllmBF16ToFloat(input.cudaData, output.cudaData, input.Count(0));
+        } else {
+            ErrorInFastLLM("ToFloat32: unsupport dataType.\n");
+        }
+    }
+
+    void CudaToBFloat16::Run(const std::string &opType, const fastllm::DataDict &datas,
+                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &data = *(datas.find("input")->second);
+        if (data.dataType == DataType::BFLOAT16) {
+            return;
+        }
+        if (data.dims.size() == 0) {
+            data.dataType = DataType::BFLOAT16;
+            data.UpdateUnitSize();
+            return;
+        }
+        if (data.dataType == DataType::FLOAT32) {
+            float *old = (float*)data.cudaData;
+            data.dataType = DataType::BFLOAT16;
+            data.UpdateUnitSize();
+            uint64_t newBytes = GetConvertedBufferBytes(data);
+            data.cudaData = FastllmCudaMalloc(newBytes);
+            int len = data.Count(0);
+            FastllmFloatToBF16(old, data.cudaData, len);
+            FastllmCudaFree(old);
+        } else if (data.dataType == DataType::FLOAT16) {
+            data.dataType = DataType::BFLOAT16;
+            data.UpdateUnitSize();
+            int len = data.Count(0);
+            FastllmHalfToBF16(data.cudaData, data.cudaData, len);
+        } else {
+            ErrorInFastLLM("ToBFloat16: unsupport dataType.\n");
+        }
+        data.expansionBytes = GetConvertedBufferBytes(data);
+        InvalidateCpuMirror(data);
+    }
+
+    void CudaConvertToBFloat16::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+        const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data *input = (datas.find("input")->second);
+        Data *output = (datas.find("output")->second);
+        output->dataType = DataType::BFLOAT16;
+        output->Resize(input->dims);
+        output->UpdateUnitSize();
+        if (input->expansionDims.size() != 0)
+            output->Expansion(input->expansionDims);
+    }
+
+    void CudaConvertToBFloat16::Run(const std::string &opType, const fastllm::DataDict &datas,
+                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        output.Allocate(false);
+        if (input.dataType == DataType::BFLOAT16) {
+            FastllmCudaCopyFromDeviceToDevice(output.cudaData, input.cudaData, input.GetBytes());
+            return;
+        }
+        if (input.dataType == DataType::FLOAT32) {
+            FastllmFloatToBF16(input.cudaData, output.cudaData, input.Count(0));
+        } else if (input.dataType == DataType::FLOAT16) {
+            FastllmHalfToBF16(input.cudaData, output.cudaData, input.Count(0));
+        } else {
+            ErrorInFastLLM("ToBFloat16: unsupport dataType.\n");
+        }
+    }
+
+    void DoCudaAttentionReshape(Data &q, Data &v, Data &output) {
+        std::vector <int> dims = {q.dims[0], q.dims[1], v.dims[2]};
+        output.dataType = q.dataType;
+        output.Resize(dims);
+    }
+
+    void CudaAttention::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                               const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &q = *(datas.find("q")->second);
+        Data &k = *(datas.find("k")->second);
+        Data &v = *(datas.find("v")->second);
+        Data &output = *(datas.find("output")->second);
+        int group = intParams.find("group") != intParams.end() ? intParams.find("group")->second : q.dims[0] / k.dims[0];
+
+        AssertInFastLLM(q.dims.size() == 3 && k.dims.size() == 3 && v.dims.size() == 3, "Attention: dims of q, k, v should be 3.\n");
+        AssertInFastLLM(q.dims[2] == k.dims[2], "Attention: q.dims[2] should be equal to k.dims[2].\n");
+        AssertInFastLLM(k.dims[1] == v.dims[1], "Attention: k.dims[1] should be equal to v.dims[1].\n");
+        AssertInFastLLM(k.dims[0] == v.dims[0], "Attention: k.dims[0] should be equal to v.dims[0].\n");
+        AssertInFastLLM(q.dims[0] == k.dims[0] * group, "Attention: q.dims[0] should be equal to k.dims[0] * group.\n");
+
+        AssertInFastLLM(q.dataType == k.dataType && q.dataType == v.dataType,
+                        "Attention: q, k, v's datatype should be same.\n");
+        AssertInFastLLM(q.dataType == DataType::FLOAT32 ||
+                        q.dataType == DataType::FLOAT16, 
+                        "Attention's input's type should be float32 or float16.\n");
+
+        DoCudaAttentionReshape(q, v, output);
+    }
+
+    void DoCudaAttention(Data &q, Data &k, Data &v, Data &mask, Data &output, int group, float scale, int maskType) {
+        output.Allocate(false);
+        if (q.dataType == DataType::FLOAT32) {
+            FastllmCudaAttention(q, k, v, mask, output, group, scale, maskType);
+        } else if (q.dataType == DataType::FLOAT16) {
+#ifdef CUDA_NO_TENSOR_CORE
+            Data q32, k32, v32, mask32, output32;
+            ToDataType(q, q32, DataType::FLOAT32);
+            ToDataType(k, k32, DataType::FLOAT32);
+            ToDataType(v, v32, DataType::FLOAT32);
+            output32.dataType = DataType::FLOAT32;
+            output32.Resize(output.dims);
+            output32.ToDevice(output.dataDevice);
+            output32.Allocate(false);
+            if (mask.dims.size() > 0)
+                ToDataType(mask, mask32, DataType::FLOAT32);
+            FastllmCudaAttention(q32, k32, v32, mask32, output32, group, scale, maskType);
+            ToDataType(output32, output, DataType::FLOAT16);
+#else
+            FastllmCudaHalfAttention(q, k, v, mask, output, group, scale, maskType);
+#endif
+        }
+    }
+
+    void CudaAttention::Run(const std::string &opType, const fastllm::DataDict &datas,
+                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data emptyData;
+        Data &q = *(datas.find("q")->second);
+        Data &k = *(datas.find("k")->second);
+        Data &v = *(datas.find("v")->second);
+        Data &mask = datas.find("mask")->second ? *(datas.find("mask")->second) : emptyData;
+        Data &output = *(datas.find("output")->second);
+        int group = intParams.find("group") != intParams.end() ? intParams.find("group")->second : q.dims[0] / k.dims[0];
+        float scale = floatParams.find("scale") != floatParams.end() ? floatParams.find("scale")->second : 1.0;
+        int maskType = intParams.find("maskType") != intParams.end() ? intParams.find("maskType")->second : 0;
+
+        DoCudaAttention(q, k, v, mask, output, group, scale, maskType);
+    }
+
+    void CudaCopyKVCacheOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                                   const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        return;
+    }
+
+    void CudaCopyKVCacheOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                               const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &oldCache = *(datas.find("oldCache")->second);
+        Data &newCache = *(datas.find("newCache")->second);
+
+        int oldBsStart = intParams.find("oldBsStart") != intParams.end() ? intParams.find("oldBsStart")->second : -1;
+        int newBsStart = intParams.find("newBsStart") != intParams.end() ? intParams.find("newBsStart")->second : -1;
+        int bs = intParams.find("bs") != intParams.end() ? intParams.find("bs")->second : -1;
+        int offset = intParams.find("offset") != intParams.end() ? intParams.find("offset")->second : -1;
+
+        int unitSize = oldCache.unitSize;
+
+        FastllmCudaMemcpy2DDeviceToDevice((uint8_t *) newCache.cudaData + newBsStart * newCache.strides[0] * unitSize
+                                                                          + offset * newCache.strides[1] * unitSize,
+                                          newCache.strides[0] * unitSize,
+                                          (uint8_t *) oldCache.cudaData + oldBsStart * oldCache.strides[0] * unitSize,
+                                          oldCache.strides[0] * unitSize,
+                                          oldCache.dims[1] * oldCache.dims[2] * unitSize, bs);
+    }
+
+    bool CudaRMSNormOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                               const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        return true;
+    }
+
+    void CudaRMSNormOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                       const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &weight = *(datas.find("weight")->second);
+        Data &output = *(datas.find("output")->second);
+
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
+                        input.dataType == DataType::FLOAT16 ||
+                        input.dataType == DataType::BFLOAT16,
+                        "RMSNorm error: datatype should be float32 or float16 or bfloat16.");
+
+        output.Allocate(false);
+
+        float eps = floatParams.find("eps") != floatParams.end() ? floatParams.find("eps")->second : 1e-5;
+        FastllmCudaRMSNorm(input, weight, output, eps);
+    }
+
+    bool CudaRMSNormPartOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                               const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        return true;
+    }
+
+    void CudaRMSNormPartOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                       const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &weight = *(datas.find("weight")->second);
+        Data &output = *(datas.find("output")->second);
+
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
+                        input.dataType == DataType::FLOAT16 ||
+                        input.dataType == DataType::BFLOAT16,
+                        "RMSNormPart error: datatype should be float32 or float16 or bfloat16.");
+
+        output.Allocate();
+
+        float eps = floatParams.find("eps") != floatParams.end() ? floatParams.find("eps")->second : 1e-5;
+        int start = intParams.find("start")->second;
+        int end = intParams.find("end")->second;
+        FastllmCudaRMSNormPart(input, weight, output, eps, start, end);
+    }
+
+    namespace {
+        bool CudaQwen4ActivationType(DataType type) {
+            return type == DataType::FLOAT32 ||
+                   type == DataType::FLOAT16 ||
+                   type == DataType::BFLOAT16;
+        }
+
+        int CudaQwen4Groups(const IntDict &intParams) {
+            auto it = intParams.find("groups");
+            return it == intParams.end() ? 1 : it->second;
+        }
+    }
+
+    bool CudaQwen4GroupedRMSNormOp::CanRun(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *datas.find("input")->second;
+        Data &weight = *datas.find("weight")->second;
+        const int groups = CudaQwen4Groups(intParams);
+        return !input.dims.empty() && groups > 0 &&
+               input.dims.back() % groups == 0 &&
+               CudaQwen4ActivationType(input.dataType) &&
+               weight.dataType == DataType::FLOAT32 &&
+               weight.Count(0) == (uint64_t)input.dims.back();
+    }
+
+    void CudaQwen4GroupedRMSNormOp::Run(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *datas.find("input")->second;
+        Data &weight = *datas.find("weight")->second;
+        Data &output = *datas.find("output")->second;
+        const int groups = CudaQwen4Groups(intParams);
+        const float eps = floatParams.find("eps") == floatParams.end()
+            ? 1e-6f : floatParams.find("eps")->second;
+        output.Allocate(false);
+        if (!FastllmCudaQwen4GroupedRMSNorm(
+                input, weight, output, eps, groups)) {
+            ErrorInFastLLM(
+                "Qwen4GroupedRMSNorm CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaQwen4PLEGateOp::CanRun(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &key = *datas.find("key")->second;
+        Data &query = *datas.find("query")->second;
+        Data &value = *datas.find("value")->second;
+        const int groups = CudaQwen4Groups(intParams);
+        if (key.dims.empty() || key.dims != query.dims || groups <= 0 ||
+            key.dims.back() % groups != 0 ||
+            key.dataType != query.dataType ||
+            key.dataType != value.dataType ||
+            !CudaQwen4ActivationType(key.dataType)) {
+            return false;
+        }
+        const int channels = key.dims.back();
+        const int rows = (int)(key.Count(0) / channels);
+        return value.Count(0) ==
+            (uint64_t)rows * channels / groups;
+    }
+
+    void CudaQwen4PLEGateOp::Run(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &key = *datas.find("key")->second;
+        Data &query = *datas.find("query")->second;
+        Data &value = *datas.find("value")->second;
+        Data &output = *datas.find("output")->second;
+        const int groups = CudaQwen4Groups(intParams);
+        output.Allocate(false);
+        if (!FastllmCudaQwen4PLEGate(
+                key, query, value, output, groups)) {
+            ErrorInFastLLM(
+                "Qwen4PLEGate CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaQwen4PLECausalConvOp::CanRun(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *datas.find("input")->second;
+        Data &gated = *datas.find("gated")->second;
+        Data &weight = *datas.find("weight")->second;
+        Data &history = *datas.find("history")->second;
+        const int kernel = intParams.find("kernel")->second;
+        const int dilation = intParams.find("dilation")->second;
+        const int historyLength = (kernel - 1) * dilation;
+        return input.dims.size() == 3 && input.dims[0] == 1 &&
+               input.dims == gated.dims && input.dataType == DataType::FLOAT32 &&
+               gated.dataType == DataType::FLOAT32 &&
+               weight.dataType == DataType::FLOAT32 &&
+               history.dataType == DataType::FLOAT32 && kernel > 1 &&
+               dilation > 0 && weight.Count(0) ==
+                   (uint64_t)input.dims.back() * kernel &&
+               history.dims == std::vector<int>({historyLength,
+                                                   input.dims.back()});
+    }
+
+    void CudaQwen4PLECausalConvOp::Run(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *datas.find("input")->second;
+        Data &gated = *datas.find("gated")->second;
+        Data &weight = *datas.find("weight")->second;
+        Data &history = *datas.find("history")->second;
+        Data &output = *datas.find("output")->second;
+        Data &newHistory = *datas.find("newHistory")->second;
+        const int kernel = intParams.find("kernel")->second;
+        const int dilation = intParams.find("dilation")->second;
+        output.Allocate(false);
+        newHistory.Allocate(false);
+        if (!FastllmCudaQwen4PLECausalConv(
+                input, gated, weight, history, output, newHistory,
+                kernel, dilation)) {
+            ErrorInFastLLM(
+                "Qwen4PLECausalConv CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaQwen4HyperMixOp::CanRun(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *datas.find("input")->second;
+        Data &mixLogits = *datas.find("mixLogits")->second;
+        const int groups = CudaQwen4Groups(intParams);
+        auto weightIt = datas.find("weight");
+        if (weightIt != datas.end()) {
+#ifdef CUDA_NO_TENSOR_CORE
+            return false;
+#else
+            Data &weight = *weightIt->second;
+            const int rows = mixLogits.dims.empty() ||
+                mixLogits.dims.back() <= 0 ? 0 :
+                (int)(mixLogits.Count(0) / mixLogits.dims.back());
+            return input.dataType == DataType::FLOAT32 &&
+                   mixLogits.dataType == DataType::FLOAT32 &&
+                   weight.dataType == DataType::FLOAT16 &&
+                   !input.dims.empty() && !mixLogits.dims.empty() &&
+                   weight.dims.size() == 2 && groups > 0 &&
+                   input.dims.back() % groups == 0 &&
+                   (rows >= 8 || (rows == 1 && groups == 4 &&
+                                  weight.dims[0] == 10240 &&
+                                  weight.dims[1] == 320)) &&
+                   mixLogits.Count(0) / mixLogits.dims.back() ==
+                       input.Count(0) / input.dims.back() &&
+                   mixLogits.dims.back() == weight.dims[1] &&
+                   input.dims.back() == weight.dims[0];
+#endif
+        }
+        return !input.dims.empty() && groups > 0 &&
+               input.dims.back() % groups == 0 &&
+               input.dims == mixLogits.dims &&
+               CudaQwen4ActivationType(input.dataType) &&
+               CudaQwen4ActivationType(mixLogits.dataType);
+    }
+
+    void CudaQwen4HyperMixOp::Run(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *datas.find("input")->second;
+        Data &mixLogits = *datas.find("mixLogits")->second;
+        Data &output = *datas.find("output")->second;
+        const int groups = CudaQwen4Groups(intParams);
+        auto weightIt = datas.find("weight");
+        bool ok;
+        if (weightIt == datas.end()) {
+            output.Allocate(false);
+            ok = FastllmCudaQwen4HyperMix(
+                input, mixLogits, output, groups);
+        } else {
+            ok = FastllmCudaQwen4HyperMixProjected(
+                input, mixLogits, *weightIt->second, output, groups);
+        }
+        if (!ok) {
+            ErrorInFastLLM(
+                "Qwen4HyperMix CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaQwen4HyperProjectOp::CanRun(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *datas.find("input")->second;
+        Data &downWeight = *datas.find("downWeight")->second;
+        Data &injectionWeight = *datas.find("injectionWeight")->second;
+        const int groups = CudaQwen4Groups(intParams);
+        auto outputTypeIt = intParams.find("outputType");
+        const DataType outputType = outputTypeIt == intParams.end()
+            ? input.dataType : (DataType)outputTypeIt->second;
+        if (outputType != DataType::FLOAT32 ||
+            downWeight.dataType != DataType::FLOAT16 ||
+            injectionWeight.dataType != DataType::FLOAT16 ||
+            input.dims.empty() || downWeight.dims.size() != 2 ||
+            injectionWeight.dims.size() != 2 || groups <= 0 ||
+            input.dims.back() != downWeight.dims[1] ||
+            input.dims.back() != injectionWeight.dims[1] ||
+            injectionWeight.dims[0] != groups) {
+            return false;
+        }
+        const int rows = (int)(input.Count(0) / input.dims.back());
+        return input.dataType == DataType::FLOAT32 ||
+               (input.dataType == DataType::FLOAT16 && rows >= 8);
+    }
+
+    void CudaQwen4HyperProjectOp::Run(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *datas.find("input")->second;
+        Data &downWeight = *datas.find("downWeight")->second;
+        Data &injectionWeight = *datas.find("injectionWeight")->second;
+        Data &activated = *datas.find("output")->second;
+        Data &injection = *datas.find("injection")->second;
+        const int groups = CudaQwen4Groups(intParams);
+        activated.Allocate(false);
+        injection.Allocate(false);
+        if (!FastllmCudaQwen4HyperProject(
+                input, downWeight, injectionWeight,
+                activated, injection, groups)) {
+            ErrorInFastLLM(
+                "Qwen4HyperProject CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaQwen4HyperPrepareOp::CanRun(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *datas.find("input")->second;
+        const int groups = CudaQwen4Groups(intParams);
+        return !input.dims.empty() && groups > 0 &&
+               CudaQwen4ActivationType(input.dataType);
+    }
+
+    void CudaQwen4HyperPrepareOp::Run(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *datas.find("input")->second;
+        Data &activated = *datas.find("output")->second;
+        const int groups = CudaQwen4Groups(intParams);
+        activated.Allocate(false);
+        if (!FastllmCudaQwen4HyperPrepare(
+                input, activated, groups)) {
+            ErrorInFastLLM(
+                "Qwen4HyperPrepare CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaQwen4HyperInjectOp::CanRun(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *datas.find("input")->second;
+        const int groups = CudaQwen4Groups(intParams);
+        return !input.dims.empty() && groups > 0 &&
+               input.dims.back() == groups &&
+               CudaQwen4ActivationType(input.dataType);
+    }
+
+    void CudaQwen4HyperInjectOp::Run(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *datas.find("input")->second;
+        Data &output = *datas.find("output")->second;
+        const int groups = CudaQwen4Groups(intParams);
+        output.Allocate(false);
+        if (!FastllmCudaQwen4HyperInject(input, output, groups)) {
+            ErrorInFastLLM(
+                "Qwen4HyperInject CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaQwen4HyperCombineOp::CanRun(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *datas.find("input")->second;
+        Data &blockOutput = *datas.find("blockOutput")->second;
+        Data &injection = *datas.find("injection")->second;
+        const int groups = CudaQwen4Groups(intParams);
+        if (input.dims.empty() || groups <= 0 ||
+            input.dims.back() % groups != 0 ||
+            !CudaQwen4ActivationType(input.dataType) ||
+            !CudaQwen4ActivationType(blockOutput.dataType) ||
+            !CudaQwen4ActivationType(injection.dataType)) {
+            return false;
+        }
+        const int rows = (int)(input.Count(0) / input.dims.back());
+        return blockOutput.Count(0) ==
+                   (uint64_t)rows * input.dims.back() / groups &&
+               injection.Count(0) == (uint64_t)rows * groups;
+    }
+
+    void CudaQwen4HyperCombineOp::Run(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *datas.find("input")->second;
+        Data &blockOutput = *datas.find("blockOutput")->second;
+        Data &injection = *datas.find("injection")->second;
+        Data &output = *datas.find("output")->second;
+        const int groups = CudaQwen4Groups(intParams);
+        output.Allocate(false);
+        if (!FastllmCudaQwen4HyperCombine(
+                input, blockOutput, injection, output, groups)) {
+            ErrorInFastLLM(
+                "Qwen4HyperCombine CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaQwen4HyperCombineRMSNormOp::CanRun(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *datas.find("input")->second;
+        Data &blockOutput = *datas.find("blockOutput")->second;
+        Data &injection = *datas.find("injection")->second;
+        Data &weight = *datas.find("weight")->second;
+        const int groups = CudaQwen4Groups(intParams);
+        if (input.dims.empty() || groups <= 0 ||
+            input.dims.back() % groups != 0 ||
+            !CudaQwen4ActivationType(input.dataType) ||
+            !CudaQwen4ActivationType(blockOutput.dataType) ||
+            !CudaQwen4ActivationType(injection.dataType) ||
+            weight.dataType != DataType::FLOAT32 ||
+            weight.Count(0) != (uint64_t)input.dims.back()) {
+            return false;
+        }
+        auto storageIt = datas.find("normalizedStorage");
+        if (storageIt != datas.end()) {
+            auto storageTypeIt = intParams.find("normalizedStorageType");
+            const DataType storageType = storageTypeIt == intParams.end()
+                ? DataType::FLOAT16 : (DataType)storageTypeIt->second;
+            if (!CudaQwen4ActivationType(storageType)) {
+                return false;
+            }
+        }
+        const int rows = (int)(input.Count(0) / input.dims.back());
+        return blockOutput.Count(0) ==
+                   (uint64_t)rows * input.dims.back() / groups &&
+               injection.Count(0) == (uint64_t)rows * groups;
+    }
+
+    void CudaQwen4HyperCombineRMSNormOp::Run(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *datas.find("input")->second;
+        Data &blockOutput = *datas.find("blockOutput")->second;
+        Data &injection = *datas.find("injection")->second;
+        Data &weight = *datas.find("weight")->second;
+        Data &output = *datas.find("output")->second;
+        Data &normalized = *datas.find("normalized")->second;
+        auto storageIt = datas.find("normalizedStorage");
+        Data *normalizedStorage = storageIt == datas.end()
+            ? nullptr : storageIt->second;
+        const int groups = CudaQwen4Groups(intParams);
+        const float eps = floatParams.find("eps") == floatParams.end()
+            ? 1e-6f : floatParams.find("eps")->second;
+        output.Allocate(false);
+        normalized.Allocate(false);
+        if (normalizedStorage != nullptr) {
+            normalizedStorage->Allocate(false);
+        }
+        if (!FastllmCudaQwen4HyperCombineRMSNorm(
+                input, blockOutput, injection, weight,
+                output, normalized, eps, groups,
+                normalizedStorage)) {
+            ErrorInFastLLM(
+                "Qwen4HyperCombineRMSNorm CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaQwen4QSASelectOp::CanRun(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &query = *datas.find("query")->second;
+        Data &compressedKeys = *datas.find("compressedKeys")->second;
+        const int keyLength = intParams.find("keyLength")->second;
+        const int heads = intParams.find("heads")->second;
+        const int headDim = intParams.find("headDim")->second;
+        const int tokenBudget = intParams.find("tokenBudget")->second;
+        const int compressRatio = intParams.find("compressRatio")->second;
+        const auto queryStartIt = intParams.find("queryStart");
+        const int queryStart = queryStartIt == intParams.end()
+            ? -1 : queryStartIt->second;
+        const int completeBlocks = compressRatio > 0
+            ? keyLength / compressRatio : 0;
+        const int rows = heads > 0 && headDim > 0
+            ? (int)(query.Count(0) / ((uint64_t)heads * headDim)) : 0;
+        return CudaQwen4ActivationType(query.dataType) &&
+               compressedKeys.dataType == DataType::FLOAT32 &&
+               compressedKeys.dims.size() == 2 &&
+               compressedKeys.dims[0] >= completeBlocks &&
+               compressedKeys.dims[1] == headDim && heads > 0 && heads <= 32 &&
+               headDim > 0 && tokenBudget > 0 && compressRatio > 0 &&
+               tokenBudget % compressRatio == 0 &&
+               completeBlocks >= tokenBudget / compressRatio &&
+               query.Count(0) % ((uint64_t)heads * headDim) == 0 &&
+               (queryStart == -1 ||
+                (queryStart >= 0 && queryStart + rows <= keyLength));
+    }
+
+    void CudaQwen4QSASelectOp::Run(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &query = *datas.find("query")->second;
+        Data &compressedKeys = *datas.find("compressedKeys")->second;
+        Data &output = *datas.find("output")->second;
+        output.Allocate(false);
+        if (!FastllmCudaQwen4QSASelect(
+                query, compressedKeys, output,
+                intParams.find("keyLength")->second,
+                intParams.find("heads")->second,
+                intParams.find("headDim")->second,
+                intParams.find("tokenBudget")->second,
+                intParams.find("compressRatio")->second,
+                intParams.find("queryStart") == intParams.end()
+                    ? -1 : intParams.find("queryStart")->second)) {
+            ErrorInFastLLM(
+                "Qwen4QSASelect CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaQwen4QSABuildMaskOp::CanRun(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &indices = *datas.find("indices")->second;
+        Data &reference = *datas.find("reference")->second;
+        const int keyLength = intParams.find("keyLength")->second;
+        return indices.dataType == DataType::INT32 &&
+               indices.dims.size() == 2 && indices.dims[0] > 0 &&
+               indices.dims[1] > 0 &&
+               CudaQwen4ActivationType(reference.dataType) &&
+               keyLength > 0;
+    }
+
+    void CudaQwen4QSABuildMaskOp::Run(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &indices = *datas.find("indices")->second;
+        Data &reference = *datas.find("reference")->second;
+        Data &output = *datas.find("output")->second;
+        output.Allocate(false);
+        if (!FastllmCudaQwen4QSABuildMask(
+                indices, reference, output,
+                intParams.find("keyLength")->second)) {
+            ErrorInFastLLM(
+                "Qwen4QSABuildMask CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaQwen4SparseAttentionOp::CanRun(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &query = *datas.find("query")->second;
+        Data &key = *datas.find("key")->second;
+        Data &value = *datas.find("value")->second;
+        Data &indices = *datas.find("indices")->second;
+        const int group = intParams.find("group")->second;
+        return (query.dataType == DataType::FLOAT32 ||
+                query.dataType == DataType::FLOAT16) &&
+               key.dataType == query.dataType &&
+               value.dataType == query.dataType &&
+               indices.dataType == DataType::INT32 &&
+               query.dims.size() == 3 && key.dims.size() == 3 &&
+               value.dims == key.dims && indices.dims.size() == 2 &&
+               group > 0 && query.dims[0] == key.dims[0] * group &&
+               query.dims[1] == indices.dims[0] &&
+               query.dims[2] == key.dims[2] &&
+               query.dims[2] <= 256 && indices.dims[1] <= 3072;
+    }
+
+    void CudaQwen4SparseAttentionOp::Run(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &query = *datas.find("query")->second;
+        Data &key = *datas.find("key")->second;
+        Data &value = *datas.find("value")->second;
+        Data &indices = *datas.find("indices")->second;
+        Data &output = *datas.find("output")->second;
+        const int width = indices.dims[1];
+        const int sequence = query.dims[1];
+        if (sequence > 1) {
+            if (FastllmCudaTryTritonQwen4SparseAttention(
+                    query, key, value, indices,
+                    intParams.find("group")->second,
+                    floatParams.find("scale")->second, output)) {
+                return;
+            }
+            output.Allocate(false);
+            const int tileRows = std::min(
+                sequence, kQwen4SparsePrefillTileRows);
+            for (int rowStart = 0; rowStart < sequence;
+                 rowStart += tileRows) {
+                const int rows = std::min(tileRows, sequence - rowStart);
+                Data packedQuery(query.dataType,
+                                 {rows * query.dims[0], 1, query.dims[2]});
+                Data compactKey(key.dataType,
+                                {rows * key.dims[0], width, key.dims[2]});
+                Data compactValue(value.dataType,
+                                  {rows * value.dims[0], width,
+                                   value.dims[2]});
+                Data paddingMask(query.dataType, {rows, 1, width});
+                packedQuery.ToDevice(DataDevice::CUDA, false);
+                compactKey.ToDevice(DataDevice::CUDA, false);
+                compactValue.ToDevice(DataDevice::CUDA, false);
+                paddingMask.ToDevice(DataDevice::CUDA, false);
+                packedQuery.Allocate(false);
+                compactKey.Allocate(false);
+                compactValue.Allocate(false);
+                paddingMask.Allocate(false);
+                if (!FastllmCudaQwen4PrepareSparseBatch(
+                        query, key, value, indices, packedQuery,
+                        compactKey, compactValue, paddingMask,
+                        rowStart, rows)) {
+                    ErrorInFastLLM(
+                        "Qwen4SparseAttention CUDA error: batched gather "
+                        "rejected input.\n");
+                }
+                Data packedOutput(
+                    query.dataType,
+                    {rows * query.dims[0], 1, value.dims[2]});
+                packedOutput.ToDevice(DataDevice::CUDA, false);
+                DoCudaAttention(
+                    packedQuery, compactKey, compactValue, paddingMask,
+                    packedOutput, intParams.find("group")->second,
+                    floatParams.find("scale")->second, 1);
+                if (!FastllmCudaQwen4UnpackSparseBatch(
+                        packedOutput, output, rowStart, rows)) {
+                    ErrorInFastLLM(
+                        "Qwen4SparseAttention CUDA error: output unpack "
+                        "rejected input.\n");
+                }
+            }
+            return;
+        }
+        Data compactKey(key.dataType,
+                        {key.dims[0], width, key.dims[2]});
+        Data compactValue(value.dataType,
+                          {value.dims[0], width, value.dims[2]});
+        compactKey.ToDevice(DataDevice::CUDA, false);
+        compactValue.ToDevice(DataDevice::CUDA, false);
+        compactKey.Allocate(false);
+        compactValue.Allocate(false);
+        if (!FastllmCudaQwen4GatherKV(
+                key, value, indices, compactKey, compactValue)) {
+            ErrorInFastLLM(
+                "Qwen4SparseAttention CUDA error: KV gather rejected input.\n");
+        }
+        Data emptyMask;
+        DoCudaAttention(
+            query, compactKey, compactValue, emptyMask, output,
+            intParams.find("group")->second,
+            floatParams.find("scale")->second, 1);
+    }
+
+    bool CudaCausalDepthwiseConv1DDecodeOp::CanRun(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *datas.find("input")->second;
+        Data &weight = *datas.find("weight")->second;
+        Data &state = *datas.find("state")->second;
+        const int kernel = intParams.find("kernel")->second;
+        if (!CudaQwen4ActivationType(input.dataType) ||
+            weight.dataType != DataType::FLOAT32 ||
+            state.dataType != DataType::FLOAT32 || kernel <= 0 ||
+            input.dims.size() != 3 || input.dims[2] != 1) {
+            return false;
+        }
+        const int batch = input.dims[0];
+        const int channels = input.dims[1];
+        return batch > 0 && channels > 0 &&
+               weight.Count(0) == (uint64_t)channels * kernel &&
+               (state.dims.empty() ||
+                state.dims == std::vector<int>({batch, channels, kernel}));
+    }
+
+    void CudaCausalDepthwiseConv1DDecodeOp::Run(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *datas.find("input")->second;
+        Data &weight = *datas.find("weight")->second;
+        Data &state = *datas.find("state")->second;
+        Data &output = *datas.find("output")->second;
+        const int kernel = intParams.find("kernel")->second;
+        auto siluIt = intParams.find("silu");
+        const bool silu = siluIt != intParams.end() && siluIt->second != 0;
+        const bool initializeState = state.cudaData == nullptr;
+        state.Allocate(false);
+        output.Allocate(false);
+        if (!FastllmCudaCausalDepthwiseConv1DDecode(
+                input, weight, state, output,
+                kernel, silu, initializeState)) {
+            ErrorInFastLLM(
+                "CausalDepthwiseConv1DDecode CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaCausalDepthwiseConv1DPrefillOp::CanRun(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *datas.find("input")->second;
+        Data &weight = *datas.find("weight")->second;
+        Data &state = *datas.find("state")->second;
+        const int kernel = intParams.find("kernel")->second;
+        auto outputTypeIt = intParams.find("outputType");
+        const DataType outputType = outputTypeIt == intParams.end()
+            ? DataType::FLOAT32 : (DataType)outputTypeIt->second;
+        if (!CudaQwen4ActivationType(input.dataType) ||
+            weight.dataType != DataType::FLOAT32 ||
+            state.dataType != DataType::FLOAT32 || kernel <= 0 ||
+            !CudaQwen4ActivationType(outputType) ||
+            input.dims.size() != 3 || input.dims[1] <= 0) {
+            return false;
+        }
+        const int batch = input.dims[0];
+        const int channels = input.dims[2];
+        return batch > 0 && channels > 0 &&
+               weight.Count(0) == (uint64_t)channels * kernel &&
+               (state.dims.empty() ||
+                state.dims == std::vector<int>({batch, channels, kernel}));
+    }
+
+    void CudaCausalDepthwiseConv1DPrefillOp::Run(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *datas.find("input")->second;
+        Data &weight = *datas.find("weight")->second;
+        Data &state = *datas.find("state")->second;
+        Data &output = *datas.find("output")->second;
+        const int kernel = intParams.find("kernel")->second;
+        auto siluIt = intParams.find("silu");
+        const bool silu = siluIt != intParams.end() && siluIt->second != 0;
+        const bool initializeState = state.cudaData == nullptr;
+        state.Allocate(false);
+        output.Allocate(false);
+        if (!FastllmCudaCausalDepthwiseConv1DPrefill(
+                input, weight, state, output,
+                kernel, silu, initializeState)) {
+            ErrorInFastLLM(
+                "CausalDepthwiseConv1DPrefill CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaQwen4GatedDeltaRuleDecodeOp::CanRun(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &qkv = *datas.find("input")->second;
+        Data &alpha = *datas.find("alpha")->second;
+        Data &beta = *datas.find("beta")->second;
+        Data &aLog = *datas.find("aLog")->second;
+        Data &dtBias = *datas.find("dtBias")->second;
+        Data &state = *datas.find("state")->second;
+        const int keyHeads = intParams.find("keyHeads")->second;
+        const int valueHeads = intParams.find("valueHeads")->second;
+        const int keyDim = intParams.find("keyDim")->second;
+        const int valueDim = intParams.find("valueDim")->second;
+        const int batch = qkv.dims.empty() ? 0 : qkv.dims[0];
+        const int sequence = qkv.dims.size() == 3 ? qkv.dims[1] : 0;
+        const int qkvChannels = 2 * keyHeads * keyDim +
+                                valueHeads * valueDim;
+        return qkv.dataType == DataType::FLOAT32 &&
+               state.dataType == DataType::FLOAT32 &&
+               aLog.dataType == DataType::FLOAT32 &&
+               dtBias.dataType == DataType::FLOAT32 &&
+               CudaQwen4ActivationType(alpha.dataType) &&
+               beta.dataType == alpha.dataType &&
+               keyHeads > 0 && valueHeads > 0 &&
+               valueHeads % keyHeads == 0 &&
+               keyDim == 128 && valueDim == 128 &&
+               qkv.dims.size() == 3 && sequence > 0 &&
+               qkv.dims[2] == qkvChannels &&
+               alpha.Count(0) ==
+                   (uint64_t)batch * sequence * valueHeads &&
+               beta.Count(0) ==
+                   (uint64_t)batch * sequence * valueHeads &&
+               aLog.Count(0) == (uint64_t)valueHeads &&
+               dtBias.Count(0) == (uint64_t)valueHeads &&
+               state.dims == std::vector<int>({batch, valueHeads,
+                                               keyDim, valueDim});
+    }
+
+    void CudaQwen4GatedDeltaRuleDecodeOp::Run(
+            const std::string &opType, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &qkv = *datas.find("input")->second;
+        Data &alpha = *datas.find("alpha")->second;
+        Data &beta = *datas.find("beta")->second;
+        Data &aLog = *datas.find("aLog")->second;
+        Data &dtBias = *datas.find("dtBias")->second;
+        Data &state = *datas.find("state")->second;
+        Data &output = *datas.find("output")->second;
+        auto stateOutputIt = datas.find("stateOutput");
+        Data *stateOutput = stateOutputIt == datas.end()
+            ? nullptr : stateOutputIt->second;
+        const int keyHeads = intParams.find("keyHeads")->second;
+        const int valueHeads = intParams.find("valueHeads")->second;
+        const int keyDim = intParams.find("keyDim")->second;
+        const int valueDim = intParams.find("valueDim")->second;
+        const float recurrentEps =
+            floatParams.find("recurrentEps")->second;
+        output.Allocate(false);
+        if (stateOutput != nullptr) {
+            stateOutput->Allocate(false);
+        }
+        if (!FastllmCudaQwen4GatedDeltaRuleDecode(
+                qkv, alpha, beta, aLog, dtBias, state, output,
+                keyHeads, valueHeads, keyDim, valueDim, recurrentEps,
+                stateOutput)) {
+            ErrorInFastLLM(
+                "GatedDeltaRuleSequence CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    namespace {
+        bool CudaKimiK3HasType(const DataDict &datas, const char *name,
+                               DataType type) {
+            auto it = datas.find(name);
+            return it != datas.end() && it->second != nullptr &&
+                   it->second->dataType == type;
+        }
+    }
+
+    bool CudaKimiK3RMSNormOp::CanRun(
+            const std::string &, const DataDict &datas,
+            const FloatDict &, const IntDict &) {
+        return CudaKimiK3HasType(datas, "input", DataType::BFLOAT16) &&
+               CudaKimiK3HasType(datas, "weight", DataType::FLOAT32);
+    }
+
+    void CudaKimiK3RMSNormOp::Run(
+            const std::string &, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &) {
+        Data &input = *datas.find("input")->second;
+        Data &weight = *datas.find("weight")->second;
+        Data &output = *datas.find("output")->second;
+        float eps = floatParams.find("eps") == floatParams.end() ?
+                    1e-5f : floatParams.find("eps")->second;
+        AssertInFastLLM(!input.dims.empty() &&
+                        weight.Count(0) == (uint64_t)input.dims.back(),
+                        "CUDA KimiK3RMSNorm shape mismatch.");
+        output.Allocate(false);
+        AssertInFastLLM(
+            FastllmCudaKimiK3RMSNorm(input, weight, output, eps),
+            "CUDA KimiK3RMSNorm launch failed.");
+    }
+
+    bool CudaKimiK3CausalConv1DOp::CanRun(
+            const std::string &, const DataDict &datas,
+            const FloatDict &, const IntDict &) {
+        return CudaKimiK3HasType(datas, "input", DataType::BFLOAT16) &&
+               CudaKimiK3HasType(datas, "weight", DataType::FLOAT32);
+    }
+
+    void CudaKimiK3CausalConv1DOp::Run(
+            const std::string &, const DataDict &datas,
+            const FloatDict &, const IntDict &intParams) {
+        Data &input = *datas.find("input")->second;
+        Data &weight = *datas.find("weight")->second;
+        Data &output = *datas.find("output")->second;
+        auto cacheIt = datas.find("cache");
+        Data *cache = cacheIt == datas.end() ? nullptr : cacheIt->second;
+        int kernelSize = intParams.find("kernelSize")->second;
+        AssertInFastLLM(
+            input.dims.size() == 3 && weight.dims.size() == 3 &&
+            weight.dims[1] == 1 && weight.dims[2] == kernelSize &&
+            input.dims[2] == weight.dims[0] && kernelSize > 0,
+            "CUDA KimiK3CausalConv1D shape mismatch.");
+        bool initializeCache = cache != nullptr && cache->cudaData == nullptr;
+        if (cache != nullptr) {
+            cache->Allocate(false);
+        }
+        output.Allocate(false);
+        AssertInFastLLM(
+            FastllmCudaKimiK3CausalConv1D(
+                input, weight, cache, output, kernelSize, initializeCache),
+            "CUDA KimiK3CausalConv1D launch failed.");
+    }
+
+    bool CudaKimiK3UpdatePackedConvCacheOp::CanRun(
+            const std::string &, const DataDict &datas,
+            const FloatDict &, const IntDict &) {
+        return CudaKimiK3HasType(datas, "q", DataType::BFLOAT16) &&
+               CudaKimiK3HasType(datas, "k", DataType::BFLOAT16) &&
+               CudaKimiK3HasType(datas, "v", DataType::BFLOAT16) &&
+               CudaKimiK3HasType(datas, "cache", DataType::BFLOAT16);
+    }
+
+    void CudaKimiK3UpdatePackedConvCacheOp::Run(
+            const std::string &, const DataDict &datas,
+            const FloatDict &, const IntDict &intParams) {
+        Data &q = *datas.find("q")->second;
+        Data &k = *datas.find("k")->second;
+        Data &v = *datas.find("v")->second;
+        Data &cache = *datas.find("cache")->second;
+        const int history = intParams.find("history")->second;
+        const int tokens = intParams.find("tokens")->second;
+        AssertInFastLLM(
+            FastllmCudaKimiK3UpdatePackedConvCache(
+                q, k, v, cache, history, tokens),
+            "CUDA KimiK3UpdatePackedConvCache launch failed.");
+    }
+
+    bool CudaKimiK3L2NormOp::CanRun(
+            const std::string &, const DataDict &datas,
+            const FloatDict &, const IntDict &) {
+        return CudaKimiK3HasType(datas, "input", DataType::BFLOAT16);
+    }
+
+    void CudaKimiK3L2NormOp::Run(
+            const std::string &, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &) {
+        Data &input = *datas.find("input")->second;
+        Data &output = *datas.find("output")->second;
+        float eps = floatParams.find("eps") == floatParams.end() ?
+                    1e-6f : floatParams.find("eps")->second;
+        output.Allocate(false);
+        AssertInFastLLM(
+            FastllmCudaKimiK3L2Norm(input, output, eps),
+            "CUDA KimiK3L2Norm launch failed.");
+    }
+
+    bool CudaKimiK3RecurrentKDAOp::CanRun(
+            const std::string &, const DataDict &datas,
+            const FloatDict &, const IntDict &) {
+        return CudaKimiK3HasType(datas, "q", DataType::BFLOAT16) &&
+               CudaKimiK3HasType(datas, "k", DataType::BFLOAT16) &&
+               CudaKimiK3HasType(datas, "v", DataType::BFLOAT16) &&
+               CudaKimiK3HasType(datas, "rawGate", DataType::BFLOAT16) &&
+               CudaKimiK3HasType(datas, "rawBeta", DataType::FLOAT32) &&
+               CudaKimiK3HasType(datas, "aLog", DataType::FLOAT32) &&
+               CudaKimiK3HasType(datas, "dtBias", DataType::FLOAT32);
+    }
+
+    void CudaKimiK3RecurrentKDAOp::Run(
+            const std::string &, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &q = *datas.find("q")->second;
+        Data &k = *datas.find("k")->second;
+        Data &v = *datas.find("v")->second;
+        Data &rawGate = *datas.find("rawGate")->second;
+        Data &rawBeta = *datas.find("rawBeta")->second;
+        Data &aLog = *datas.find("aLog")->second;
+        Data &dtBias = *datas.find("dtBias")->second;
+        Data &state = *datas.find("state")->second;
+        Data &output = *datas.find("output")->second;
+        Data &decay = *datas.find("decay")->second;
+        Data &beta = *datas.find("beta")->second;
+        float lowerBound =
+            floatParams.find("lowerBound") == floatParams.end() ?
+            -5.0f : floatParams.find("lowerBound")->second;
+        const bool stateOnly =
+            intParams.find("stateOnly") != intParams.end() &&
+            intParams.find("stateOnly")->second != 0;
+        const bool outputAux =
+            intParams.find("outputAux") == intParams.end() ||
+            intParams.find("outputAux")->second != 0;
+        const int tokenLimit =
+            intParams.find("tokenLimit") == intParams.end() ? -1 :
+            intParams.find("tokenLimit")->second;
+        const bool normalizeQKInFp32 =
+            intParams.find("normalizeQKInFp32") != intParams.end() &&
+            intParams.find("normalizeQKInFp32")->second != 0;
+        const bool roundBetaToBfloat16 =
+            intParams.find("roundBetaToBfloat16") != intParams.end() &&
+            intParams.find("roundBetaToBfloat16")->second != 0;
+        AssertInFastLLM(
+            q.dims.size() == 4 && q.dims == k.dims && q.dims == v.dims &&
+            q.dims == rawGate.dims,
+            "CUDA KimiK3RecurrentKDA q/k/v/g shape mismatch.");
+        bool initializeState = state.cudaData == nullptr;
+        state.Allocate(false);
+        if (!stateOnly) {
+            output.Allocate(false);
+            if (outputAux) {
+                decay.Allocate(false);
+                beta.Allocate(false);
+            }
+        }
+        AssertInFastLLM(
+            FastllmCudaKimiK3RecurrentKDA(
+                q, k, v, rawGate, rawBeta, aLog, dtBias, state, output,
+                decay, beta, lowerBound, initializeState,
+                tokenLimit, stateOnly, outputAux, normalizeQKInFp32,
+                roundBetaToBfloat16),
+            "CUDA KimiK3RecurrentKDA launch failed.");
+    }
+
+    bool CudaKimiK3RMSNormSigmoidGateOp::CanRun(
+            const std::string &, const DataDict &datas,
+            const FloatDict &, const IntDict &) {
+        return CudaKimiK3HasType(datas, "input", DataType::BFLOAT16) &&
+               CudaKimiK3HasType(datas, "gate", DataType::BFLOAT16) &&
+               CudaKimiK3HasType(datas, "weight", DataType::FLOAT32);
+    }
+
+    void CudaKimiK3RMSNormSigmoidGateOp::Run(
+            const std::string &, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &) {
+        Data &input = *datas.find("input")->second;
+        Data &gate = *datas.find("gate")->second;
+        Data &weight = *datas.find("weight")->second;
+        Data &output = *datas.find("output")->second;
+        float eps = floatParams.find("eps") == floatParams.end() ?
+                    1e-5f : floatParams.find("eps")->second;
+        AssertInFastLLM(input.dims == gate.dims && !input.dims.empty() &&
+                        weight.Count(0) == (uint64_t)input.dims.back(),
+                        "CUDA KimiK3RMSNormSigmoidGate shape mismatch.");
+        output.Allocate(false);
+        AssertInFastLLM(
+            FastllmCudaKimiK3RMSNormSigmoidGate(
+                input, gate, weight, output, eps),
+            "CUDA KimiK3RMSNormSigmoidGate launch failed.");
+    }
+
+    bool CudaKimiK3AttnResOp::CanRun(
+            const std::string &, const DataDict &datas,
+            const FloatDict &, const IntDict &) {
+        return CudaKimiK3HasType(datas, "prefixSum", DataType::BFLOAT16) &&
+               CudaKimiK3HasType(datas, "blockResidual", DataType::BFLOAT16) &&
+               CudaKimiK3HasType(datas, "projection", DataType::FLOAT32) &&
+               CudaKimiK3HasType(datas, "norm", DataType::FLOAT32);
+    }
+
+    void CudaKimiK3AttnResOp::Run(
+            const std::string &, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &) {
+        Data &prefixSum = *datas.find("prefixSum")->second;
+        Data &blockResidual = *datas.find("blockResidual")->second;
+        Data &projection = *datas.find("projection")->second;
+        Data &norm = *datas.find("norm")->second;
+        Data &output = *datas.find("output")->second;
+        float eps = floatParams.find("eps") == floatParams.end() ?
+                    1e-5f : floatParams.find("eps")->second;
+        int dimension = prefixSum.dims.back();
+        int rows = (int)(prefixSum.Count(0) / dimension);
+        AssertInFastLLM(
+            blockResidual.dims.size() == 3 &&
+            blockResidual.dims[0] == rows &&
+            blockResidual.dims[2] == dimension &&
+            blockResidual.dims[1] > 0 &&
+            projection.Count(0) == (uint64_t)dimension &&
+            norm.Count(0) == (uint64_t)dimension,
+            "CUDA KimiK3AttnRes shape mismatch.");
+        output.Allocate(false);
+        AssertInFastLLM(
+            FastllmCudaKimiK3AttnRes(
+                prefixSum, blockResidual, projection, norm, output, eps),
+            "CUDA KimiK3AttnRes launch failed.");
+    }
+
+    bool CudaKimiK3SiTUAndMulOp::CanRun(
+            const std::string &, const DataDict &datas,
+            const FloatDict &, const IntDict &) {
+        return CudaKimiK3HasType(datas, "gate", DataType::BFLOAT16) &&
+               CudaKimiK3HasType(datas, "up", DataType::BFLOAT16);
+    }
+
+    void CudaKimiK3SiTUAndMulOp::Run(
+            const std::string &, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &) {
+        Data &gate = *datas.find("gate")->second;
+        Data &up = *datas.find("up")->second;
+        Data &output = *datas.find("output")->second;
+        float beta = floatParams.find("beta") == floatParams.end() ?
+                     1.0f : floatParams.find("beta")->second;
+        float linearBeta =
+            floatParams.find("linearBeta") == floatParams.end() ?
+            0.0f : floatParams.find("linearBeta")->second;
+        AssertInFastLLM(gate.dims == up.dims && beta > 0.0f,
+                        "CUDA KimiK3SiTUAndMul shape/parameter mismatch.");
+        output.Allocate(false);
+        AssertInFastLLM(
+            FastllmCudaKimiK3SiTUAndMul(
+                gate, up, output, beta, linearBeta),
+            "CUDA KimiK3SiTUAndMul launch failed.");
+    }
+
+    bool CudaKimiK3CausalAttentionOp::CanRun(
+            const std::string &, const DataDict &datas,
+            const FloatDict &, const IntDict &) {
+        return CudaKimiK3HasType(datas, "q", DataType::BFLOAT16) &&
+               CudaKimiK3HasType(datas, "k", DataType::BFLOAT16) &&
+               CudaKimiK3HasType(datas, "v", DataType::BFLOAT16);
+    }
+
+    void CudaKimiK3CausalAttentionOp::Run(
+            const std::string &, const DataDict &datas,
+            const FloatDict &floatParams, const IntDict &) {
+        Data &q = *datas.find("q")->second;
+        Data &k = *datas.find("k")->second;
+        Data &v = *datas.find("v")->second;
+        Data &output = *datas.find("output")->second;
+        float scale = floatParams.find("scale") == floatParams.end() ?
+                      1.0f : floatParams.find("scale")->second;
+        bool standardCache = k.dims.size() == 3 && v.dims.size() == 3;
+        bool currentTensors = k.dims.size() == 4 && v.dims.size() == 4;
+        AssertInFastLLM(q.dims.size() == 4 &&
+                        (standardCache || currentTensors),
+                        "CUDA KimiK3CausalAttention q/k/v rank mismatch.");
+        output.Allocate(false);
+        AssertInFastLLM(
+            FastllmCudaKimiK3CausalAttention(q, k, v, output, scale),
+            "CUDA KimiK3CausalAttention launch failed.");
+    }
+
+    bool CudaLayerNormOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        int axis = intParams.find("axis") != intParams.end() ? intParams.find("axis")->second : -1;
+        int dimsLen = input.dims.size();
+        axis = (axis % dimsLen + dimsLen) % dimsLen;
+        int inner = input.strides[axis];
+        return inner == 1;
+    }
+
+    void CudaLayerNormOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                             const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        Data &gamma = *(datas.find("gamma")->second);
+        Data &beta = *(datas.find("beta")->second);
+        int axis = intParams.find("axis") != intParams.end() ? intParams.find("axis")->second : -1;
+
+        int dimsLen = input.dims.size();
+        axis = (axis % dimsLen + dimsLen) % dimsLen;
+        output.Allocate();
+        FastllmCudaLayerNorm(input, gamma, beta, output, axis);
+    }
+
+    bool CudaEmbedding::CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams) {
+        if (GetLowMemMode() || !GetCudaEmbedding()) {
+            return false;
+        }
+        Data &input = *(datas.find("input")->second);
+        if (input.dataType != DataType::FLOAT32) {
+            return false;
+        }
+        return true;
+    }
+
+    void CudaEmbedding::Run(const std::string &opType, const fastllm::DataDict &datas,
+                               const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        Data &weight = *(datas.find("weight")->second);;
+        output.Allocate();
+
+        FastllmCudaEmbedding(input, weight, output);
+    }
+
+    bool CudaEmbeddingDirect::CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams) {
+        if (GetLowMemMode() || (!GetCudaEmbedding())) {
+            return false;
+        }
+        Data &input = *(datas.find("input")->second);
+        if (input.dataType != DataType::FLOAT32) {
+            return false;
+        }
+        return true;
+    }
+
+    void CudaEmbeddingDirect::Run(const std::string &opType, const fastllm::DataDict &datas,
+                               const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        Data &weight = *(datas.find("weight")->second);;
+        output.Allocate();
+
+        FastllmCudaEmbeddingDirect(input, weight, output);
+    }
+
+    void CudaConv1DPerChannel::Run(const std::string &opType, const fastllm::DataDict &datas,
+                      const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        Data &weight = *(datas.find("weight")->second);
+        Data &bias = *(datas.find("bias")->second);
+
+        int inputChannels = intParams.find("inputChannels")->second;    
+        int outputChannels = intParams.find("outputChannels")->second; 
+        int kernelSize = intParams.find("kernel")->second;
+        int padding = intParams.find("pad")->second; 
+        int stride = intParams.find("stride")->second;
+        int groups = inputChannels;  // 组数等于通道数，实现逐通道卷积
+
+        output.Allocate(false);
+        FastllmCudaConv1DPerChannelFloat32(input, weight, bias, inputChannels, outputChannels, kernelSize, stride, padding, output);
+    }
+
+    void CudaConv2DOp::Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        Data &weight = *(datas.find("weight")->second);
+        Data &bias = *(datas.find("bias")->second);
+
+        output.Allocate();
+
+        int inputChannels = intParams.find("inputChannels")->second;
+        int outputChannels = intParams.find("outputChannels")->second;
+        int kernelH = intParams.find("kernelH")->second;
+        int kernelW = intParams.find("kernelW")->second;
+        int padH = intParams.find("padH")->second;
+        int padW = intParams.find("padW")->second;
+        int strideH = intParams.find("strideH")->second;
+        int strideW = intParams.find("strideW")->second;
+        
+        std::vector <int> dims = input.dims;
+        int inputHeight = dims[2], inputWidth = dims[3];
+        int outputHeight = (inputHeight + padH + padH - kernelH) / strideH + 1;
+        int outputWidth = (inputWidth + padW + padW - kernelW) / strideW + 1;
+
+        FastllmCudaConv2DFloat32(input, weight, bias, inputChannels, outputChannels, kernelH, kernelW, strideH, strideW, padH, padW, output);
+    }
+
+    void DoCudaLinearReshape(Data &input, Data &weight, Data &output) {
+        weight.weightType = WeightType::LINEAR;
+        std::vector <int> dims = input.dims;
+        dims.back() = weight.dims[0];
+
+        output.dataType = input.dataType;
+        output.Resize(dims);
+    }
+
+    void CudaLinearOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                               const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        Data &weight = *(datas.find("weight")->second);
+
+        AssertInFastLLM(weight.dims.size() == 2, "Linear's weight's shape's size should be 2.\n");
+        AssertInFastLLM(input.dims.back() == weight.dims[1], "Linear's weight's shape error.\n");
+        DoCudaLinearReshape(input, weight, output);
+    }
+
+    bool CudaLinearOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                              const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        if (intParams.find("exType") != intParams.end()) {
+            return false;
+        }
+        return true;
+    }
+
+    bool IsCudaLinearDataTypeSupported(DataType inputType, DataType weightType, DataType biasType) {
+        if (biasType != DataType::FLOAT32) {
+            return false;
+        }
+        if (inputType == DataType::FLOAT16) {
+            return weightType == DataType::FLOAT32 ||
+                   weightType == DataType::FLOAT16 ||
+                   weightType == DataType::BFLOAT16 ||
+                   weightType == DataType::INT8 ||
+                   weightType == DataType::INT4_GROUP ||
+                   weightType == DataType::INT4_GROUP32 ||
+                   weightType == DataType::INT4_GROUP128 ||
+                   weightType == DataType::INT4_NOZERO ||
+                   weightType == DataType::FP8_E4M3 ||
+                   weightType == DataType::FP8_E4M3_BLOCK_128 ||
+                   weightType == DataType::FP8_E4M3_PERCHANNEL ||
+                   weightType == DataType::NVFP4 ||
+                   weightType == DataType::NVFP4_BLOCK_16 ||
+                   weightType == DataType::NVFP4_BLOCK_16_PLANAR ||
+                   weightType == DataType::NVFP4_BLOCK_16_E8M0 ||
+                   weightType == DataType::NVFP4_BLOCK_32_E8M0 ||
+                   weightType == DataType::DATA_GGUF_FORMAT;
+        }
+        if (inputType == DataType::FLOAT32) {
+            return weightType == DataType::FLOAT32 ||
+                   weightType == DataType::FLOAT16 ||
+                   weightType == DataType::BFLOAT16 ||
+                   weightType == DataType::INT8 ||
+                   weightType == DataType::INT4 ||
+                   weightType == DataType::INT4_NOZERO ||
+                   weightType == DataType::INT4_GROUP ||
+                   weightType == DataType::INT4_GROUP32 ||
+                   weightType == DataType::FP8_E4M3 ||
+                   weightType == DataType::FP8_E4M3_BLOCK_128 ||
+                   weightType == DataType::FP8_E4M3_PERCHANNEL ||
+                   weightType == DataType::NVFP4 ||
+                   weightType == DataType::NVFP4_BLOCK_16 ||
+                   weightType == DataType::NVFP4_BLOCK_16_PLANAR ||
+                   weightType == DataType::NVFP4_BLOCK_16_E8M0 ||
+                   weightType == DataType::NVFP4_BLOCK_32_E8M0 ||
+                   weightType == DataType::DATA_GGUF_FORMAT;
+        }
+        if (inputType == DataType::BFLOAT16) {
+            return weightType == DataType::BFLOAT16 ||
+                   weightType == DataType::FLOAT32 ||
+                   weightType == DataType::FLOAT16 ||
+                   weightType == DataType::INT4_GROUP32 ||
+                   weightType == DataType::FP8_E4M3 ||
+                   weightType == DataType::FP8_E4M3_BLOCK_128 ||
+                   weightType == DataType::FP8_E4M3_PERCHANNEL ||
+                   weightType == DataType::NVFP4 ||
+                   weightType == DataType::NVFP4_BLOCK_16 ||
+                   weightType == DataType::NVFP4_BLOCK_16_PLANAR ||
+                   weightType == DataType::NVFP4_BLOCK_16_E8M0 ||
+                   weightType == DataType::NVFP4_BLOCK_32_E8M0 ||
+                   weightType == DataType::DATA_GGUF_FORMAT;
+        }
+        return false;
+    }
+
+    void DoCudaLinear(Data &input, Data &weight, const Data &bias, Data &output) {
+        output.Allocate(false);
+        int n = input.Count(0) / input.dims.back();
+        int m = input.dims.back();
+        int k = output.dims.back();
+        std::string dataTypeInfo = " input.dataType = " + GetDataTypeName(input.dataType) +
+                                   ", weight.dataType = " + GetDataTypeName(weight.dataType) +
+                                   ", bias.dataType = " + GetDataTypeName(bias.dataType) + ".";
+        if (!IsCudaLinearDataTypeSupported(input.dataType, weight.dataType, bias.dataType)) {
+            ErrorInFastLLM("Linear error: unsupported dataType combination." + dataTypeInfo);
+        } else if (input.dataType == DataType::FLOAT16) {
+            if (weight.dataType == DataType::FLOAT32) {
+                FastllmCudaHalfMatMulFloat32(input, weight, bias, output, n, m, k);
+            } else if (weight.dataType == DataType::FLOAT16) {
+                FastllmCudaHalfMatMulFloat16(input, weight, bias, output, n, m, k);
+            } else if (weight.dataType == DataType::BFLOAT16) {
+                FastllmCudaHalfMatMulBFloat16(input, weight, bias, output, n, m, k);
+            } else if (weight.dataType == DataType::INT8) {
+                FastllmCudaHalfMatMulFloatInt8(input, weight, bias, output, n, m, k);
+            } else if (weight.dataType == DataType::INT4_GROUP) {
+                FastllmCudaHalfMatMulFloatInt4Group(input, weight, bias, output, n, m, k);
+            } else if (weight.dataType == DataType::INT4_GROUP32) {
+                FastllmCudaHalfMatMulFloatInt4Group32(input, weight, bias, output, n, m, k);
+            } else if (weight.dataType == DataType::INT4_GROUP128) {
+                FastllmCudaHalfMatMulFloatInt4Group128(input, weight, bias, output, n, m, k);
+            } else if (weight.dataType == DataType::INT4_NOZERO) {
+                FastllmCudaHalfMatMulFloatInt4NoZero(input, weight, bias, output, n, m, k);
+            } else if (weight.dataType == DataType::FP8_E4M3) {
+                if (
+#ifdef FASTLLM_ENABLE_DEEPGEMM_FP8_SM90
+                    !TryCudaDeepGemmLinearFp8Sm90(input, weight, bias, output, n, m, k) &&
+#endif
+                    !TryCudaCutlassLinearFp8PerChannel(input, weight, bias, output, n, m, k) &&
+                    !TryCudaCutlassLinearFp8Block128(input, weight, bias, output, n, m, k) &&
+                    !TryCudaTritonLinearFp8Block128(input, weight, bias, output, n, m, k)) {
+                    TraceCudaLinearFp8Path("native-fp8-e4m3", n, m, k);
+                    FastllmCudaHalfMatMulFloatFP8E4M3(input, weight, bias, output, n, m, k);
+                }
+            } else if (weight.dataType == DataType::FP8_E4M3_BLOCK_128) {
+                if (!TryCudaTritonLinearFp8Block128(input, weight, bias, output, n, m, k)) {
+                    TraceCudaLinearFp8Path("native-fp8-e4m3-packed-block128", n, m, k);
+                    FastllmCudaHalfMatMulFloatFP8E4M3Block128(input, weight, bias, output, n, m, k);
+                }
+            } else if (weight.dataType == DataType::FP8_E4M3_PERCHANNEL) {
+                TraceCudaLinearFp8Path("native-fp8-e4m3-packed-perchannel", n, m, k);
+                FastllmCudaHalfMatMulFloatFP8E4M3PerChannel(input, weight, bias, output, n, m, k);
+            } else if (weight.dataType == DataType::NVFP4) {
+                FastllmCudaHalfMatMulFloatNVFP4(input, weight, bias, output, n, m, k);
+            } else if (weight.dataType == DataType::NVFP4_BLOCK_16 ||
+                       weight.dataType == DataType::NVFP4_BLOCK_16_PLANAR) {
+                FastllmCudaHalfMatMulFloatNVFP4Block16(input, weight, bias, output, n, m, k);
+            } else if (weight.dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
+                       weight.dataType == DataType::NVFP4_BLOCK_32_E8M0) {
+                FastllmCudaHalfMatMulFloatNVFP4Block16E8M0(input, weight, bias, output, n, m, k);
+            } else if (weight.dataType == DataType::DATA_GGUF_FORMAT) {
+                FastllmCudaHalfMatMulGGUF(input, weight, bias, output, n, m, k);
+            } else {
+                ErrorInFastLLM("Linear error: unsupport weight's dataType." + dataTypeInfo);
+            }
+        } else if (input.dataType == DataType::FLOAT32) {
+            if (weight.dataType == DataType::FLOAT32) {
+                FastllmCudaMatMulFloat32(input, weight, bias, output, n, m, k);
+            } else if (weight.dataType == DataType::FLOAT16) {
+                FastllmCudaMatMulFloat16(input, weight, bias, output, n, m, k);
+            } else if (weight.dataType == DataType::BFLOAT16) {
+                FastllmCudaMatMulBFloat16(input, weight, bias, output, n, m, k);
+            } else if (weight.dataType == DataType::INT8) {
+                FastllmCudaMatMulFloatInt8(input, weight, bias, output, n, m, k);
+            } else if (weight.dataType == DataType::INT4) {
+                FastllmCudaMatMulFloatInt4(input, weight, bias, output, n, m, k);
+            } else if (weight.dataType == DataType::INT4_NOZERO) {
+                FastllmCudaMatMulFloatInt4NoZero(input, weight, bias, output, n, m, k);
+            } else if (weight.dataType == DataType::INT4_GROUP) {
+                FastllmCudaMatMulFloatInt4Group(input, weight, bias, output, n, m, k);
+            } else if (weight.dataType == DataType::INT4_GROUP32) {
+                FastllmCudaMatMulFloatInt4Group32(input, weight, bias, output, n, m, k);
+            } else if (weight.dataType == DataType::FP8_E4M3) {
+                FastllmCudaMatMulFloatFP8E4M3(input, weight, bias, output, n, m, k);
+            } else if (weight.dataType == DataType::DATA_GGUF_FORMAT) {
+                FastllmCudaMatMulFloatGGUF(input, weight, bias, output, n, m, k);
+            } else if (weight.dataType == DataType::FP8_E4M3_BLOCK_128) {
+                FastllmCudaMatMulFloatFP8E4M3Block128(input, weight, bias, output, n, m, k);
+            } else if (weight.dataType == DataType::FP8_E4M3_PERCHANNEL) {
+                FastllmCudaMatMulFloatFP8E4M3PerChannel(input, weight, bias, output, n, m, k);
+            } else if (weight.dataType == DataType::NVFP4) {
+                FastllmCudaMatMulFloatNVFP4(input, weight, bias, output, n, m, k);
+            } else if (weight.dataType == DataType::NVFP4_BLOCK_16 ||
+                       weight.dataType == DataType::NVFP4_BLOCK_16_PLANAR) {
+                FastllmCudaMatMulFloatNVFP4Block16(input, weight, bias, output, n, m, k);
+            } else if (weight.dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
+                       weight.dataType == DataType::NVFP4_BLOCK_32_E8M0) {
+                FastllmCudaMatMulFloatNVFP4Block16E8M0(input, weight, bias, output, n, m, k);
+            } else {
+                ErrorInFastLLM("Linear error: unsupport weight's dataType." + dataTypeInfo);
+            }
+        } else if (input.dataType == DataType::BFLOAT16) {
+            if (weight.dataType == DataType::BFLOAT16) {
+                FastllmCudaBFloat16MatMulBFloat16(input, weight, bias, output, n, m, k);
+            } else if (weight.dataType == DataType::FLOAT32) {
+                FastllmCudaBFloat16MatMulFloat32(input, weight, bias, output, n, m, k);
+            } else if (weight.dataType == DataType::FLOAT16) {
+                FastllmCudaBFloat16MatMulFloat16(input, weight, bias, output, n, m, k);
+            } else if (weight.dataType == DataType::INT4_GROUP32) {
+                FastllmCudaBFloat16MatMulInt4Group32(input, weight, bias, output, n, m, k);
+            } else if (weight.dataType == DataType::FP8_E4M3) {
+                if (
+#ifdef FASTLLM_ENABLE_DEEPGEMM_FP8_SM90
+                    !TryCudaDeepGemmLinearFp8Sm90(input, weight, bias, output, n, m, k) &&
+#endif
+                    !TryCudaCutlassLinearFp8PerChannel(input, weight, bias, output, n, m, k) &&
+                    !TryCudaCutlassLinearFp8Block128(input, weight, bias, output, n, m, k) &&
+                    !TryCudaTritonLinearFp8Block128(input, weight, bias, output, n, m, k)) {
+                    TraceCudaLinearFp8Path("native-fp8-e4m3", n, m, k);
+                    FastllmCudaBFloat16MatMulFP8E4M3(input, weight, bias, output, n, m, k);
+                }
+            } else if (weight.dataType == DataType::FP8_E4M3_BLOCK_128) {
+                if (!TryCudaTritonLinearFp8Block128(input, weight, bias, output, n, m, k)) {
+                    TraceCudaLinearFp8Path("native-fp8-e4m3-packed-block128", n, m, k);
+                    FastllmCudaBFloat16MatMulFP8E4M3Block128(input, weight, bias, output, n, m, k);
+                }
+            } else if (weight.dataType == DataType::FP8_E4M3_PERCHANNEL) {
+                TraceCudaLinearFp8Path("native-fp8-e4m3-packed-perchannel", n, m, k);
+                FastllmCudaBFloat16MatMulFP8E4M3PerChannel(input, weight, bias, output, n, m, k);
+            } else if (weight.dataType == DataType::NVFP4) {
+                FastllmCudaBFloat16MatMulNVFP4(input, weight, bias, output, n, m, k);
+            } else if (weight.dataType == DataType::NVFP4_BLOCK_16 ||
+                       weight.dataType == DataType::NVFP4_BLOCK_16_PLANAR) {
+                FastllmCudaBFloat16MatMulNVFP4Block16(input, weight, bias, output, n, m, k);
+            } else if (weight.dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
+                       weight.dataType == DataType::NVFP4_BLOCK_32_E8M0) {
+                FastllmCudaBFloat16MatMulNVFP4Block16E8M0(input, weight, bias, output, n, m, k);
+            } else if (weight.dataType == DataType::DATA_GGUF_FORMAT) {
+                FastllmCudaBFloat16MatMulGGUF(input, weight, bias, output, n, m, k);
+            } else {
+                ErrorInFastLLM("Linear error: unsupport weight's dataType for BFLOAT16 input." + dataTypeInfo);
+            }
+        } else {
+            ErrorInFastLLM("Linear error: unsupport input's dataType." + dataTypeInfo);
+        }
+    }
+
+    bool DoCudaLinearAdd(Data &input, Data &weight, const Data &bias, Data &output) {
+        int n = input.Count(0) / input.dims.back();
+        int m = input.dims.back();
+        int k = output.dims.back();
+        if (bias.dataType != DataType::FLOAT32) {
+            return false;
+        } else if (input.dataType == DataType::FLOAT16) {
+            if (weight.dataType == DataType::FLOAT16) {
+                FastllmCudaHalfMatMulFloat16(input, weight, bias, output, n, m, k, true);
+            } else if (weight.dataType == DataType::FP8_E4M3_BLOCK_128 &&
+                       bias.dims.empty() &&
+                       FastllmCudaHalfMatMulFloatFP8E4M3Block128AddTo(
+                           input, weight, output, 1.0f, false, n, m, k)) {
+                // Batch-1 decode can accumulate the packed FP8 projection
+                // directly into the residual, avoiding a second AddTo launch.
+            } else {
+                return false;
+            }
+        } else if (input.dataType == DataType::FLOAT32) {
+            {
+                return false;
+            }
+        } else if (input.dataType == DataType::BFLOAT16) {
+            if (weight.dataType == DataType::FP8_E4M3_BLOCK_128 &&
+                bias.dims.empty() &&
+                FastllmCudaBFloat16MatMulFP8E4M3Block128AddTo(
+                    input, weight, output, 1.0f, false, n, m, k)) {
+                // See the FLOAT16 path above.
+            } else {
+                return false;
+            }
+        } else {
+            return false;
+        }
+        return true;
+    }
+
+    void CudaLinearOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        Data &weight = *(datas.find("weight")->second);
+        Data &bias = *(datas.find("bias")->second);
+        DoCudaLinear(input, weight, bias, output);
+    }
+
+    void CudaLinearAddOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                                  const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        Data &weight = *(datas.find("weight")->second);
+
+        AssertInFastLLM(weight.dims.size() == 2, "LinearAdd's weight's shape's size should be 2.\n");
+        AssertInFastLLM(input.dims.back() == weight.dims[1], "LinearAdd's weight's shape error.\n");
+
+        // output 已经存在且形状正确，不需要 resize
+        // 但需要验证 output 的最后一维与 weight.dims[0] 一致
+        AssertInFastLLM(output.dims.back() == weight.dims[0], "LinearAdd's output's shape doesn't match weight.\n");
+
+        weight.weightType = WeightType::LINEAR;
+    }
+
+    bool CudaLinearAddOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        return true;
+    }
+
+    void CudaLinearAddOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                              const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        Data &weight = *(datas.find("weight")->second);
+        Data &middle = *(datas.find("middle")->second);
+        Data &bias = *(datas.find("bias")->second);
+
+        if (DoCudaLinearAdd(input, weight, bias, output)) { 
+            return;
+        } else {
+            DoCudaLinearReshape(input, weight, middle);
+            DoCudaLinear(input, weight, bias, middle);
+
+            // output += middle
+            FastllmCudaAddTo(output, middle, 1.0f);
+        }
+    }
+
+    bool CanUseCudaCutlassSwigluLinear(int rows, bool tensorParallel) {
+        if (!CudaEnvFlagDefaultEnabled("FASTLLM_CUDA_CUTLASS_LINEAR_FP8", true) ||
+            !CudaEnvFlagDefaultEnabled("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_SWIGLU_QUANT", true)) {
+            return false;
+        }
+        int minBatch = std::max(FastllmCudaGetLinearExactBatchThreshold(),
+            CudaEnvInt("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_MIN_BATCH", 8));
+        if (tensorParallel) {
+            if (!CudaEnvFlagDefaultEnabled("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_SWIGLU_QUANT_TP", true)) {
+                return false;
+            }
+            minBatch = std::max(minBatch,
+                CudaEnvInt("FASTLLM_CUDA_CUTLASS_LINEAR_FP8_SWIGLU_QUANT_TP_MIN_BATCH", 128));
+        }
+        return rows >= minBatch && FastllmCudaCutlassLinearFP8E4M3Block128FromSwigluAvailable();
+    }
+
+    static bool CanUseCudaSwigluLinearAdd(
+        const Data &input, const Data &weight, const Data &bias, const Data &output) {
+        if (input.dims.empty() || weight.dims.size() != 2 || output.dims.empty()) {
+            return false;
+        }
+        int gateup = input.dims.back();
+        if (gateup <= 0 || (gateup % 2) != 0) {
+            return false;
+        }
+        int n = input.Count(0) / gateup;
+        if (!CanUseCudaCutlassSwigluLinear(n) &&
+            !(CanUseCudaTritonSwigluLinear(n, !bias.dims.empty()) &&
+              !FastllmCudaHasFp8MarlinLayout(weight))) {
+            return false;
+        }
+        int inter = gateup / 2;
+        int hidden = output.dims.back();
+        return (input.dataType == DataType::FLOAT16 || input.dataType == DataType::BFLOAT16) &&
+               output.dataType == input.dataType &&
+               weight.dataType == DataType::FP8_E4M3 &&
+               weight.blockM == 128 && weight.blockK == 128 && !weight.scales.empty() &&
+               weight.dims[0] == hidden && weight.dims[1] == inter &&
+               (inter % 128) == 0 && (hidden % 128) == 0 &&
+               (bias.dims.empty() || bias.dataType == DataType::FLOAT32);
+    }
+
+    void CudaSwigluLinearAddOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                                        const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        Data &weight = *(datas.find("weight")->second);
+        Data &middle = *(datas.find("middle")->second);
+
+        AssertInFastLLM(input.dims.size() > 0 && (input.dims.back() % 2) == 0,
+                        "SwigluLinearAdd's input last dimension should be even.\n");
+        AssertInFastLLM(weight.dims.size() == 2, "SwigluLinearAdd's weight's shape's size should be 2.\n");
+        AssertInFastLLM(input.dims.back() / 2 == weight.dims[1], "SwigluLinearAdd's weight's shape error.\n");
+        AssertInFastLLM(output.dims.size() > 0 && output.dims.back() == weight.dims[0],
+                        "SwigluLinearAdd's output's shape doesn't match weight.\n");
+
+        std::vector<int> dims = input.dims;
+        dims.back() = weight.dims[0];
+        middle.dataType = input.dataType;
+        middle.Resize(dims);
+        weight.weightType = WeightType::LINEAR;
+    }
+
+    bool CudaSwigluLinearAddOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                                       const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        auto inputIt = datas.find("input");
+        auto weightIt = datas.find("weight");
+        auto biasIt = datas.find("bias");
+        auto outputIt = datas.find("output");
+        if (inputIt == datas.end() || weightIt == datas.end() ||
+            biasIt == datas.end() || outputIt == datas.end() ||
+            inputIt->second == nullptr || weightIt->second == nullptr ||
+            biasIt->second == nullptr || outputIt->second == nullptr) {
+            return false;
+        }
+        return CanUseCudaSwigluLinearAdd(
+            *inputIt->second, *weightIt->second, *biasIt->second, *outputIt->second);
+    }
+
+    void CudaSwigluLinearAddOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                    const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        Data &weight = *(datas.find("weight")->second);
+        Data &middle = *(datas.find("middle")->second);
+        Data &bias = *(datas.find("bias")->second);
+
+        int n = input.Count(0) / input.dims.back();
+        int m = input.dims.back() / 2;
+        int k = weight.dims[0];
+        middle.Allocate(false);
+        bool ok = (CanUseCudaCutlassSwigluLinear(n) &&
+                   FastllmCudaCutlassLinearFP8E4M3Block128FromSwiglu(input, weight, bias, middle, n, m, k)) ||
+                  DoCudaTritonSwigluLinear(input, weight, bias, middle);
+        if (!ok) {
+            Data swiglu;
+            DoCudaSwigluReshape(input, swiglu);
+            DoCudaSwiglu(input, swiglu);
+            if (DoCudaLinearAdd(swiglu, weight, bias, output)) {
+                return;
+            }
+            DoCudaLinearReshape(swiglu, weight, middle);
+            DoCudaLinear(swiglu, weight, bias, middle);
+        }
+        AssertInFastLLM(middle.dataType == output.dataType,
+                        "SwigluLinearAdd fallback requires middle and output dtype to match.\n");
+        FastllmCudaAddTo(output, middle, 1.0f);
+    }
+
+    void CudaLinearSwigluOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                                     const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        Data &weight = *(datas.find("weight")->second);
+        Data &middle = *(datas.find("middle")->second);
+
+        AssertInFastLLM(weight.dims.size() == 2, "LinearSwiglu's weight's shape's size should be 2.\n");
+        AssertInFastLLM(input.dims.back() == weight.dims[1], "LinearSwiglu's weight's shape error.\n");
+
+        // middle = Linear(input, weight, bias), shape: [..., weight.dims[0]]
+        DoCudaLinearReshape(input, weight, middle);
+
+        // output = Swiglu(middle), shape: [..., weight.dims[0] / 2]
+        DoCudaSwigluReshape(middle, output);
+    }
+
+    bool CudaLinearSwigluOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                                    const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        return true;
+    }
+
+    bool DoCudaLinearSwiglu(Data &input, Data &weight, const Data &bias, Data &middle, Data &output) {
+        int n = input.Count(0) / input.dims.back();
+        int m = input.dims.back();
+        int k = weight.dims[0];
+        if (bias.dataType != DataType::FLOAT32) {
+            return false;
+        } else if (input.dataType == DataType::FLOAT16) {
+            if (weight.dataType == DataType::FLOAT16) {
+                return FastllmCudaHalfMatMulFloat16Swiglu(input, weight, bias, output, n, m, output.dims.back());
+            } else {
+                return false;
+            }
+        } else if (input.dataType == DataType::FLOAT32) {
+            {
+                return false;
+            }
+        } else if (input.dataType == DataType::BFLOAT16) {
+            {
+                return false;
+            }
+        } else {
+            return false;
+        }
+        return true;
+    }
+
+    void CudaLinearSwigluOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        Data &weight = *(datas.find("weight")->second);
+        Data &middle = *(datas.find("middle")->second);
+        Data &bias = *(datas.find("bias")->second);
+
+        if (DoCudaLinearSwiglu(input, weight, bias, middle, output)) {
+            return;
+        } else {
+            DoCudaLinear(input, weight, bias, middle);
+            DoCudaSwiglu(middle, output);
+        }
+    }
+
+    void DoCudaSplitReshape(Data &input, int axis, int start, int end, Data &output) {
+        int dimsLen = input.dims.size();
+        axis = (axis % dimsLen + dimsLen) % dimsLen;
+
+        start = std::max(0, std::min(input.dims[axis] - 1, start));
+        end = std::max(0, std::min(input.dims[axis], end));
+        std::vector <int> dims = input.dims;
+        dims[axis] = end - start;
+
+        output.dataType = input.dataType;
+        output.Resize(dims);
+    }
+
+    void CudaSplitOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                              const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        int axis = intParams.find("axis") != intParams.end() ? intParams.find("axis")->second : -1;
+        int start = intParams.find("start") != intParams.end() ? intParams.find("start")->second : 0;
+        int end = intParams.find("end") != intParams.end() ? intParams.find("end")->second : 0;
+        DoCudaSplitReshape(input, axis, start, end, output);
+    }
+
+    void DoCudaSplit(Data &input, int axis, int start, int end, Data &output) {
+        output.Allocate(false);
+
+        int dimsLen = input.dims.size();
+        axis = (axis % dimsLen + dimsLen) % dimsLen;
+        start = std::max(0, std::min(input.dims[axis] - 1, start));
+        end = std::max(0, std::min(input.dims[axis], end));
+
+        int outer = input.Count(0) / input.Count(axis);
+        int inputStride = input.Count(axis);
+        int outputStride = output.Count(axis);
+        int channels = input.dims[axis];
+        int inner = input.strides[axis];
+        int unitSize = input.unitSize;
+
+        FastllmCudaMemcpy2DDeviceToDevice((uint8_t*)output.cudaData, outputStride * unitSize,
+                                          (uint8_t*)input.cudaData + start * inner * unitSize, inputStride * unitSize,
+                                          (end - start) * inner * unitSize, outer);
+    }
+
+    void CudaSplitOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                          const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        int axis = intParams.find("axis") != intParams.end() ? intParams.find("axis")->second : -1;
+        int start = intParams.find("start") != intParams.end() ? intParams.find("start")->second : 0;
+        int end = intParams.find("end") != intParams.end() ? intParams.find("end")->second : 0;
+        DoCudaSplit(input, axis, start, end, output);
+    }
+
+    void CudaRepeatOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                       const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        int axis = intParams.find("axis") != intParams.end() ? intParams.find("axis")->second : -1;
+        int repeatTimes = intParams.find("repeatTimes") != intParams.end() ? intParams.find("repeatTimes")->second : 1;
+        int dimsLen = input.dims.size();
+        axis = (axis % dimsLen + dimsLen) % dimsLen;
+
+        output.Allocate(false);
+
+        int outer = output.Count(0) / output.Count(axis);
+        int inputStride = input.Count(axis);
+        int outputStride = output.Count(axis);
+        int channels = input.dims[axis];
+        int inner = input.strides[axis];
+        int unitSize = input.unitSize;
+        FastllmCudaRepeat(input.cudaData, output.cudaData, outer, repeatTimes, inputStride * unitSize, outputStride * unitSize, channels * inner * unitSize, channels * inner * unitSize);
+    }
+
+    void CudaRepeatAddToOp::Run(
+            const std::string &opType, const fastllm::DataDict &datas,
+            const fastllm::FloatDict &floatParams,
+            const fastllm::IntDict &intParams) {
+        Data &input0 = *datas.find("input0")->second;
+        Data &input1 = *datas.find("input1")->second;
+        const float alpha = floatParams.find("alpha") != floatParams.end()
+            ? floatParams.find("alpha")->second : 1.0f;
+        int axis = intParams.find("axis") != intParams.end()
+            ? intParams.find("axis")->second : -1;
+        const int repeatTimes =
+            intParams.find("repeatTimes") != intParams.end()
+                ? intParams.find("repeatTimes")->second : 1;
+        AssertInFastLLM(
+            input0.dataType == input1.dataType &&
+            (input0.dataType == DataType::FLOAT32 ||
+             input0.dataType == DataType::FLOAT16 ||
+             input0.dataType == DataType::BFLOAT16),
+            "RepeatAddTo requires equal float32, float16 or bfloat16 types.\n");
+        AssertInFastLLM(
+            !input0.dims.empty() &&
+            input0.dims.size() == input1.dims.size() &&
+            repeatTimes > 0,
+            "RepeatAddTo received invalid shapes or repeat count.\n");
+        axis = (axis % (int)input0.dims.size() +
+                (int)input0.dims.size()) % (int)input0.dims.size();
+        for (int i = 0; i < (int)input0.dims.size(); i++) {
+            const int expected = i == axis
+                ? input1.dims[i] * repeatTimes : input1.dims[i];
+            AssertInFastLLM(
+                input0.dims[i] == expected,
+                "RepeatAddTo shape does not match Repeat(input1).\n");
+        }
+        const int outputStride = input0.Count(axis);
+        const int inputStride = input1.Count(axis);
+        const int outer = input0.Count(0) / outputStride;
+        AssertInFastLLM(
+            FastllmCudaRepeatAddTo(
+                input0, input1, outer, outputStride,
+                inputStride, alpha),
+            "RepeatAddTo CUDA kernel rejected its inputs.\n");
+    }
+
+    void CudaCopyOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                         const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        if (&input == &output) {
+            return;
+        }
+        output.Allocate();
+        if (!FastllmCudaCopy(input, output)) {
+            ErrorInFastLLM("Copy CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    // ==================== DeepSeek-V4.1 ====================
+
+    static Data *CudaV41Optional(const fastllm::DataDict &datas, const char *name) {
+        auto it = datas.find(name);
+        return (it == datas.end() || it->second == nullptr) ? nullptr : it->second;
+    }
+
+    static int CudaV41Int(const fastllm::IntDict &params, const char *name, int fallback) {
+        auto it = params.find(name);
+        return it == params.end() ? fallback : it->second;
+    }
+
+    static float CudaV41Float(const fastllm::FloatDict &params, const char *name, float fallback) {
+        auto it = params.find(name);
+        return it == params.end() ? fallback : it->second;
+    }
+
+    static bool CudaV41FloatType(DataType t) {
+        return t == DataType::FLOAT32 || t == DataType::FLOAT16 || t == DataType::BFLOAT16;
+    }
+
+    bool CudaDeepSeekV41HcMixOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                                        const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &hcFn = *(datas.find("hcFn")->second);
+        int hcMult = CudaV41Int(intParams, "hcMult", 1);
+        return input.dims.size() == 4 && input.dims[2] == hcMult && hcMult <= 4 &&
+               CudaV41FloatType(input.dataType) && hcFn.dataType == DataType::FLOAT32;
+    }
+
+    void CudaDeepSeekV41HcMixOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                     const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        if (!FastllmCudaDeepSeekV41HcMix(*(datas.find("input")->second), *(datas.find("hcFn")->second),
+                                         *(datas.find("hcScale")->second), *(datas.find("hcBase")->second),
+                                         CudaV41Int(intParams, "hcMult", 1), CudaV41Int(intParams, "sinkhornIters", 20),
+                                         CudaV41Float(floatParams, "eps", 1e-6f), CudaV41Float(floatParams, "normEps", 1e-6f),
+                                         *(datas.find("pre")->second), *(datas.find("post")->second),
+                                         *(datas.find("comb")->second))) {
+            ErrorInFastLLM("DeepSeekV41HcMix CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaDeepSeekV41HcApplyPreOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                                             const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        return input.dims.size() == 4 && CudaV41FloatType(input.dataType);
+    }
+
+    void CudaDeepSeekV41HcApplyPreOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                          const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        if (!FastllmCudaDeepSeekV41HcApplyPre(*(datas.find("input")->second), *(datas.find("pre")->second),
+                                              *(datas.find("output")->second))) {
+            ErrorInFastLLM("DeepSeekV41HcApplyPre CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaDeepSeekV41EngramApplyOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                                              const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &hidden = *(datas.find("hidden")->second);
+        Data &kv = *(datas.find("kv")->second);
+        return hidden.dims.size() == 4 && hidden.dataType == DataType::BFLOAT16 && CudaV41FloatType(kv.dataType);
+    }
+
+    void CudaDeepSeekV41EngramApplyOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        if (!FastllmCudaDeepSeekV41EngramApply(*(datas.find("hidden")->second), *(datas.find("kv")->second),
+                                               *(datas.find("qWeight")->second), *(datas.find("kWeight")->second),
+                                               CudaV41Optional(datas, "mask"),
+                                               CudaV41Float(floatParams, "eps", 1e-20f),
+                                               CudaV41Float(floatParams, "clampValue", 1e-6f))) {
+            ErrorInFastLLM("DeepSeekV41EngramApply CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaDeepSeekV41RotaryQuantOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                                              const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        if ((input.dims.size() != 3 && input.dims.size() != 4) || !CudaV41FloatType(input.dataType)) {
+            return false;
+        }
+        int dim = input.dims.back();
+        int quantMode = CudaV41Int(intParams, "quantMode", 0);
+        int quantBlock = CudaV41Int(intParams, "quantBlock", 32);
+        int quantDim = CudaV41Int(intParams, "quantDim", dim);
+        return dim <= 1024 && dim % 32 == 0 &&
+               (quantMode == 0 || ((quantBlock == 16 || quantBlock == 32) && quantDim % 32 == 0));
+    }
+
+    void CudaDeepSeekV41RotaryQuantOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        if (!FastllmCudaDeepSeekV41RotaryQuant(input, CudaV41Int(intParams, "ropeDim", 64),
+                                               CudaV41Float(floatParams, "ropeBase", 10000.0f),
+                                               CudaV41Int(intParams, "startPos", 0), CudaV41Int(intParams, "posStep", 1),
+                                               CudaV41Int(intParams, "inverse", 0) != 0,
+                                               CudaV41Int(intParams, "originalSeqLen", 0),
+                                               CudaV41Float(floatParams, "ropeFactor", 1.0f),
+                                               CudaV41Int(intParams, "betaFast", 32), CudaV41Int(intParams, "betaSlow", 1),
+                                               CudaV41Int(intParams, "quantMode", 0),
+                                               CudaV41Int(intParams, "quantDim", input.dims.back()),
+                                               CudaV41Int(intParams, "quantBlock", 32))) {
+            ErrorInFastLLM("DeepSeekV41RotaryQuant CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaDeepSeekV41CompressOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &kv = *(datas.find("kv")->second);
+        Data *score = CudaV41Optional(datas, "score");
+        int ratio = CudaV41Int(intParams, "compressRatio", 1);
+        return kv.dims.size() == 3 && kv.dims[2] == 512 && CudaV41FloatType(kv.dataType) &&
+               (ratio == 1 || (score != nullptr && score->dataType == kv.dataType));
+    }
+
+    void CudaDeepSeekV41CompressOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                        const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        if (!FastllmCudaDeepSeekV41Compress(*(datas.find("kv")->second), CudaV41Optional(datas, "score"),
+                                            *(datas.find("normWeight")->second),
+                                            CudaV41Int(intParams, "compressRatio", 1),
+                                            CudaV41Float(floatParams, "normEps", 1e-20f),
+                                            *(datas.find("output")->second))) {
+            ErrorInFastLLM("DeepSeekV41Compress CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaDeepSeekV41IndexerScoreOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                                               const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &q = *(datas.find("q")->second);
+        Data &k = *(datas.find("k")->second);
+        Data &weights = *(datas.find("weights")->second);
+        // k 可以是 BF16/FP32 的 [b, m, 128]，也可以是量化缓存行（INT8，行宽 132 / 72 / 68）
+        const bool kQuant = k.dataType == DataType::INT8 &&
+                            (k.dims[2] == 132 || k.dims[2] == 72 || k.dims[2] == 68);
+        return q.dims.size() == 4 && k.dims.size() == 3 && q.dims[3] == 128 &&
+               weights.dataType == DataType::FLOAT32 &&
+               (q.dataType == DataType::BFLOAT16 || q.dataType == DataType::FLOAT32) &&
+               (kQuant || (k.dims[2] == 128 &&
+                           (k.dataType == DataType::BFLOAT16 || k.dataType == DataType::FLOAT32)));
+    }
+
+    void CudaDeepSeekV41IndexerScoreOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                            const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        int ratio = intParams.find("compressRatio") == intParams.end() ? 0 : intParams.find("compressRatio")->second;
+        int startPos = intParams.find("startPos") == intParams.end() ? 0 : intParams.find("startPos")->second;
+        if (!FastllmCudaDeepSeekV41IndexerScore(*(datas.find("q")->second), *(datas.find("weights")->second),
+                                                *(datas.find("k")->second), ratio, startPos,
+                                                *(datas.find("output")->second))) {
+            ErrorInFastLLM("DeepSeekV41IndexerScore CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaDeepSeekV41CandidateBlocksOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                                                  const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &score = *(datas.find("score")->second);
+        return score.dims.size() == 3 && score.dataType == DataType::FLOAT32;
+    }
+
+    void CudaDeepSeekV41CandidateBlocksOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                               const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        if (!FastllmCudaDeepSeekV41CandidateBlocks(*(datas.find("score")->second),
+                                                   CudaV41Int(intParams, "blockSize", 8),
+                                                   CudaV41Int(intParams, "topkBlocks", 0),
+                                                   CudaV41Int(intParams, "compressRatio", 1),
+                                                   CudaV41Int(intParams, "startPos", 0),
+                                                   *(datas.find("output")->second))) {
+            ErrorInFastLLM("DeepSeekV41CandidateBlocks CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaDeepSeekV41IndexerTopKOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                                              const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &score = *(datas.find("score")->second);
+        return score.dims.size() == 3 && score.dataType == DataType::FLOAT32;
+    }
+
+    void CudaDeepSeekV41IndexerTopKOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        if (!FastllmCudaDeepSeekV41IndexerTopK(*(datas.find("score")->second), CudaV41Optional(datas, "candidates"),
+                                               CudaV41Int(intParams, "topK", 0),
+                                               CudaV41Int(intParams, "compressRatio", 1),
+                                               CudaV41Int(intParams, "startPos", 0),
+                                               CudaV41Int(intParams, "blockSize", 8),
+                                               *(datas.find("output")->second))) {
+            ErrorInFastLLM("DeepSeekV41IndexerTopK CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaDeepSeekV41SparseAttentionOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                                                  const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &q = *(datas.find("q")->second);
+        Data &chunkKV = *(datas.find("chunkKV")->second);
+        return q.dims.size() == 4 && q.dims[3] == 512 && q.dims[2] % 32 == 0 &&
+               (q.dataType == DataType::BFLOAT16 || q.dataType == DataType::FLOAT32) &&
+               chunkKV.dataType == DataType::BFLOAT16;
+    }
+
+    void CudaDeepSeekV41SparseAttentionOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                               const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        if (!FastllmCudaDeepSeekV41SparseAttention(*(datas.find("q")->second), *(datas.find("chunkKV")->second),
+                                                   CudaV41Optional(datas, "ringKV"), CudaV41Optional(datas, "compressedKV"),
+                                                   CudaV41Optional(datas, "cmpIdx"), *(datas.find("attnSink")->second),
+                                                   CudaV41Int(intParams, "windowSize", 128),
+                                                   CudaV41Int(intParams, "startPos", 0),
+                                                   CudaV41Float(floatParams, "softmaxScale", 1.0f),
+                                                   *(datas.find("output")->second))) {
+            ErrorInFastLLM("DeepSeekV41SparseAttention CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaDeepSeekV41WindowStoreOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                                              const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &chunk = *(datas.find("chunk")->second);
+        return chunk.dims.size() == 3;
+    }
+
+    void CudaDeepSeekV41WindowStoreOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        if (!FastllmCudaDeepSeekV41WindowStore(*(datas.find("chunk")->second), *(datas.find("ring")->second),
+                                               CudaV41Int(intParams, "startPos", 0),
+                                               CudaV41Int(intParams, "windowSize", 128))) {
+            ErrorInFastLLM("DeepSeekV41WindowStore CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaDeepSeekV41QuantizeActivationOp::CanRun(const std::string &, const DataDict &datas,
+                                                      const FloatDict &, const IntDict &) {
+        const Data &input = *datas.at("input");
+        return !input.dims.empty() && input.dims.back() % 32 == 0 && CudaV41FloatType(input.dataType);
+    }
+
+    void CudaDeepSeekV41QuantizeActivationOp::Run(const std::string &, const DataDict &datas,
+                                                  const FloatDict &, const IntDict &) {
+        if (!FastllmCudaDeepSeekV41QuantizeActivation(*datas.at("input"), *datas.at("output")))
+            ErrorInFastLLM("DeepSeekV41QuantizeActivation CUDA rejected input.\n");
+    }
+
+    bool CudaDeepSeekV41QuantizeKVOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                                             const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        auto blockIt = intParams.find("quantBlock");
+        int quantBlock = blockIt == intParams.end() ? 32 : blockIt->second;
+        return input.dims.size() == 3 && quantBlock > 0 && input.dims[2] % quantBlock == 0 &&
+               (input.dataType == DataType::BFLOAT16 || input.dataType == DataType::FLOAT32 ||
+                input.dataType == DataType::FLOAT16);
+    }
+
+    void CudaDeepSeekV41QuantizeKVOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                          const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        auto modeIt = intParams.find("quantMode");
+        auto blockIt = intParams.find("quantBlock");
+        int quantMode = modeIt == intParams.end() ? 1 : modeIt->second;
+        int quantBlock = blockIt == intParams.end() ? 32 : blockIt->second;
+        if (!FastllmCudaDeepSeekV41QuantizeKV(*(datas.find("input")->second), *(datas.find("output")->second),
+                                              quantMode, quantBlock)) {
+            ErrorInFastLLM("DeepSeekV41QuantizeKV CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaDeepSeekV4HcPreOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                                       const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &hcFn = *(datas.find("hcFn")->second);
+        Data &hcScale = *(datas.find("hcScale")->second);
+        Data &hcBase = *(datas.find("hcBase")->second);
+        int hcMult = intParams.find("hcMult") != intParams.end() ? intParams.find("hcMult")->second : 1;
+        int sinkhornIters = intParams.find("sinkhornIters") != intParams.end() ? intParams.find("sinkhornIters")->second : 1;
+        if (input.dims.size() != 4 || hcMult <= 0 || sinkhornIters <= 0 ||
+            input.dims[2] != hcMult ||
+            hcScale.dataType != DataType::FLOAT32 || hcBase.dataType != DataType::FLOAT32) {
+            return false;
+        }
+        if (input.dataType != DataType::FLOAT32 && input.dataType != DataType::FLOAT16 &&
+            input.dataType != DataType::BFLOAT16) {
+            return false;
+        }
+        if (hcFn.dataType != DataType::FLOAT32 && hcFn.dataType != DataType::FLOAT16 &&
+            hcFn.dataType != DataType::BFLOAT16) {
+            return false;
+        }
+        int dim = input.dims[3];
+        int flatDim = hcMult * dim;
+        int mixHc = (2 + hcMult) * hcMult;
+        return hcFn.Count(0) == (uint64_t)mixHc * flatDim &&
+               hcScale.Count(0) >= 3 && hcBase.Count(0) >= (uint64_t)mixHc;
+    }
+
+    void CudaDeepSeekV4HcPreOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                    const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &hcFn = *(datas.find("hcFn")->second);
+        Data &hcScale = *(datas.find("hcScale")->second);
+        Data &hcBase = *(datas.find("hcBase")->second);
+        Data &output = *(datas.find("output")->second);
+        Data &post = *(datas.find("post")->second);
+        Data &comb = *(datas.find("comb")->second);
+        int hcMult = intParams.find("hcMult") != intParams.end() ? intParams.find("hcMult")->second : 1;
+        int sinkhornIters = intParams.find("sinkhornIters") != intParams.end() ? intParams.find("sinkhornIters")->second : 1;
+        float eps = floatParams.find("eps") != floatParams.end() ? floatParams.find("eps")->second : 1e-6f;
+        float normEps = floatParams.find("normEps") != floatParams.end() ? floatParams.find("normEps")->second : 1e-6f;
+        if (!FastllmCudaDeepSeekV4HcPre(input, hcFn, hcScale, hcBase, hcMult, sinkhornIters,
+                                        eps, normEps, output, post, comb)) {
+            ErrorInFastLLM("DeepSeekV4HcPre CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaDeepSeekV4HcPostOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                                        const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &residual = *(datas.find("residual")->second);
+        Data &post = *(datas.find("post")->second);
+        Data &comb = *(datas.find("comb")->second);
+        if (opType == "DeepSeekV41HcPost" &&
+            (input.dataType != residual.dataType || (residual.dims.size() == 4 && residual.dims[2] > 4) || datas.at("output") == &input)) return false;
+        if (residual.dims.size() != 4 || post.dataType != DataType::FLOAT32 ||
+            comb.dataType != DataType::FLOAT32) {
+            return false;
+        }
+        if ((input.dataType != DataType::FLOAT32 && input.dataType != DataType::FLOAT16 &&
+             input.dataType != DataType::BFLOAT16) ||
+            (residual.dataType != DataType::FLOAT32 && residual.dataType != DataType::FLOAT16 &&
+             residual.dataType != DataType::BFLOAT16)) {
+            return false;
+        }
+        int bsz = residual.dims[0], seqlen = residual.dims[1], hcMult = residual.dims[2], dim = residual.dims[3];
+        return bsz > 0 && seqlen > 0 && hcMult > 0 && dim > 0 &&
+               input.Count(0) == (uint64_t)bsz * seqlen * dim &&
+               post.Count(0) == (uint64_t)bsz * seqlen * hcMult &&
+               comb.Count(0) == (uint64_t)bsz * seqlen * hcMult * hcMult;
+    }
+
+    void CudaDeepSeekV4HcPostOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                     const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &residual = *(datas.find("residual")->second);
+        Data &post = *(datas.find("post")->second);
+        Data &comb = *(datas.find("comb")->second);
+        Data &output = *(datas.find("output")->second);
+        int bsz = residual.dims[0], seqlen = residual.dims[1], hcMult = residual.dims[2], dim = residual.dims[3];
+        if (opType == "DeepSeekV41HcPost") {
+            if (!FastllmCudaDeepSeekV41HcPost(input, residual, post, comb, output))
+                ErrorInFastLLM("DeepSeekV41HcPost CUDA error: kernel rejected input.\n");
+            return;
+        }
+        if (!FastllmCudaDeepSeekV4HcPostCudaMix(input, residual, post, comb, bsz, seqlen, hcMult, dim, output)) {
+            ErrorInFastLLM("DeepSeekV4HcPost CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaScaleQRatoryOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                                    const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &q = *(datas.find("q")->second);
+        int ropeDim = intParams.find("ropeDim") != intParams.end() ? intParams.find("ropeDim")->second : 0;
+        return q.dataDevice == DataDevice::CUDA &&
+               q.dims.size() == 4 &&
+               ropeDim > 0 && ropeDim <= q.dims[3] && ropeDim % 2 == 0 &&
+               q.dataType == DataType::BFLOAT16;
+    }
+
+    void CudaScaleQRatoryOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &q = *(datas.find("q")->second);
+        int ropeDim = intParams.find("ropeDim") != intParams.end() ? intParams.find("ropeDim")->second : 0;
+        int startPos = intParams.find("startPos") != intParams.end() ? intParams.find("startPos")->second : 0;
+        int originalSeqLen = intParams.find("originalSeqLen") != intParams.end() ? intParams.find("originalSeqLen")->second : 0;
+        int betaFast = intParams.find("betaFast") != intParams.end() ? intParams.find("betaFast")->second : 32;
+        int betaSlow = intParams.find("betaSlow") != intParams.end() ? intParams.find("betaSlow")->second : 1;
+        float eps = floatParams.find("eps") != floatParams.end() ? floatParams.find("eps")->second : 1e-6f;
+        float ropeBase = floatParams.find("ropeBase") != floatParams.end() ? floatParams.find("ropeBase")->second : 10000.0f;
+        float ropeFactor = floatParams.find("ropeFactor") != floatParams.end() ? floatParams.find("ropeFactor")->second : 1.0f;
+        if (!FastllmCudaDeepSeekV4ScaleQRotary(q, ropeDim, ropeBase, startPos,
+                                               originalSeqLen, ropeFactor, betaFast, betaSlow, eps)) {
+            ErrorInFastLLM("ScaleQRatory CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaDeepSeekV4RotaryQuantOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                                             const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        int ropeDim = intParams.find("ropeDim") != intParams.end() ? intParams.find("ropeDim")->second : 0;
+        int quantDim = intParams.find("quantDim") != intParams.end() ? intParams.find("quantDim")->second : 0;
+        int blockSize = intParams.find("blockSize") != intParams.end() ? intParams.find("blockSize")->second : 64;
+        int dim = input.dims.empty() ? 0 : input.dims.back();
+        return input.dataDevice == DataDevice::CUDA &&
+               input.dataType == DataType::BFLOAT16 &&
+               input.dims.size() >= 3 && input.dims.size() <= 4 &&
+               ropeDim > 0 && ropeDim <= dim && ropeDim % 2 == 0 &&
+               quantDim >= 0 && quantDim <= dim &&
+               blockSize > 0;
+    }
+
+    void CudaDeepSeekV4RotaryQuantOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                          const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        int ropeDim = intParams.find("ropeDim") != intParams.end() ? intParams.find("ropeDim")->second : 0;
+        int startPos = intParams.find("startPos") != intParams.end() ? intParams.find("startPos")->second : 0;
+        int originalSeqLen = intParams.find("originalSeqLen") != intParams.end() ? intParams.find("originalSeqLen")->second : 0;
+        int betaFast = intParams.find("betaFast") != intParams.end() ? intParams.find("betaFast")->second : 32;
+        int betaSlow = intParams.find("betaSlow") != intParams.end() ? intParams.find("betaSlow")->second : 1;
+        int quantDim = intParams.find("quantDim") != intParams.end() ? intParams.find("quantDim")->second : 0;
+        int blockSize = intParams.find("blockSize") != intParams.end() ? intParams.find("blockSize")->second : 64;
+        int posStep = intParams.find("posStep") != intParams.end() ? intParams.find("posStep")->second : 1;
+        float ropeBase = floatParams.find("ropeBase") != floatParams.end() ? floatParams.find("ropeBase")->second : 10000.0f;
+        float ropeFactor = floatParams.find("ropeFactor") != floatParams.end() ? floatParams.find("ropeFactor")->second : 1.0f;
+        if (!FastllmCudaDeepSeekV4RotaryQuant(input, ropeDim, ropeBase, startPos,
+                                              originalSeqLen, ropeFactor, betaFast, betaSlow,
+                                              quantDim, blockSize, posStep)) {
+            ErrorInFastLLM("DeepSeekV4RotaryQuant CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaDeepSeekV4WoAOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                                     const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &weight = *(datas.find("weight")->second);
+        int groups = intParams.find("groups") != intParams.end() ? intParams.find("groups")->second : 1;
+        int oRank = intParams.find("oRank") != intParams.end() ? intParams.find("oRank")->second : 1;
+        if (input.dims.size() != 4 || groups <= 0 || oRank <= 0) {
+            return false;
+        }
+        int heads = input.dims[2], headDim = input.dims[3];
+        if (heads % groups != 0 ||
+            weight.Count(0) != (uint64_t)groups * oRank * (heads / groups) * headDim) {
+            return false;
+        }
+        return input.dataType == DataType::FLOAT32 ||
+               input.dataType == DataType::FLOAT16 ||
+               input.dataType == DataType::BFLOAT16;
+    }
+
+    void CudaDeepSeekV4WoAOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                  const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &weight = *(datas.find("weight")->second);
+        Data &output = *(datas.find("output")->second);
+        int groups = intParams.find("groups") != intParams.end() ? intParams.find("groups")->second : 1;
+        int oRank = intParams.find("oRank") != intParams.end() ? intParams.find("oRank")->second : 1;
+        if (!FastllmCudaDeepSeekV4WoA(input, weight, groups, oRank, output)) {
+            ErrorInFastLLM("DeepSeekV4WoA CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaDeepSeekV4BuildCompressedKVFromRawOp::CanRun(const std::string &opType,
+                                                          const fastllm::DataDict &datas,
+                                                          const fastllm::FloatDict &floatParams,
+                                                          const fastllm::IntDict &intParams) {
+        if (intParams.find("preferCudaOutput") == intParams.end() ||
+            intParams.find("preferCudaOutput")->second == 0) {
+            return false;
+        }
+        Data &kv = *(datas.find("kv")->second);
+        Data &score = *(datas.find("score")->second);
+        Data &ape = *(datas.find("ape")->second);
+        Data &normWeight = *(datas.find("normWeight")->second);
+        int rawLen = intParams.find("rawLen") != intParams.end() ? intParams.find("rawLen")->second : 0;
+        int blockStart = intParams.find("blockStart") != intParams.end() ? intParams.find("blockStart")->second : 0;
+        int blockCount = intParams.find("blockCount") != intParams.end() ? intParams.find("blockCount")->second : 0;
+        int compressRatio = intParams.find("compressRatio") != intParams.end() ? intParams.find("compressRatio")->second : 0;
+        int headDim = intParams.find("headDim") != intParams.end() ? intParams.find("headDim")->second : 0;
+        int ropeDim = intParams.find("ropeDim") != intParams.end() ? intParams.find("ropeDim")->second : 0;
+        bool overlap = intParams.find("overlap") != intParams.end() && intParams.find("overlap")->second != 0;
+        int wideDim = (overlap ? 2 : 1) * headDim;
+        if (kv.dims.size() != 3 || score.dims != kv.dims || kv.dims[1] < rawLen ||
+            kv.dims[2] != wideDim || rawLen <= 0 || blockStart < 0 || blockCount <= 0 ||
+            compressRatio <= 0 || headDim <= 0 || ropeDim <= 0 || ropeDim > headDim ||
+            ape.dataType != DataType::FLOAT32 || ape.Count(0) < (uint64_t)compressRatio * wideDim ||
+            normWeight.Count(0) < (uint64_t)headDim) {
+            return false;
+        }
+        return kv.dataType == DataType::FLOAT32 ||
+               kv.dataType == DataType::FLOAT16 ||
+               kv.dataType == DataType::BFLOAT16;
+    }
+
+    void CudaDeepSeekV4BuildCompressedKVFromRawOp::Run(const std::string &opType,
+                                                       const fastllm::DataDict &datas,
+                                                       const fastllm::FloatDict &floatParams,
+                                                       const fastllm::IntDict &intParams) {
+        Data &kv = *(datas.find("kv")->second);
+        Data &score = *(datas.find("score")->second);
+        Data &ape = *(datas.find("ape")->second);
+        Data &normWeight = *(datas.find("normWeight")->second);
+        Data &cache = *(datas.find("cache")->second);
+        int rawTokenBase = intParams.find("rawTokenBase") != intParams.end() ? intParams.find("rawTokenBase")->second : 0;
+        int rawLen = intParams.find("rawLen") != intParams.end() ? intParams.find("rawLen")->second : 0;
+        int blockStart = intParams.find("blockStart") != intParams.end() ? intParams.find("blockStart")->second : 0;
+        int blockCount = intParams.find("blockCount") != intParams.end() ? intParams.find("blockCount")->second : 0;
+        int compressRatio = intParams.find("compressRatio") != intParams.end() ? intParams.find("compressRatio")->second : 0;
+        int headDim = intParams.find("headDim") != intParams.end() ? intParams.find("headDim")->second : 0;
+        int ropeDim = intParams.find("ropeDim") != intParams.end() ? intParams.find("ropeDim")->second : 0;
+        int betaFast = intParams.find("betaFast") != intParams.end() ? intParams.find("betaFast")->second : 32;
+        int betaSlow = intParams.find("betaSlow") != intParams.end() ? intParams.find("betaSlow")->second : 1;
+        int originalSeqLen = intParams.find("originalSeqLen") != intParams.end() ? intParams.find("originalSeqLen")->second : 0;
+        bool overlap = intParams.find("overlap") != intParams.end() && intParams.find("overlap")->second != 0;
+        bool multiCudaDispatch =
+            intParams.find("multiCudaDispatch") != intParams.end() &&
+            intParams.find("multiCudaDispatch")->second != 0;
+        float ropeBase = floatParams.find("ropeBase") != floatParams.end() ? floatParams.find("ropeBase")->second : 10000.0f;
+        float ropeFactor = floatParams.find("ropeFactor") != floatParams.end() ? floatParams.find("ropeFactor")->second : 1.0f;
+        int bsz = kv.dims[0];
+        int wideDim = (overlap ? 2 : 1) * headDim;
+
+        Data compressed;
+        if (!FastllmCudaDeepSeekV4BuildCompressedKV(kv, score, ape, rawTokenBase, rawLen,
+                                                    blockStart, blockCount, compressRatio,
+                                                    headDim, wideDim, overlap, compressed)) {
+            ErrorInFastLLM("DeepSeekV4BuildCompressedKVFromRaw CUDA error: build kernel rejected input.\n");
+        }
+
+        const bool fusedFinalize =
+            std::getenv("FASTLLM_DSV4_DISABLE_FUSED_COMPRESSED_KV") == nullptr &&
+            !multiCudaDispatch && bsz == 1 &&
+            (headDim == 128 || headDim == 512) &&
+            normWeight.dataType == DataType::FLOAT32 &&
+            (blockStart > 0 || cache.dims.empty()) &&
+            (blockStart <= 0 ||
+             (cache.dataType == DataType::BFLOAT16 &&
+              cache.dims.size() == 3 && cache.dims[0] == bsz &&
+              cache.dims[1] >= blockStart && cache.dims[2] == headDim &&
+              cache.expansionDims.empty() &&
+              cache.strides.size() == 3 &&
+              cache.strides[0] == cache.dims[1] * headDim &&
+              cache.strides[1] == headDim &&
+              cache.cudaData != nullptr));
+        if (fusedFinalize) {
+            const int totalBlocks = blockStart + blockCount;
+            const int allocationUnit = 64;
+            const int requiredCapacity =
+                ((totalBlocks + allocationUnit - 1) / allocationUnit) *
+                allocationUnit;
+            std::vector<int> currentDevice = {FastllmCudaGetDevice()};
+            if (cache.dims.empty()) {
+                cache.dataType = DataType::BFLOAT16;
+                cache.UpdateUnitSize();
+                cache.Resize({bsz, requiredCapacity, headDim});
+                cache.SetKVCache();
+                cache.ToDevice(DataDevice::CUDA, currentDevice, false);
+                cache.Allocate(false);
+                cache.Resize({bsz, totalBlocks, headDim});
+            } else {
+                int capacity = (int)(cache.expansionSize / headDim);
+                if (capacity < requiredCapacity) {
+                    cache.Expansion({bsz, requiredCapacity, headDim});
+                    // For bsz == 1 the reserved rows do not participate in
+                    // addressing: sequence rows are contiguous and there is
+                    // no second batch whose base needs a capacity stride.
+                    // Keep the allocation size as the private reserve, while
+                    // publishing compact logical strides to every consumer.
+                    cache.expansionDims.clear();
+                }
+                cache.Resize({bsz, totalBlocks, headDim});
+            }
+            cache.SetKVCache();
+            if (!FastllmCudaDeepSeekV4FinalizeCompressedKV(
+                    compressed, normWeight, blockStart, compressRatio,
+                    ropeDim, ropeBase, originalSeqLen, ropeFactor,
+                    betaFast, betaSlow, cache)) {
+                ErrorInFastLLM(
+                    "DeepSeekV4BuildCompressedKVFromRaw CUDA error: "
+                    "fused finalize rejected prepared input.\n");
+            }
+            return;
+        }
+
+        Data compressedForNorm(DataType::BFLOAT16, {bsz, blockCount, headDim});
+        std::vector<int> currentDevice = {FastllmCudaGetDevice()};
+        compressedForNorm.ToDevice(DataDevice::CUDA, currentDevice, false);
+        compressedForNorm.Allocate(false);
+        FastllmFloatToBF16(compressed.cudaData, compressedForNorm.cudaData,
+                           (int)compressed.Count(0));
+
+        Data newRows(DataType::BFLOAT16, {bsz, blockCount, headDim});
+        newRows.ToDevice(DataDevice::CUDA, currentDevice, false);
+        newRows.Allocate(false);
+        if (!FastllmCudaRMSNorm(compressedForNorm, normWeight, newRows, 1e-6f)) {
+            ErrorInFastLLM("DeepSeekV4BuildCompressedKVFromRaw CUDA error: rmsnorm failed.\n");
+        }
+        const int quantDim = headDim == 128 ? headDim : headDim - ropeDim;
+        const int quantBlock = headDim == 128 ? 128 : 64;
+        if (!FastllmCudaDeepSeekV4RotaryQuant(newRows, ropeDim, ropeBase, blockStart * compressRatio,
+                                              originalSeqLen, ropeFactor, betaFast, betaSlow,
+                                              quantDim, quantBlock, compressRatio)) {
+            ErrorInFastLLM("DeepSeekV4BuildCompressedKVFromRaw CUDA error: rotary quant failed.\n");
+        }
+
+        int totalBlocks = blockStart + blockCount;
+        if (blockStart <= 0 || cache.dims.size() != 3 || cache.dims[1] <= 0 ||
+            cache.cudaData == nullptr) {
+            cache.CopyFrom(newRows);
+            cache.SetKVCache();
+            cache.ToDevice(DataDevice::CUDA, currentDevice);
+            return;
+        }
+        AssertInFastLLM(cache.dataType == DataType::BFLOAT16 &&
+                        cache.dims[0] == bsz && cache.dims[1] >= blockStart &&
+                        cache.dims[2] == headDim,
+                        "DeepSeekV4BuildCompressedKVFromRaw CUDA error: invalid old cache.\n");
+
+        Data merged(DataType::BFLOAT16, {bsz, totalBlocks, headDim});
+        merged.SetKVCache();
+        merged.ToDevice(DataDevice::CUDA, currentDevice, false);
+        merged.Allocate(false);
+        size_t unit = sizeof(uint16_t);
+        size_t oldPitch = (size_t)cache.dims[1] * headDim * unit;
+        size_t copyOldWidth = (size_t)blockStart * headDim * unit;
+        size_t addPitch = (size_t)blockCount * headDim * unit;
+        size_t mergedPitch = (size_t)totalBlocks * headDim * unit;
+        FastllmCudaMemcpy2DDeviceToDevice(merged.cudaData, mergedPitch,
+                                          cache.cudaData, oldPitch,
+                                          copyOldWidth, bsz);
+        FastllmCudaMemcpy2DDeviceToDevice((uint8_t*)merged.cudaData + (size_t)blockStart * headDim * unit,
+                                          mergedPitch, newRows.cudaData, addPitch,
+                                          addPitch, bsz);
+        cache.CopyFrom(merged);
+        cache.SetKVCache();
+        cache.ToDevice(DataDevice::CUDA, currentDevice);
+    }
+
+    bool CudaDeepSeekV4StoreWindowKVCacheOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                                                    const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &kv = *(datas.find("input")->second);
+        int startPos = intParams.find("startPos") != intParams.end() ? intParams.find("startPos")->second : 0;
+        int windowSize = intParams.find("windowSize") != intParams.end() ? intParams.find("windowSize")->second : 0;
+        return kv.dims.size() == 3 && kv.dims[1] > 0 && startPos >= 0 && windowSize > 0 &&
+               (kv.dataType == DataType::FLOAT32 || kv.dataType == DataType::FLOAT16 ||
+                kv.dataType == DataType::BFLOAT16);
+    }
+
+    void CudaDeepSeekV4StoreWindowKVCacheOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &kv = *(datas.find("input")->second);
+        Data &windowKV = *(datas.find("cache")->second);
+        int startPos = intParams.find("startPos") != intParams.end() ? intParams.find("startPos")->second : 0;
+        int windowSize = intParams.find("windowSize") != intParams.end() ? intParams.find("windowSize")->second : 0;
+        if (!FastllmCudaDeepSeekV4StoreWindowKVCache(kv, startPos, windowSize, windowKV)) {
+            ErrorInFastLLM("DeepSeekV4StoreWindowKVCache CUDA error: kernel rejected input.\n");
+        }
+        windowKV.SetKVCache();
+    }
+
+    bool CudaDeepSeekV4UpdateWindowKVCacheOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                                                     const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &kv = *(datas.find("input")->second);
+        Data &windowKV = *(datas.find("cache")->second);
+        int startPos = intParams.find("startPos") != intParams.end() ? intParams.find("startPos")->second : 0;
+        int windowSize = intParams.find("windowSize") != intParams.end() ? intParams.find("windowSize")->second : 0;
+        if (kv.dims.size() != 3 || kv.dims[1] <= 0 || startPos < 0 || windowSize <= 0 ||
+            (kv.dataType != DataType::FLOAT32 && kv.dataType != DataType::FLOAT16 &&
+             kv.dataType != DataType::BFLOAT16)) {
+            return false;
+        }
+        return windowKV.dataType == DataType::FLOAT32 && windowKV.dims.size() == 3 &&
+               windowKV.dims[0] == kv.dims[0] && windowKV.dims[1] == windowSize &&
+               windowKV.dims[2] == kv.dims[2] &&
+               (windowKV.cpuData != nullptr || windowKV.cudaData != nullptr);
+    }
+
+    void CudaDeepSeekV4UpdateWindowKVCacheOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                                  const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &kv = *(datas.find("input")->second);
+        Data &windowKV = *(datas.find("cache")->second);
+        int startPos = intParams.find("startPos") != intParams.end() ? intParams.find("startPos")->second : 0;
+        int windowSize = intParams.find("windowSize") != intParams.end() ? intParams.find("windowSize")->second : 0;
+        if (!FastllmCudaDeepSeekV4UpdateWindowKVCache(kv, startPos, windowSize, windowKV)) {
+            ErrorInFastLLM("DeepSeekV4UpdateWindowKVCache CUDA error: kernel rejected input.\n");
+        }
+        windowKV.SetKVCache();
+    }
+
+    void CudaCatOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                       const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input0 = *(datas.find("input0")->second);
+        Data &input1 = *(datas.find("input1")->second);
+        Data &output = *(datas.find("output")->second);
+
+        output.Allocate(false);
+
+        int axis = intParams.find("axis") != intParams.end() ? intParams.find("axis")->second : -1;
+        if (input0.dims.size() == 0 && input1.dims.size() > 0) {
+            output.CopyFrom(input1);
+            return;
+        }
+        if (input1.dims.size() == 0 && input0.dims.size() > 0) {
+            output.CopyFrom(input0);
+            return;
+        }
+
+        int dimsLen = input0.dims.size();
+        axis = (axis % dimsLen + dimsLen) % dimsLen;
+
+        int outer = output.Count(0) / output.Count(axis);
+        int input0Stride = input0.Count(axis);
+        int input1Stride = input1.Count(axis);
+        int outputStride = output.Count(axis);
+        int inner = input0.strides[axis];
+        int unitSize = input0.unitSize;
+
+        FastllmCudaMemcpy2DDeviceToDevice((uint8_t *) output.cudaData, outputStride * unitSize,
+                                            (uint8_t *) input0.cudaData, input0Stride * unitSize,
+                                            input0.dims[axis] * inner * unitSize, outer);
+        FastllmCudaMemcpy2DDeviceToDevice((uint8_t *) output.cudaData + input0.dims[axis] * inner * unitSize, outputStride * unitSize,
+                                            (uint8_t *) input1.cudaData, input1Stride * unitSize,
+                                            input1.dims[axis] * inner * unitSize, outer);
+    }
+
+    void CudaPadOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                        const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+
+        int padSize = intParams.find("padSize") != intParams.end() ? intParams.find("padSize")->second : 0;
+        AssertInFastLLM(padSize >= 0, "Pad Error: padSize should be non-negative.");
+        if (input.dims.empty() || padSize == 0) {
+            output.CopyFrom(input);
+            return;
+        }
+
+        int axis = intParams.find("axis") != intParams.end() ? intParams.find("axis")->second : -1;
+        int dimsLen = input.dims.size();
+        axis = (axis % dimsLen + dimsLen) % dimsLen;
+
+        output.Allocate();
+        FastllmCudaMemset0(output.cudaData, output.GetBytes());
+
+        int outer = output.Count(0) / output.Count(axis);
+        int inputStride = input.Count(axis);
+        int outputStride = output.Count(axis);
+        int inner = input.strides[axis];
+        int unitSize = input.unitSize;
+
+        FastllmCudaMemcpy2DDeviceToDevice((uint8_t *) output.cudaData, outputStride * unitSize,
+                                          (uint8_t *) input.cudaData, inputStride * unitSize,
+                                          input.dims[axis] * inner * unitSize, outer);
+    }
+
+    void DoCudaCatDirect(Data &input0, Data &input1, int axis) {
+        AssertInFastLLM(input0.dataType == input1.dataType &&
+                        (input0.dataType == DataType::FLOAT32 ||
+                         input0.dataType == DataType::FLOAT16 ||
+                         input0.dataType == DataType::BFLOAT16 ||
+                         input0.dataType == DataType::INT8),
+                        "CatDirect's inputs should have the same float or int8 type.\n");
+        AssertInFastLLM(input0.dataDevice == input1.dataDevice, "CatDirect error: inputs should use same device.\n");
+
+        if (input0.dims.size() == 0) {
+            input0.Resize(input1.dims);
+            AssertInFastLLM(input0.expansionDims.size() == input1.dims.size() &&
+                            input1.dims[axis] <= input0.expansionDims[axis],
+                            "CatDirect Error: input0's expansion size is not enough.\n");
+            int outer = input1.Count(0) / input1.Count(axis);
+            int input0Stride = input0.Count(axis);
+            int input1Stride = input1.Count(axis);
+            int inner = input0.strides[axis];
+            int unitSize = input0.unitSize;
+            FastllmCudaMemcpy2DDeviceToDevice((uint8_t *) input0.cudaData, input0Stride * unitSize,
+                                              (uint8_t *) input1.cudaData, input1Stride * unitSize,
+                                              input1.dims[axis] * inner * unitSize, outer);
+            return;
+        }
+
+        AssertInFastLLM(input0.dims.size() == input1.dims.size(), "Cat Error: input's shape's size should be same.\n");
+        int dimsLen = input0.dims.size();
+        axis = (axis % dimsLen + dimsLen) % dimsLen;
+
+        for (int i = 0; i < dimsLen; i++) {
+            if (i != axis) {
+                AssertInFastLLM(input0.dims[i] == input1.dims[i], "Cat Error: input's shape doesn't match.");
+            }
+        }
+
+        std::vector<int> dims = input0.dims;
+        std::vector<int> oldDims = dims;
+        dims[axis] += input1.dims[axis];
+        // 追加分支原来没有容量检查（上面的"空 input0"分支是有的）。容量不够时
+        // Resize 不会重新分配，下面的 memcpy2D 直接写出界，只会在之后某个不相关的
+        // CUDA 调用上报 illegal address。这里按空分支同样的方式先拦住。
+        AssertInFastLLM(input0.expansionDims.size() == dims.size() &&
+                        dims[axis] <= input0.expansionDims[axis],
+                        "CatDirect Error: input0's expansion size is not enough.\n");
+        input0.Resize(dims);
+        int outer = input0.Count(0) / input0.Count(axis);
+        int input0Stride = input0.Count(axis);
+        int input1Stride = input1.Count(axis);
+
+        int inner = input0.strides[axis];
+        int unitSize = input0.unitSize;
+
+        FastllmCudaMemcpy2DDeviceToDevice((uint8_t *) input0.cudaData + oldDims[axis] * inner * unitSize,
+                                          input0Stride * unitSize,
+                                          (uint8_t *) input1.cudaData, input1Stride * unitSize,
+                                          input1.dims[axis] * inner * unitSize, outer);
+    }
+
+    void CudaCatDirectOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                             const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input0 = *(datas.find("input0")->second);
+        Data &input1 = *(datas.find("input1")->second);
+
+        int axis = intParams.find("axis") != intParams.end() ? intParams.find("axis")->second : -1;
+        DoCudaCatDirect(input0, input1, axis);
+    }
+
+    void CudaMatMulOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                              const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input0 = *(datas.find("input0")->second);
+        Data &input1 = *(datas.find("input1")->second);
+        Data &output = *(datas.find("output")->second);
+
+        AssertInFastLLM(input0.dataDevice == input1.dataDevice, "MatMul error: inputs should use same device.\n");
+        AssertInFastLLM((input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT32) ||
+                        (input0.dataType == DataType::FLOAT16 && input1.dataType == DataType::FLOAT16) ||
+                        (input0.dataType == DataType::BFLOAT16 && input1.dataType == DataType::BFLOAT16) ||
+                        (input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT16),
+                        "MatMul's inputs should be matching float32, float16 or bfloat16.\n");
+        AssertInFastLLM(input0.dims.size() >= 2 && input1.dims.size() >= 2,
+                        "MatMul's input's shape's size should be >= 2.\n");
+        AssertInFastLLM(input0.dims.back() == input1.dims[input1.dims.size() - 2],
+                        "MatMul's shape error.\n");
+        int input0Spatial = input0.Count(input0.dims.size() - 2);
+        int input1Spatial = input1.Count(input1.dims.size() - 2);
+        int batch0 = input0.Count(0) / input0Spatial;
+        int batch1 = input1.Count(0) / input1Spatial;
+        int group = intParams.find("group") != intParams.end() ? intParams.find("group")->second : 1;
+        AssertInFastLLM(batch0 == batch1 * group, "MatMul: input0.dims[1] should be equal to input1.dims[0] * group.\n");
+        // AssertInFastLLM(batch0 == batch1, "MatMul's shape error.\n");
+
+        std::vector <int> dims = input0.dims;
+        dims.back() = input1.dims[input1.dims.size() - 1];
+
+        output.dataType = input0.dataType;
+        output.Resize(dims);
+    }
+
+    void CudaMatMulOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                          const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input0 = *(datas.find("input0")->second);
+        Data &input1 = *(datas.find("input1")->second);
+        Data &output = *(datas.find("output")->second);
+
+        output.Allocate();
+
+        float alpha = floatParams.find("alpha") != floatParams.end() ? floatParams.find("alpha")->second : 1.0f;
+        int group = intParams.find("group") != intParams.end() ? intParams.find("group")->second : 1;
+        int input0Spatial = input0.Count(input0.dims.size() - 2) * group;
+        int input1Spatial = input1.Count(input1.dims.size() - 2);
+        int input0Stride = input0.strides[input0.dims.size() - 2];
+        int input1Stride = input1.strides[input1.dims.size() - 2];
+        int n = input0.dims[input0.dims.size() - 2] * group;
+        int m = input0.dims.back();
+        int k = input1.dims[input1.dims.size() - 1];
+        int batch0 = input0.Count(0) / input0Spatial;
+        int batch1 = input1.Count(0) / input1Spatial;
+
+        int outputSpatial = output.Count(output.dims.size() - 2) * group;
+        FastllmCudaBatchMatMul(input0, input1, output,
+                               input0Spatial, input1Spatial, outputSpatial, input0Stride, input1Stride,
+                               batch1, n, m, k, alpha);
+    }
+
+    void CudaMatMulTransBOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                                    const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input0 = *(datas.find("input0")->second);
+        Data &input1 = *(datas.find("input1")->second);
+        Data &output = *(datas.find("output")->second);
+
+        AssertInFastLLM(input0.dataDevice == input1.dataDevice, "MatMulTransB error: inputs should use same device.\n");
+        AssertInFastLLM((input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT32) ||
+                        (input0.dataType == DataType::FLOAT16 && input1.dataType == DataType::FLOAT16) ||
+                        (input0.dataType == DataType::BFLOAT16 && input1.dataType == DataType::BFLOAT16) ||
+                        (input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT16),
+                        "MatMulTransB's inputs should be matching float32, float16 or bfloat16.\n");
+        AssertInFastLLM(input0.dims.size() >= 2 && input1.dims.size() >= 2,
+                        "MatMulTransB's input's shape's size should be >= 2.\n");
+        AssertInFastLLM(input0.dims.back() == input1.dims.back(),
+                        "MatMulTransB's shape error.\n");
+        int input0Spatial = input0.Count(input0.dims.size() - 2);
+        int input1Spatial = input1.Count(input1.dims.size() - 2);
+        int batch0 = input0.Count(0) / input0Spatial;
+        int batch1 = input1.Count(0) / input1Spatial;
+        int group = intParams.find("group") != intParams.end() ? intParams.find("group")->second : 1;
+        AssertInFastLLM(batch0 == batch1 * group, "MatMulTransB: input0.dims[0] should be equal to input1.dims[0] * group.\n");
+        // AssertInFastLLM(batch0 == batch1, "MatMulTransB's shape error.\n");
+
+        std::vector <int> dims = input0.dims;
+        dims.back() = input1.dims[input1.dims.size() - 2];
+        output.dataType = input0.dataType;
+        output.Resize(dims);
+    }
+
+    void CudaMatMulTransBOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input0 = *(datas.find("input0")->second);
+        Data &input1 = *(datas.find("input1")->second);
+        Data &output = *(datas.find("output")->second);
+
+        output.Allocate();
+
+        float alpha = floatParams.find("alpha") != floatParams.end() ? floatParams.find("alpha")->second : 1.0f;
+        int group = intParams.find("group") != intParams.end() ? intParams.find("group")->second : 1;
+        int input0Spatial = input0.Count(input0.dims.size() - 2) * group;
+        int input1Spatial = input1.Count(input1.dims.size() - 2);
+        int input0Stride = input0.strides[input0.dims.size() - 2];
+        int input1Stride = input1.strides[input1.dims.size() - 2];
+        int n = input0.dims[input0.dims.size() - 2] * group;
+        int m = input0.dims.back();
+        int k = input1.dims[input1.dims.size() - 2];
+        int batch0 = input0.Count(0) / input0Spatial;
+        int batch1 = input1.Count(0) / input1Spatial;
+
+        int outputSpatial = output.Count(output.dims.size() - 2) * group;
+        FastllmCudaBatchMatMulTransB(input0, input1, output,
+                                     input0Spatial, input1Spatial, outputSpatial, input0Stride, input1Stride,
+                                     batch1, n, m, k, alpha);
+    }
+
+    bool CudaSoftMaxOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                               const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        int axis = intParams.find("axis") != intParams.end() ? intParams.find("axis")->second : -1;
+        int dimsLen = input.dims.size();
+        axis = (axis % dimsLen + dimsLen) % dimsLen;
+        int inner = input.Count(axis + 1);
+        if (inner != 1) {
+            return false;
+        }
+        return true;
+    }
+
+    void CudaSoftMaxOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                            const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        output.Allocate(false);
+
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 || input.dataType == DataType::FLOAT16, 
+                        "Softmax error: Data's type should be float32 or float16.\n");
+        int axis = intParams.find("axis") != intParams.end() ? intParams.find("axis")->second : -1;
+        int dimsLen = input.dims.size();
+        axis = (axis % dimsLen + dimsLen) % dimsLen;
+        FastllmCudaSoftmax(input, output, axis);
+    }
+
+    void CudaGeluNewOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        output.Allocate();
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
+                        input.dataType == DataType::FLOAT16,
+                        "GeluNew error: Data's type should be float32 or float16.\n");
+        FastllmCudaGeluNew(input, output);
+    }
+
+    void CudaGeluOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        output.Allocate();
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
+                        input.dataType == DataType::FLOAT16, "Gelu error: Data's type should be float32 or float16.\n");
+        FastllmCudaGelu(input, output);
+    }
+
+    void DoCudaGegluReshape(Data &input, Data &output) {
+        DoCudaSwigluReshape(input, output);
+    }
+
+    void CudaGegluOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                              const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        DoCudaGegluReshape(input, output);
+    }
+
+    void DoCudaGeglu(Data &input, Data &output) {
+        output.Allocate();
+        FastllmCudaGeglu(input, output);
+    }
+
+    void CudaGegluOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                          const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
+                        input.dataType == DataType::FLOAT16 ||
+                        input.dataType == DataType::BFLOAT16,
+                        "Geglu error: Data's type should be float32, float16 or bfloat16.\n");
+        DoCudaGeglu(input, output);
+    }
+
+    void CudaExpOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        output.Allocate();
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 || input.dataType == DataType::FLOAT16, 
+                "Exp error: Data's type should be float32 or float16\n");
+        FastllmCudaExp(input, output);
+    }
+
+    void CudaReluOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        output.Allocate();
+        AssertInFastLLM(input.dataType == DataType::FLOAT32, "Relu error: Data's type should be float32\n");
+        FastllmCudaRelu(input, output);
+    }
+
+    void DoCudaSwigluReshape(Data &input, Data &output) {
+        std::vector <int> dims = input.dims;
+        dims[dims.size() - 1] /= 2;
+        output.dataType = input.dataType;
+        output.Resize(dims);
+    }
+
+    void CudaSwigluOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                              const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        DoCudaSwigluReshape(input, output);
+    }
+
+    void DoCudaSwiglu(Data &input, Data &output) {
+        output.Allocate(false);
+        FastllmCudaSwiglu(input, output);
+    }
+
+    void CudaSwigluOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                          const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
+                        input.dataType == DataType::FLOAT16 ||
+                        input.dataType == DataType::BFLOAT16, 
+                        "Swiglu error: Data's type should be float32, float16 or bfloat16.\n");
+        DoCudaSwiglu(input, output);
+    }
+
+    void CudaCrossSwigluOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                              const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        DoCudaSwigluReshape(input, output);
+    }
+
+    void CudaCrossSwigluOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                          const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
+                        input.dataType == DataType::FLOAT16, 
+                        "CrossSwiglu error: Data's type should be float32 or float16.\n");
+        output.Allocate();
+        FastllmCudaCrossSwiglu(input, output);
+    }
+
+    void CudaSiluOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                            const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        output.Allocate();
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
+                        input.dataType == DataType::FLOAT16 ||
+                        input.dataType == DataType::BFLOAT16,
+                        "Silu error: Data's type should be float32, float16 or bfloat16.\n");
+        FastllmCudaSilu(input, output);
+    }
+
+    void CudaSigmoidOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                            const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        output.Allocate();
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
+                        input.dataType == DataType::FLOAT16 ||
+                        input.dataType == DataType::BFLOAT16,
+                        "Sigmoid error: Data's type should be float32, float16 or bfloat16.\n");
+        FastllmCudaSigmoid(input, output);
+    }
+
+    void CudaSigmoidMulToOp::Run(
+            const std::string &opType, const fastllm::DataDict &datas,
+            const fastllm::FloatDict &floatParams,
+            const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &gate = *(datas.find("gate")->second);
+        auto supportedType = [](DataType type) {
+            return type == DataType::FLOAT32 ||
+                   type == DataType::FLOAT16 ||
+                   type == DataType::BFLOAT16;
+        };
+        AssertInFastLLM(
+            supportedType(input.dataType) && supportedType(gate.dataType),
+            "CUDA SigmoidMulTo input and gate should be float32, "
+            "float16 or bfloat16.");
+        AssertInFastLLM(
+            input.Count(0) > 0 && gate.Count(0) > 0 &&
+            (input.dims == gate.dims || gate.Count(0) == 1 ||
+             input.Count(0) % gate.Count(0) == 0),
+            "CUDA SigmoidMulTo gate shape cannot broadcast to input.");
+        AssertInFastLLM(
+            FastllmCudaSigmoidMulTo(input, gate),
+            "CUDA SigmoidMulTo launch failed.");
+    }
+
+    void CudaMambaSoftplusOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                       const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        Data &aLogData = *(datas.find("aLog")->second);
+        Data &dtBiasData = *(datas.find("dtBias")->second);
+        output.Allocate();
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 || input.dataType == DataType::FLOAT16,
+                        "CudaMambaSoftplusOp error: Data's type should be float32 or float16.\n");
+        AssertInFastLLM(aLogData.dataType == DataType::FLOAT32 && dtBiasData.dataType == DataType::FLOAT32,
+                        "CudaMambaSoftplusOp error: alog's type and dtbias's type should be float32.\n");
+        
+        float outputScale = floatParams.find("outputScale") != floatParams.end() ?
+            floatParams.find("outputScale")->second : 1.0f;
+        FastllmCudaMambaSoftplus(input, output, aLogData, dtBiasData, outputScale);
+    }
+
+    void CudaSigmoidMambaSoftplusOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                       const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &sigmoidInputOutput = *(datas.find("sigmoidInputOutput")->second);
+        Data &softplusInput = *(datas.find("softplusInput")->second);
+        Data &softplusOutput = *(datas.find("softplusOutput")->second);
+        Data &aLogData = *(datas.find("aLog")->second);
+        Data &dtBiasData = *(datas.find("dtBias")->second);
+        AssertInFastLLM(sigmoidInputOutput.dataType == DataType::FLOAT32 ||
+                        sigmoidInputOutput.dataType == DataType::FLOAT16,
+                        "CudaSigmoidMambaSoftplusOp error: input type should be float32 or float16.\n");
+        AssertInFastLLM(softplusInput.dataType == sigmoidInputOutput.dataType,
+                        "CudaSigmoidMambaSoftplusOp error: sigmoid and softplus input types should match.\n");
+        AssertInFastLLM(aLogData.dataType == DataType::FLOAT32 && dtBiasData.dataType == DataType::FLOAT32,
+                        "CudaSigmoidMambaSoftplusOp error: alog and dtbias types should be float32.\n");
+        softplusOutput.dataType = softplusInput.dataType;
+        softplusOutput.Resize(softplusInput.dims);
+        softplusOutput.Allocate();
+        FastllmCudaSigmoidMambaSoftplus(sigmoidInputOutput, softplusInput, softplusOutput, aLogData, dtBiasData);
+    }
+
+    void CudaAddOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                       const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        output.Allocate();
+
+        float v = floatParams.find("v") != floatParams.end() ? floatParams.find("v")->second : 1.0;
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
+                        input.dataType == DataType::FLOAT16, 
+                        "Mul error: Data's type should be float32 or float16.\n");
+        FastllmCudaAdd(input, v, output);
+    }
+
+    void CudaMulOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                       const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        output.Allocate();
+
+        float v = floatParams.find("v") != floatParams.end() ? floatParams.find("v")->second : 1.0;
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
+                        input.dataType == DataType::FLOAT16 ||
+                        input.dataType == DataType::BFLOAT16,
+                        "Mul error: Data's type should be float32, float16 or bfloat16.\n");
+        FastllmCudaMul(input, v, output);
+    }
+
+    void CudaAddToOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                         const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input0 = *(datas.find("input0")->second);
+        Data &input1 = *(datas.find("input1")->second);
+        float alpha = floatParams.find("alpha") != floatParams.end() ? floatParams.find("alpha")->second : 1.0;
+
+        if (!((input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT32) ||
+              (input0.dataType == DataType::FLOAT16 && input1.dataType == DataType::FLOAT16) ||
+              (input0.dataType == DataType::BFLOAT16 && input1.dataType == DataType::BFLOAT16))) {
+            std::ostringstream oss;
+            oss << "AddTo error: Data's type should be float32, float16 or bfloat16."
+                << " input0.name=" << input0.name
+                << " input1.name=" << input1.name
+                << " input0.type=" << (int) input0.dataType
+                << " input1.type=" << (int) input1.dataType
+                << " input0.device=" << (int) input0.dataDevice
+                << " input1.device=" << (int) input1.dataDevice
+                << " input0.dims=[";
+            for (int i = 0; i < input0.dims.size(); i++) {
+                if (i > 0) oss << ",";
+                oss << input0.dims[i];
+            }
+            oss << "] input1.dims=[";
+            for (int i = 0; i < input1.dims.size(); i++) {
+                if (i > 0) oss << ",";
+                oss << input1.dims[i];
+            }
+            oss << "] alpha=" << alpha;
+            ErrorInFastLLM(oss.str());
+        }
+        AssertInFastLLM(input0.dims == input1.dims, "AddTo error: input's shape should be same.\n");
+        FastllmCudaAddTo(input0, input1, alpha);
+    }
+
+    void CudaMulToOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                          const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input0 = *(datas.find("input0")->second);
+        Data &input1 = *(datas.find("input1")->second);
+        float alpha = floatParams.find("alpha") != floatParams.end() ? floatParams.find("alpha")->second : 1.0;
+        AssertInFastLLM(
+            input0.dataType == input1.dataType &&
+            (input0.dataType == DataType::FLOAT32 ||
+             input0.dataType == DataType::FLOAT16 ||
+             input0.dataType == DataType::BFLOAT16),
+            "MulTo error: inputs should have the same float32, float16 or bfloat16 type.\n");
+        AssertInFastLLM(input0.dims == input1.dims || input1.Count(0) == 1
+                        || input0.Count(0) % input1.Count(0) == 0, "MulTo error: input's shape should be same.\n");
+        FastllmCudaMulTo(input0, input1, alpha);
+    }
+
+    void CudaAttentionMaskOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                  const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &mask = *(datas.find("mask")->second);
+        float maskValue = floatParams.find("maskValue") != floatParams.end() ? floatParams.find("maskValue")->second : -10000.0;
+        FastllmCudaAttentionMask(input, mask, maskValue);
+    }
+
+    void CudaAlibiMaskOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                              const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &mask = *(datas.find("mask")->second);
+        float maskValue = floatParams.find("maskValue") != floatParams.end() ? floatParams.find("maskValue")->second : -10000.0;
+        FastllmCudaAlibiMask(input, mask, maskValue);
+    }
+
+    void CudaTransferAttnOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        FastllmCudaTransferAttn(input);
+    }
+
+    void CudaApplyChunkDecayByLastLogGOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &g = *(datas.find("g")->second);
+        AssertInFastLLM((input.dataType == DataType::FLOAT32 && g.dataType == DataType::FLOAT32) ||
+                        (input.dataType == DataType::FLOAT16 && g.dataType == DataType::FLOAT16) ||
+                        (input.dataType == DataType::BFLOAT16 && g.dataType == DataType::BFLOAT16),
+                        "ApplyChunkDecayByLastLogG's input's type should be float32, float16 or bfloat16.\n");
+        AssertInFastLLM(input.dims.size() >= 2 && g.dims.size() >= 1,
+                        "ApplyChunkDecayByLastLogG error: invalid dims.\n");
+        int dim = input.dims[input.dims.size() - 2];
+        AssertInFastLLM(g.dims.back() == dim && input.Count(0) == g.Count(0) * input.dims.back(),
+                        "ApplyChunkDecayByLastLogG error: input and g shape mismatch.\n");
+        FastllmCudaApplyChunkDecayByLastLogG(input, g);
+    }
+
+    void CudaCumSumLastDimOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        FastllmCudaCumSumLastDim(input);
+    }
+
+    void CudaTopKOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                            const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        int topk = intParams.find("topk") != intParams.end() ? intParams.find("topk")->second : 1;
+
+        AssertInFastLLM(input.dataType == DataType::FLOAT32, "TopK error: Data's type should be float32.\n");
+        
+        int dimsLen = input.dims.size();
+        std::vector<int> dims = input.dims;
+        dims[dimsLen - 1] = topk * 2;
+
+        output.dataType = input.dataType;
+        output.Resize(dims);
+    }
+
+    bool CudaTopKOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                            const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        int topk = intParams.find("topk") != intParams.end() ? intParams.find("topk")->second : 1;
+        if (topk > 50) {
+            return false;
+        }
+        return true;
+    }
+
+    void CudaTopKOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                        const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        output.Allocate(false);
+        int topk = intParams.find("topk") != intParams.end() ? intParams.find("topk")->second : -1;
+        FastllmCudaTopK(input, output, topk);
+    }
+
+    void CudaSelectExpertOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                                      const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &logits = *(datas.find("logits")->second);
+        Data &index = *(datas.find("index")->second);
+        Data &score = *(datas.find("score")->second);
+        int topk = intParams.find("topk") != intParams.end() ? intParams.find("topk")->second : 1;
+
+        AssertInFastLLM(logits.dataType == DataType::FLOAT32, "SelectExpert error: logits's type should be float32.\n");
+        
+        int dimsLen = logits.dims.size();
+        int n = logits.Count(0) / logits.dims[dimsLen - 1]; // number of tokens
+        int numExperts = logits.dims[dimsLen - 1]; // number of experts
+
+        // Index output: [n, topk]
+        index.dataType = DataType::INT32;
+        index.Resize({n, topk});
+        
+        // Score output: [n, topk]
+        score.dataType = DataType::FLOAT32;
+        score.Resize({n, topk});
+    }
+
+    bool CudaSelectExpertOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                                     const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        int topk = intParams.find("topk") != intParams.end() ? intParams.find("topk")->second : 1;
+        if (topk > 50) {
+            return false; // 回退到 CPU 实现
+        }
+        return true;
+    }
+
+    void CudaSelectExpertOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &logits = *(datas.find("logits")->second);
+        Data &index = *(datas.find("index")->second);
+        Data &score = *(datas.find("score")->second);
+        Data *gateBias = datas.find("gateBias") != datas.end() ? datas.find("gateBias")->second : nullptr;
+        
+        int topk = intParams.find("topk") != intParams.end() ? intParams.find("topk")->second : 1;
+        bool needNorm = intParams.find("needNorm") != intParams.end() ? (intParams.find("needNorm")->second != 0) : false;
+        float routeScale = floatParams.find("routeScale") != floatParams.end() ? floatParams.find("routeScale")->second : 1.0f;
+        
+        index.Allocate(false);
+        score.Allocate(false);
+        
+        bool success = FastllmCudaSelectExpert(logits, gateBias, index, score, topk, needNorm, routeScale);
+        if (!success) {
+            ErrorInFastLLM("CudaSelectExpert failed, topk may be too large (> 50).\n");
+        }
+    }
+
+    void CudaFusedSelectExpertOp::Reshape(
+            const std::string &opType, const fastllm::DataDict &datas,
+            const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &logits = *(datas.find("logits")->second);
+        Data &index = *(datas.find("index")->second);
+        Data &score = *(datas.find("score")->second);
+        int topk = intParams.find("topk") != intParams.end() ? intParams.find("topk")->second : 1;
+
+        AssertInFastLLM(!logits.dims.empty(),
+                        "FusedSelectExpert requires non-empty logits.\n");
+        int experts = logits.dims.back();
+        int tokens = logits.Count(0) / experts;
+        index.dataType = DataType::INT32;
+        index.Resize({tokens, topk});
+        score.dataType = DataType::FLOAT32;
+        score.Resize({tokens, topk});
+    }
+
+    bool CudaFusedSelectExpertOp::CanRun(
+            const std::string &opType, const fastllm::DataDict &datas,
+            const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        auto logitsIt = datas.find("logits");
+        auto indexIt = datas.find("index");
+        auto scoreIt = datas.find("score");
+        if (logitsIt == datas.end() || logitsIt->second == nullptr ||
+            indexIt == datas.end() || indexIt->second == nullptr ||
+            scoreIt == datas.end() || scoreIt->second == nullptr) {
+            return false;
+        }
+        const Data &logits = *logitsIt->second;
+        int topk = intParams.find("topk") != intParams.end() ? intParams.find("topk")->second : 1;
+        bool sigmoid = opType == "FusedSigmoidSelectExpert";
+        const bool validType =
+            logits.dataType == DataType::FLOAT16 ||
+            logits.dataType == DataType::BFLOAT16 ||
+            logits.dataType == DataType::FLOAT32;
+        const bool supported256 =
+            !logits.dims.empty() && logits.dims.back() == 256 &&
+            topk == (sigmoid ? 10 : 8) && validType;
+        const bool supportedQwen4 =
+            !sigmoid && !logits.dims.empty() &&
+            logits.dims.back() == 512 && topk == 10 &&
+            logits.dataType == DataType::FLOAT32;
+        if ((!sigmoid && opType != "FusedSoftmaxSelectExpert") ||
+            logits.Count(0) == 0 ||
+            (!supported256 && !supportedQwen4)) {
+            return false;
+        }
+        auto biasIt = datas.find("gateBias");
+        if (biasIt != datas.end() && biasIt->second != nullptr && !biasIt->second->dims.empty()) {
+            const Data &bias = *biasIt->second;
+            const bool validBiasType = supportedQwen4
+                ? bias.dataType == DataType::FLOAT32
+                : (bias.dataType == DataType::FLOAT32 ||
+                   bias.dataType == DataType::FLOAT16 ||
+                   bias.dataType == DataType::BFLOAT16);
+            if (!validBiasType ||
+                bias.Count(0) != logits.dims.back()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void CudaFusedSelectExpertOp::Run(
+            const std::string &opType, const fastllm::DataDict &datas,
+            const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &logits = *(datas.find("logits")->second);
+        Data &index = *(datas.find("index")->second);
+        Data &score = *(datas.find("score")->second);
+        Data *gateBias = datas.find("gateBias") != datas.end() ? datas.find("gateBias")->second : nullptr;
+        int topk = intParams.find("topk") != intParams.end() ? intParams.find("topk")->second : 1;
+        bool needNorm = intParams.find("needNorm") != intParams.end() && intParams.find("needNorm")->second != 0;
+        float routeScale = floatParams.find("routeScale") != floatParams.end() ?
+                           floatParams.find("routeScale")->second : 1.0f;
+
+        index.Allocate(false);
+        score.Allocate(false);
+        bool success = opType == "FusedSigmoidSelectExpert" ?
+            FastllmCudaFusedSigmoidSelectExpert(
+                logits, gateBias, index, score, topk, needNorm, routeScale) :
+            FastllmCudaFusedSoftmaxSelectExpert(
+                logits, gateBias, index, score, topk, needNorm, routeScale);
+        AssertInFastLLM(success,
+                        "CudaFusedSelectExpert received an unsupported input.\n");
+    }
+
+    void DoCudaPermuteSelf(Data &input, const std::vector <int> &axis) {
+        bool same = false;
+        same |= ((axis == std::vector <int>{1, 2, 0} || axis == std::vector <int>{1, 0, 2}) && (input.dims[0] == 1 || input.dims[1] == 1));
+        same |= ((axis == std::vector <int>{2, 0, 1, 3}) && input.dims[2] == 1);
+        same |= ((axis == std::vector <int>{2, 0, 1, 3}) && input.dims[0] == 1 && input.dims[1] == 1);
+        same |= ((axis == std::vector <int>{0, 2, 1, 3}) && (input.dims[1] == 1 || input.dims[2] == 1));
+        same |= ((axis == std::vector <int>{1, 0, 2, 3}) && (input.dims[0] == 1 || input.dims[1] == 1));
+        same |= ((axis == std::vector <int>{1, 2, 0, 3}) && input.dims[1] == 1 && input.dims[2] == 1);
+        same |= ((axis == std::vector <int>{0, 2, 1}) && (input.dims[1] == 1 || input.dims[2] == 1));
+        if (same) {
+            std::vector<int> new_dims;
+            for (int i = 0; i < axis.size(); i++) {
+                new_dims.push_back(input.dims[axis[i]]);
+            }
+            input.Resize(new_dims);
+            return;
+        }
+        FastllmCudaPermute(input, axis);
+    }
+
+    void CudaPermuteSelfOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                               const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &axisData = *(datas.find("axis")->second);
+        std::vector <int> axis;
+        for (int i = 0; i < axisData.Count(0); i++) {
+            axis.push_back(((int32_t *) axisData.cpuData)[i]);
+        }
+
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
+                                input.dataType == DataType::FLOAT16 ||
+                                input.dataType == DataType::BFLOAT16,
+                                "Permute error: datatype should be float32, float16 or bfloat16.");
+        AssertInFastLLM(axis.size() == input.dims.size(), "Permute error: axis's size should be equal to data's shape's size.");
+        DoCudaPermuteSelf(input, axis);
+    }
+
+    void CudaRotatePosition2DOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                    const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &data = *(datas.find("input")->second);
+        Data &positionIds = *(datas.find("positionIds")->second);
+        Data &sinData = *(datas.find("sin")->second);
+        Data &cosData = *(datas.find("cos")->second);
+        int rotaryDim = intParams.find("rotaryDim") != intParams.end() ? intParams.find("rotaryDim")->second : 64;
+
+        FastllmCudaRotatePosition2D(data, positionIds, sinData, cosData, rotaryDim);
+    }
+
+    void CudaNearlyRotatePosition2DOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                     const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &data = *(datas.find("input")->second);
+        Data &positionIds = *(datas.find("positionIds")->second);
+        Data &sinData = *(datas.find("sin")->second);
+        Data &cosData = *(datas.find("cos")->second);
+        int rotaryDim = intParams.find("rotaryDim") != intParams.end() ? intParams.find("rotaryDim")->second : 64;
+        int positionStride = intParams.find("positionStride") != intParams.end() ? intParams.find("positionStride")->second : 1;
+
+        FastllmCudaNearlyRotatePosition2D(data, positionIds, sinData, cosData, rotaryDim, positionStride);
+    }
+
+    void CudaLlamaRotatePosition2DOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                     const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &data = *(datas.find("input")->second);
+        Data &positionIds = *(datas.find("positionIds")->second);
+        Data &sinData = *(datas.find("sin")->second);
+        Data &cosData = *(datas.find("cos")->second);
+        int rotaryDim = intParams.find("rotaryDim") != intParams.end() ? intParams.find("rotaryDim")->second : 128;
+
+        FastllmCudaLlamaRotatePosition2D(data, positionIds, sinData, cosData, rotaryDim);
+    }
+
+    void CudaLlamaRotatePosition2DPartOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                     const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &data = *(datas.find("input")->second);
+        Data &positionIds = *(datas.find("positionIds")->second);
+        Data &sinData = *(datas.find("sin")->second);
+        Data &cosData = *(datas.find("cos")->second);
+        int rotaryDim = intParams.find("rotaryDim") != intParams.end() ? intParams.find("rotaryDim")->second : 128;
+        int part = intParams.find("part") != intParams.end() ? intParams.find("part")->second : 128;
+
+        FastllmCudaLlamaRotatePosition2DPart(data, positionIds, sinData, cosData, rotaryDim, part);
+    }
+
+    void CudaRopeEncodingOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                     const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &data = *(datas.find("input")->second);
+        Data &positionIds = *(datas.find("positionIds")->second);
+        int rotaryDim = intParams.find("rotaryDim") != intParams.end() ? intParams.find("rotaryDim")->second : 128;
+        float ropeTheta = floatParams.find("ropeTheta") != floatParams.end() ? floatParams.find("ropeTheta")->second : 10000.0f;
+        float ropeScale = floatParams.find("ropeScale") != floatParams.end() ? floatParams.find("ropeScale")->second : 1.0f;
+
+        FastllmCudaRopeEncoding(data, positionIds, rotaryDim, ropeTheta, ropeScale);
+    }
+
+    void CudaLlama3RopeEncodingOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                       const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &data = *(datas.find("input")->second);
+        Data &positionIds = *(datas.find("positionIds")->second);
+        int rotaryDim = intParams.find("rotaryDim") != intParams.end() ? intParams.find("rotaryDim")->second : 128;
+        float ropeTheta = floatParams.find("ropeTheta") != floatParams.end() ? floatParams.find("ropeTheta")->second : 10000.0f;
+        float factor = floatParams.find("factor") != floatParams.end() ? floatParams.find("factor")->second : 1.0f;
+        float originalMaxPosition = floatParams.find("originalMaxPosition") != floatParams.end() ? floatParams.find("originalMaxPosition")->second : 131072.0f;
+        float lowFreqFactor = floatParams.find("lowFreqFactor") != floatParams.end() ? floatParams.find("lowFreqFactor")->second : 1.0f;
+        float highFreqFactor = floatParams.find("highFreqFactor") != floatParams.end() ? floatParams.find("highFreqFactor")->second : 32.0f;
+
+        FastllmCudaLlama3RopeEncoding(data, positionIds, rotaryDim, ropeTheta, factor,
+                                      originalMaxPosition, lowFreqFactor, highFreqFactor);
+    }
+
+    void CudaYarnRopeEncodingOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                     const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &data = *(datas.find("input")->second);
+        Data &positionIds = *(datas.find("positionIds")->second);
+        int rotaryDim = intParams.find("rotaryDim") != intParams.end() ? intParams.find("rotaryDim")->second : 128;
+        float ropeTheta = floatParams.find("ropeTheta") != floatParams.end() ? floatParams.find("ropeTheta")->second : 10000.0f;
+        float factor = floatParams.find("factor") != floatParams.end() ? floatParams.find("factor")->second : 1.0f;
+        float attentionFactor = floatParams.find("attentionFactor") != floatParams.end() ? floatParams.find("attentionFactor")->second : 1.0f;
+        float correctionLow = floatParams.find("correctionLow") != floatParams.end() ? floatParams.find("correctionLow")->second : 0.0f;
+        float correctionHigh = floatParams.find("correctionHigh") != floatParams.end() ? floatParams.find("correctionHigh")->second : 1.0f;
+
+        FastllmCudaYarnRopeEncoding(data, positionIds, rotaryDim, ropeTheta, factor,
+                                    attentionFactor, correctionLow, correctionHigh,
+                                    intParams.count("mrope") ? intParams.at("mrope") : 0,
+                                    intParams.count("sectionH") ? intParams.at("sectionH") : 0,
+                                    intParams.count("sectionW") ? intParams.at("sectionW") : 0);
+    }
+
+    void CudaQwen35InterleavedRopeOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                          const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &data = *(datas.find("input")->second);
+        Data &positionIds = *(datas.find("positionIds")->second);
+        int rotaryDim = intParams.find("rotaryDim") != intParams.end() ? intParams.find("rotaryDim")->second : 128;
+        int sectionT = intParams.find("sectionT") != intParams.end() ? intParams.find("sectionT")->second : 0;
+        int sectionH = intParams.find("sectionH") != intParams.end() ? intParams.find("sectionH")->second : 0;
+        int sectionW = intParams.find("sectionW") != intParams.end() ? intParams.find("sectionW")->second : 0;
+        float ropeTheta = floatParams.find("ropeTheta") != floatParams.end() ? floatParams.find("ropeTheta")->second : 10000.0f;
+        float ropeScale = floatParams.find("ropeScale") != floatParams.end() ? floatParams.find("ropeScale")->second : 1.0f;
+
+        FastllmCudaQwen35InterleavedRope(data, positionIds, rotaryDim, sectionT, sectionH, sectionW, ropeTheta, ropeScale);
+    }
+
+    void CudaQKVRMSNormRopeOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                     const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &qkv = *(datas.find("qkv")->second);
+        Data &qNormWeight = *(datas.find("qNormWeight")->second);
+        Data &kNormWeight = *(datas.find("kNormWeight")->second);
+        Data &positionIds = *(datas.find("positionIds")->second);
+        int q_heads = intParams.find("q_heads")->second;
+        int k_heads = intParams.find("k_heads")->second;
+        int head_dim = intParams.find("head_dim")->second;
+        int rotateDim = intParams.find("rotaryDim") != intParams.end() ? intParams.find("rotaryDim")->second : 128;
+        float eps = floatParams.find("eps")->second;
+        float ropeTheta = floatParams.find("ropeTheta") != floatParams.end() ? floatParams.find("ropeTheta")->second : 10000.0f;
+        float ropeScale = floatParams.find("ropeScale") != floatParams.end() ? floatParams.find("ropeScale")->second : 1.0f;
+
+        FastllmCudaQKVRMSNormRope(qkv, qNormWeight, kNormWeight, positionIds,
+                                   q_heads, k_heads, head_dim, rotateDim, eps, ropeTheta, ropeScale);
+    }
+
+    void CudaQKVRMSNormRopeSplitAppendPagedCacheOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                     const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &qkv = *(datas.find("qkv")->second);
+        Data &qNormWeight = *(datas.find("qNormWeight")->second);
+        Data &kNormWeight = *(datas.find("kNormWeight")->second);
+        Data &positionIds = *(datas.find("positionIds")->second);
+        Data &qOutput = *(datas.find("qOutput")->second);
+        Data &pagedKCacheData = *(datas.find("pagedKCacheData")->second);
+        Data &pagedVCacheData = *(datas.find("pagedVCacheData")->second);
+        Data &insertIndexs = *(datas.find("insertIndexs")->second);
+        Data &insertPositions = *(datas.find("insertPositions")->second);
+        Data *lastPageLens = nullptr;
+        auto lastPageLensIt = datas.find("lastPageLens");
+        if (lastPageLensIt != datas.end()) {
+            lastPageLens = lastPageLensIt->second;
+        }
+
+        int q_heads = intParams.find("q_heads")->second;
+        int k_heads = intParams.find("k_heads")->second;
+        int head_dim = intParams.find("head_dim")->second;
+        int rotateDim = intParams.find("rotaryDim") != intParams.end() ? intParams.find("rotaryDim")->second : 128;
+        int pageLen = intParams.find("pageLen")->second;
+        int batch = intParams.find("batch")->second;
+        float eps = floatParams.find("eps")->second;
+        float ropeTheta = floatParams.find("ropeTheta") != floatParams.end() ? floatParams.find("ropeTheta")->second : 10000.0f;
+        float ropeScale = floatParams.find("ropeScale") != floatParams.end() ? floatParams.find("ropeScale")->second : 1.0f;
+
+        int doQKNorm = intParams.find("doQKNorm") != intParams.end() ? intParams.find("doQKNorm")->second : 1;
+        int useLlama3 = intParams.find("useLlama3") != intParams.end() ? intParams.find("useLlama3")->second : 0;
+        float llama3Factor = floatParams.find("llama3Factor") != floatParams.end() ? floatParams.find("llama3Factor")->second : 1.0f;
+        float llama3OriginalMaxPosition = floatParams.find("llama3OriginalMaxPosition") != floatParams.end() ?
+            floatParams.find("llama3OriginalMaxPosition")->second : 131072.0f;
+        float llama3LowFreqFactor = floatParams.find("llama3LowFreqFactor") != floatParams.end() ?
+            floatParams.find("llama3LowFreqFactor")->second : 1.0f;
+        float llama3HighFreqFactor = floatParams.find("llama3HighFreqFactor") != floatParams.end() ?
+            floatParams.find("llama3HighFreqFactor")->second : 32.0f;
+        int useYarn = intParams.find("useYarn") != intParams.end() ? intParams.find("useYarn")->second : 0;
+        float yarnFactor = floatParams.find("yarnFactor") != floatParams.end() ?
+            floatParams.find("yarnFactor")->second : 1.0f;
+        float yarnAttentionFactor = floatParams.find("yarnAttentionFactor") != floatParams.end() ?
+            floatParams.find("yarnAttentionFactor")->second : 1.0f;
+        float yarnCorrectionLow = floatParams.find("yarnCorrectionLow") != floatParams.end() ?
+            floatParams.find("yarnCorrectionLow")->second : 0.0f;
+        float yarnCorrectionHigh = floatParams.find("yarnCorrectionHigh") != floatParams.end() ?
+            floatParams.find("yarnCorrectionHigh")->second : 1.0f;
+
+        AssertInFastLLM(batch > 0 && pageLen > 0,
+                        "CudaQKVRMSNormRopeSplitAppendPagedCacheOp: batch and pageLen must be positive.\n");
+        AssertInFastLLM(qkv.dims.size() == 3 && qkv.dims[0] * qkv.dims[1] == batch,
+                        "CudaQKVRMSNormRopeSplitAppendPagedCacheOp: qkv token count must match logical batch.\n");
+        AssertInFastLLM(pagedKCacheData.dims.size() == 4 && pagedVCacheData.dims.size() == 4,
+                        "CudaQKVRMSNormRopeSplitAppendPagedCacheOp: paged KV cache data should have 4 dimensions.\n");
+        AssertInFastLLM(pagedKCacheData.dims[0] == pagedVCacheData.dims[0] &&
+                        pagedKCacheData.dims[1] == pageLen &&
+                        pagedVCacheData.dims[1] == pageLen,
+                        "CudaQKVRMSNormRopeSplitAppendPagedCacheOp: paged KV cache shape mismatch.\n");
+        AssertInFastLLM(insertIndexs.dims.size() == 1 && insertIndexs.dims[0] == batch &&
+                        insertPositions.dims.size() == 1 && insertPositions.dims[0] == batch,
+                        "CudaQKVRMSNormRopeSplitAppendPagedCacheOp: insert meta length should match batch.\n");
+        int maxPages = pagedKCacheData.dims[0];
+        if ((int)insertIndexs.cpuIntDatas.size() >= batch &&
+            (int)insertPositions.cpuIntDatas.size() >= batch) {
+            for (int i = 0; i < batch; i++) {
+                AssertInFastLLM(insertIndexs.cpuIntDatas[i] >= 0 && insertIndexs.cpuIntDatas[i] < maxPages,
+                                "CudaQKVRMSNormRopeSplitAppendPagedCacheOp: insert page index out of range.\n");
+                AssertInFastLLM(insertPositions.cpuIntDatas[i] >= 0 && insertPositions.cpuIntDatas[i] < pageLen,
+                                "CudaQKVRMSNormRopeSplitAppendPagedCacheOp: insert page offset out of range.\n");
+            }
+        }
+
+        // 分配 qOutput 内存
+        qOutput.Allocate();
+
+        if (lastPageLens != nullptr) {
+            if (lastPageLens->isFake) {
+                lastPageLens->isFake = false;
+                lastPageLens->cudaData = nullptr;
+                lastPageLens->cpuData = nullptr;
+                lastPageLens->expansionSize = 0;
+                lastPageLens->expansionBytes = 0;
+            }
+            for (auto &it : lastPageLens->multiDeviceDatas) {
+                delete it.second;
+            }
+            lastPageLens->multiDeviceDatas.clear();
+            lastPageLens->multiDeviceData = false;
+            lastPageLens->ClearTensorParallelLayout();
+            lastPageLens->dataType = DataType::INT32;
+            lastPageLens->dataDevice = DataDevice::CUDA;
+            lastPageLens->dataDeviceIds = {FastllmCudaGetDevice()};
+            lastPageLens->Resize({batch});
+            lastPageLens->Allocate(false);
+        }
+
+        AssertInFastLLM(FastllmCudaQKVRMSNormRopeSplitAppendPagedCache(
+            qkv, qNormWeight, kNormWeight, positionIds,
+            qOutput,
+            (uint8_t*)pagedKCacheData.cudaData, (uint8_t*)pagedVCacheData.cudaData,
+            (int32_t*)insertIndexs.cudaData, (int32_t*)insertPositions.cudaData,
+            lastPageLens != nullptr ? (int32_t*)lastPageLens->cudaData : nullptr,
+            q_heads, k_heads, head_dim, rotateDim, eps, ropeTheta, ropeScale,
+            pageLen, maxPages, pagedKCacheData.dataType, batch, doQKNorm,
+            useLlama3, llama3Factor, llama3OriginalMaxPosition,
+            llama3LowFreqFactor, llama3HighFreqFactor,
+            useYarn, yarnFactor, yarnAttentionFactor,
+            yarnCorrectionLow, yarnCorrectionHigh),
+            "CudaQKVRMSNormRopeSplitAppendPagedCacheOp: CUDA fused append failed.\n");
+    }
+
+    void CudaQwen35QGateKVRMSNormRopeSplitAppendPagedCacheOp::Run(
+            const std::string &opType, const fastllm::DataDict &datas,
+            const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &qgatekv = *(datas.find("qgatekv")->second);
+        Data &qNormWeight = *(datas.find("qNormWeight")->second);
+        Data &kNormWeight = *(datas.find("kNormWeight")->second);
+        Data &positionIds = *(datas.find("positionIds")->second);
+        Data &qOutput = *(datas.find("qOutput")->second);
+        Data &gateOutput = *(datas.find("gateOutput")->second);
+        Data &pagedKCacheData = *(datas.find("pagedKCacheData")->second);
+        Data &pagedVCacheData = *(datas.find("pagedVCacheData")->second);
+        Data &insertIndexs = *(datas.find("insertIndexs")->second);
+        Data &insertPositions = *(datas.find("insertPositions")->second);
+        Data *lastPageLens = nullptr;
+        auto lastPageLensIt = datas.find("lastPageLens");
+        if (lastPageLensIt != datas.end()) {
+            lastPageLens = lastPageLensIt->second;
+        }
+
+        int qHeads = intParams.find("q_heads")->second;
+        int kHeads = intParams.find("k_heads")->second;
+        int headDim = intParams.find("head_dim")->second;
+        int rotaryDim = intParams.find("rotaryDim") != intParams.end() ? intParams.find("rotaryDim")->second : 128;
+        int sectionT = intParams.find("sectionT") != intParams.end() ? intParams.find("sectionT")->second : 0;
+        int sectionH = intParams.find("sectionH") != intParams.end() ? intParams.find("sectionH")->second : 0;
+        int sectionW = intParams.find("sectionW") != intParams.end() ? intParams.find("sectionW")->second : 0;
+        int pageLen = intParams.find("pageLen")->second;
+        int batch = intParams.find("batch")->second;
+        int doQKNorm = intParams.find("doQKNorm") != intParams.end() ? intParams.find("doQKNorm")->second : 1;
+        float eps = floatParams.find("eps")->second;
+        float ropeTheta = floatParams.find("ropeTheta") != floatParams.end() ? floatParams.find("ropeTheta")->second : 10000.0f;
+        float ropeScale = floatParams.find("ropeScale") != floatParams.end() ? floatParams.find("ropeScale")->second : 1.0f;
+
+        qOutput.Allocate();
+        gateOutput.Allocate();
+
+        if (lastPageLens != nullptr) {
+            if (lastPageLens->isFake) {
+                lastPageLens->isFake = false;
+                lastPageLens->cudaData = nullptr;
+                lastPageLens->cpuData = nullptr;
+                lastPageLens->expansionSize = 0;
+                lastPageLens->expansionBytes = 0;
+            }
+            for (auto &it : lastPageLens->multiDeviceDatas) {
+                delete it.second;
+            }
+            lastPageLens->multiDeviceDatas.clear();
+            lastPageLens->multiDeviceData = false;
+            lastPageLens->ClearTensorParallelLayout();
+            lastPageLens->dataType = DataType::INT32;
+            lastPageLens->dataDevice = DataDevice::CUDA;
+            lastPageLens->dataDeviceIds = {FastllmCudaGetDevice()};
+            lastPageLens->Resize({batch});
+            lastPageLens->Allocate(false);
+        }
+
+        FastllmCudaQwen35QGateKVRMSNormRopeSplitAppendPagedCache(
+            qgatekv, qNormWeight, kNormWeight, positionIds,
+            qOutput, gateOutput,
+            (uint8_t*)pagedKCacheData.cudaData, (uint8_t*)pagedVCacheData.cudaData,
+            (int32_t*)insertIndexs.cudaData, (int32_t*)insertPositions.cudaData,
+            lastPageLens != nullptr ? (int32_t*)lastPageLens->cudaData : nullptr,
+            qHeads, kHeads, headDim, rotaryDim,
+            sectionT, sectionH, sectionW,
+            eps, ropeTheta, ropeScale, pageLen,
+            pagedKCacheData.dataType, batch, doQKNorm,
+            intParams.count("useYarn") ? intParams.at("useYarn") : 0,
+            floatParams.count("yarnFactor") ? floatParams.at("yarnFactor") : 1,
+            floatParams.count("yarnAttentionFactor") ? floatParams.at("yarnAttentionFactor") : 1,
+            floatParams.count("yarnCorrectionLow") ? floatParams.at("yarnCorrectionLow") : 0,
+            floatParams.count("yarnCorrectionHigh") ? floatParams.at("yarnCorrectionHigh") : 1);
+    }
+
+    void CudaRepeatPenaltyOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                         const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &penalty = *(datas.find("penalty")->second);
+        Data &penaltyScale = *(datas.find("penaltyScale")->second);
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 && penalty.dataType == DataType::FLOAT32 && penaltyScale.dataType == DataType::FLOAT32,
+                        "Repeat Penalty error: Data's type should be float32.\n");
+        FastllmCudaRepeatPenalty(input, penalty, penaltyScale);
+    }
+
+    void CudaApplyLognAttnOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &lognAttn = *(datas.find("lognAttn")->second);
+        Data &positionIds = *(datas.find("positionIds")->second);
+
+        FastllmCudaApplyLognAttn(input, lognAttn, positionIds);
+    }
+
+    void CudaRecurrentGatedDeltaRuleOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &q = *(datas.find("q")->second);
+        Data &k = *(datas.find("k")->second);
+        Data &v = *(datas.find("v")->second);
+        Data &g = *(datas.find("g")->second);
+        Data &b = *(datas.find("b")->second);
+        Data &last_recurrent_state = *(datas.find("last_recurrent_state")->second);
+        Data &core_attn_out = *(datas.find("core_attn_out")->second);
+        float qScale = floatParams.find("qScale") != floatParams.end() ? floatParams.find("qScale")->second : 1.0f;
+        core_attn_out.Allocate();
+        FastllmRecurrentGatedDeltaRule(q, k, v, g, b, last_recurrent_state, core_attn_out, qScale);
+    }
+
+    void CudaChunkGatedDeltaRulePrefillOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &q = *(datas.find("q")->second);
+        Data &k = *(datas.find("k")->second);
+        Data &v = *(datas.find("v")->second);
+        Data &g = *(datas.find("g")->second);
+        Data &attn = *(datas.find("attn")->second);
+        auto decayMaskIt = datas.find("decay_mask");
+        Data *decayMask = decayMaskIt == datas.end()
+            ? nullptr : decayMaskIt->second;
+        Data &k_cumdecay = *(datas.find("k_cumdecay")->second);
+        Data &last_recurrent_state = *(datas.find("last_recurrent_state")->second);
+        Data &core_attn_out = *(datas.find("core_attn_out")->second);
+        bool fuseDecayMask =
+            intParams.find("fuse_decay_mask") != intParams.end() &&
+            intParams.find("fuse_decay_mask")->second != 0;
+        if (TryCudaTritonChunkGdnPrefill(
+                q, k, v, g, attn, decayMask, k_cumdecay,
+                last_recurrent_state, core_attn_out,
+                fuseDecayMask)) {
+            return;
+        }
+        if (decayMask != nullptr && fuseDecayMask) {
+            AssertInFastLLM(
+                FastllmCudaMulToCausalMask(
+                    attn, *decayMask, 1.0f, 1, 0.0f),
+                "CUDA chunk GDN prefill failed to apply decay mask "
+                "before native fallback.\n");
+        }
+        FastllmChunkGatedDeltaRulePrefill(q, k, v, g, attn, k_cumdecay, last_recurrent_state, core_attn_out);
+    }
+
+    void CudaCausalMaskOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        int base = intParams.find("base") != intParams.end() ? intParams.find("base")->second : 0;
+        float maskValue = floatParams.find("maskValue") != floatParams.end() ? floatParams.find("maskValue")->second : -10000.0;
+        FastllmCudaCausalMask(input, base, maskValue);
+    }
+
+    void CudaMakeDecayMaskOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        output.Allocate();
+        FastllmCudaMakeDecayMask(input, output);
+    }
+
+    void CudaMergeMLA::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                    const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &qNope = *(datas.find("qNope")->second);
+        Data &output = *(datas.find("output")->second);
+        // int b = qNope.dims[0], s = q_nope.dims[1], h = q_nope.dims[2], d = q_nope.dims[3], c = qNope.dims.back();
+        output.dataType = qNope.dataType;
+        output.Resize(qNope.dims);
+    }
+
+    void CudaMergeMLA::Run(const std::string &opType, const fastllm::DataDict &datas,
+                    const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &qNope = *(datas.find("qNope")->second);
+        Data &qPe = *(datas.find("qPe")->second);
+        Data &kvCache = *(datas.find("kvCache")->second);
+        Data &peCache = *(datas.find("peCache")->second);
+        Data &mask = *(datas.find("mask")->second);
+        Data &output = *(datas.find("output")->second);
+        float softmaxScale = floatParams.find("softmaxScale") != floatParams.end() ? floatParams.find("softmaxScale")->second : 1.0f;        
+        int b = qPe.dims[0], s = qPe.dims[1], h = qPe.dims[2], c = qNope.dims.back(), t = kvCache.dims[1], r = qPe.dims[3];
+        output.Allocate();
+
+        // qNope: {b * s, h, c}
+        // qPe: {b, s, h, r}
+        // kvCache : {1, t, r}
+        // peCache : {1, t, c}
+        // output : {b * s, h, c}
+
+        Data score0, score1;
+        if (b == 1 && s == 1 && mask.dims.size() == 0) {
+            FastllmCudaMLA(qNope, qPe, kvCache, peCache, score0, output, softmaxScale);
+        } else {
+            if ((double)b * s * h * t * 2 * 4 > 1e9) {
+                int parth = 1;
+                Data qNopePart, qPePart;
+                std::vector <Data> outputParts;
+                std::vector <Data*> outputPartPointers;
+                outputParts.resize((h - 1) / parth + 1);
+                for (int i = 0; i < outputParts.size(); i++) {
+                    outputPartPointers.push_back(&outputParts[i]);
+                }
+                for (int sth = 0; sth < h; sth += parth) {
+                    int idx = sth / parth;
+                    int curh = std::min(parth, h - sth);
+                    Split(qNope, 1, sth, sth + curh, qNopePart);
+                    Split(qPe, 2, sth, sth + curh, qPePart);
+                    qNopePart.Reshape({b, s * curh, c});
+                    MatMulTransB(qNopePart, peCache, score0);
+                    score0.Reshape({b, s, curh, t});
+                    qPePart.Reshape({b, s * curh, r});
+                    MatMulTransB(qPePart, kvCache, score1);
+                    score1.Reshape({b, s, curh, t});
+                    AddTo(score1, score0);
+                    Mul(score1, softmaxScale, score0);
+                    if (mask.dims.size() > 0) {
+                        score0.Reshape({b * s, curh, t});
+                        ToDataType(mask, qNope.dataType);
+                        AttentionMask(score0, mask, -10000);
+                    }
+
+                    Softmax(score0, score0, -1);
+                    score0.Reshape({b, s * curh, t});
+                    MatMul(score0, peCache, outputParts[idx]);
+                    outputParts[idx].Reshape({b, s, curh, c});
+                }
+                CatBatch(outputPartPointers, 2, output);
+                output.Reshape({b * s, h, c});
+            } else {
+                qNope.Reshape({b, s * h, c});
+                MatMulTransB(qNope, peCache, score0);
+                score0.Reshape({b, s, h, t});
+
+                qPe.Reshape({qPe.dims[0], -1, qPe.dims[3]});
+                MatMulTransB(qPe, kvCache, score1);
+                score1.Reshape({b, s, h, t});
+                AddTo(score1, score0);
+                Mul(score1, softmaxScale, score0);
+
+                if (mask.dims.size() > 0) {
+                    score0.Reshape({b * s, h, t});
+                    ToDataType(mask, qNope.dataType);
+                    AttentionMask(score0, mask, -10000);
+                }
+
+                Softmax(score0, score0, -1);
+                score0.Reshape({b, s * h, t});
+                MatMul(score0, peCache, output);
+            }
+        }
+    }
+
+    void CudaMergeMLAPaged::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                    const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &qNope = *(datas.find("qNope")->second);
+        Data &output = *(datas.find("output")->second);
+        output.dataType = qNope.dataType;
+        output.Resize(qNope.dims);
+    }
+
+    void CudaMergeMLAPaged::Run(const std::string &opType, const fastllm::DataDict &datas,
+                    const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &qNope = *(datas.find("qNope")->second);
+        Data &qPe = *(datas.find("qPe")->second);
+        Data &kvCachePaged = *(datas.find("kvCachePaged")->second);
+        Data &peCachePaged = *(datas.find("peCachePaged")->second);
+        Data &output = *(datas.find("output")->second);
+        output.Allocate();
+
+        float softmaxScale = floatParams.find("softmaxScale") != floatParams.end() ? floatParams.find("softmaxScale")->second : 1.0f;
+        int kvLen = intParams.find("kvLen") != intParams.end() ?
+            intParams.find("kvLen")->second : -1;
+
+        AssertInFastLLM(kvCachePaged.isPagedKVCache && peCachePaged.isPagedKVCache,
+            "CudaMergeMLAPaged: kvCachePaged and peCachePaged must be paged KV cache (isPagedKVCache=true).\n");
+        if (qNope.dataType != DataType::FLOAT16 &&
+            qNope.dataType != DataType::BFLOAT16) {
+            printf("CudaMergeMLAPaged: qNope must be FLOAT16 or BFLOAT16.\n");
+            return;
+        }
+
+        bool ok = FastllmCudaMLAPaged(
+            qNope, qPe, kvCachePaged, peCachePaged,
+            output, softmaxScale, kvLen);
+        AssertInFastLLM(ok, "CudaMergeMLAPaged: FastllmCudaMLAPaged failed.\n");
+    }
+
+    // 将 output.cpuData 中的值拷入 GPU，按数据类型加到 output.cudaData 中，然后将结果拷回 CPU
+    void ReduceSumFromCPU(Data &output) {
+        int len = output.Count(0);
+        FastllmCudaAddHostToDevice(output.cudaData, output.cpuData, len, output.dataType);
+    }
+
+    static inline void ApplyCudaMoeGate(Data &input, Data &output, MoeGateType gateType, bool isCrossSwiglu = false) {
+        if (gateType == MoeGateGeglu) {
+            DoCudaGegluReshape(input, output);
+            DoCudaGeglu(input, output);
+            return;
+        }
+        DoCudaSwigluReshape(input, output);
+        if (isCrossSwiglu) {
+            output.Allocate();
+            FastllmCudaCrossSwiglu(input, output);
+        } else {
+            DoCudaSwiglu(input, output);
+        }
+    }
+
+    struct CudaMergeMoeFromCpuWorkspace {
+        std::mutex mutex;
+        Data tempInput;
+        Data tempMiddle;
+        Data tempSwiglu;
+        Data tempOutput;
+        Data tempFloatMiddle;
+        Data tempFloatSwiglu;
+        Data tempFloatOutput;
+        Data floatOutput;
+    };
+
+    static CudaMergeMoeFromCpuWorkspace &GetCudaMergeMoeFromCpuWorkspace(
+            int deviceId) {
+        static std::mutex registryMutex;
+        static auto *workspaces =
+            new std::map<int, std::unique_ptr<CudaMergeMoeFromCpuWorkspace> >();
+        std::lock_guard<std::mutex> guard(registryMutex);
+        auto &workspace = (*workspaces)[deviceId];
+        if (!workspace) {
+            workspace.reset(new CudaMergeMoeFromCpuWorkspace());
+        }
+        return *workspace;
+    }
+
+    static bool IsDeepSeekV4CudaQuantizedWeight(const Data &weight) {
+        return weight.dataType == DataType::FP8_E4M3 ||
+               weight.dataType == DataType::FP8_E4M3_BLOCK_128 ||
+               weight.dataType == DataType::FP8_E4M3_PERCHANNEL ||
+               weight.dataType == DataType::NVFP4 ||
+               weight.dataType == DataType::NVFP4_BLOCK_16 ||
+               weight.dataType == DataType::NVFP4_BLOCK_16_PLANAR ||
+               weight.dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
+               weight.dataType == DataType::NVFP4_BLOCK_32_E8M0;
+    }
+
+    void DoCudaMergeMOEFromCPU (Data &input, Data &output, Data &index, Data &score, Data &w1, Data &w2, Data &w3, 
+        Data **weights, Data **biass, float sharedScale, bool setZero, const std::unordered_set<int> &experts, bool isCrossSwiglu,
+        MoeGateType gateType, bool deepSeekV4Mode, float swigluLimit) {
+        int curDeviceId = FastllmCudaGetDevice();
+        CudaMergeMoeFromCpuWorkspace &workspace =
+            GetCudaMergeMoeFromCpuWorkspace(curDeviceId);
+        std::lock_guard<std::mutex> workspaceGuard(workspace.mutex);
+        Data &tempInput = workspace.tempInput;
+        Data &tempMiddle = workspace.tempMiddle;
+        Data &tempSwiglu = workspace.tempSwiglu;
+        Data &tempOutput = workspace.tempOutput;
+        Data &tempFloatMiddle = workspace.tempFloatMiddle;
+        Data &tempFloatSwiglu = workspace.tempFloatSwiglu;
+        Data &tempFloatOutput = workspace.tempFloatOutput;
+        Data &floatOutput = workspace.floatOutput;
+        if (output.cudaData != nullptr) {
+            int outputPtrDevice = GetPointerDeviceId(output.cudaData);
+            if (outputPtrDevice >= 0 && outputPtrDevice != curDeviceId) {
+                FastllmCudaSetDevice(outputPtrDevice);
+                FastllmCudaFree(output.cudaData);
+                FastllmCudaSetDevice(curDeviceId);
+                output.cudaData = FastllmCudaMalloc(output.expansionBytes);
+            }
+        }
+        if (setZero) {
+            output.Allocate();
+            output.ToCudaTemporary({}, false);
+            FastllmCudaMemset0(output.cudaData, output.GetBytes());
+        } else {
+            output.ToCudaTemporary({}, true);
+        }
+        input.ToCudaTemporary({}, false);
+        int batch = input.dims[0];
+        
+        int32_t *indexData = (int32_t*)index.cpuData;
+        float *scoreData = (float*)score.cpuData;
+        int n = index.dims[0];
+        int topk = index.dims[1];
+        
+        // 计算最大专家数量
+        int maxExpert = 0;
+        for (int i = 0; i < n; i++) {
+            for (int j = 0; j < topk; j++) {
+                int expertIdx = indexData[i * topk + j];
+                if (expertIdx > maxExpert) {
+                    maxExpert = expertIdx;
+                }
+            }
+        }
+        int m = maxExpert + 1; // 专家数量
+        
+        std::vector <std::vector <std::pair <int, float> > > expertTasks; // expertTasks[i]代表专家i的task, expertTasks[i][j] = (第j个任务对应的行数， 权重)
+        expertTasks.resize(m + 1);
+        for (int b = 0; b < batch; b++) {
+            expertTasks[0].push_back(std::make_pair(b, sharedScale));
+            for (int j = 0; j < topk; j++) {
+                int expertIdx = indexData[b * topk + j];
+                float value = scoreData[b * topk + j];
+                expertTasks[expertIdx + 1].push_back(std::make_pair(b, value));
+            }
+        }
+
+        // Match the NUMA CPU path's FP32 projection outputs and expert
+        // reduction only for the ordinary packed-FP8 BF16 MoE path.
+        const bool accurateFp8Moe = [&]() {
+            if (!setZero || deepSeekV4Mode ||
+                input.dataType != DataType::BFLOAT16 ||
+                output.dataType != DataType::BFLOAT16 ||
+                gateType != MoeGateSwiglu || !isCrossSwiglu) {
+                return false;
+            }
+            bool hasGpuExpert = false;
+            int gateUpDim = -1;
+            int outputDim = -1;
+            for (int i = 0; i < (int)expertTasks.size(); i++) {
+                if (expertTasks[i].empty() ||
+                    experts.find(i) == experts.end() ||
+                    weights[i * 2] == nullptr) {
+                    continue;
+                }
+                hasGpuExpert = true;
+                if (weights[i * 2 + 1] == nullptr ||
+                    weights[i * 2]->dims.size() != 2 ||
+                    weights[i * 2 + 1]->dims.size() != 2 ||
+                    weights[i * 2]->dims[1] % 128 != 0 ||
+                    weights[i * 2 + 1]->dims[1] % 128 != 0 ||
+                    weights[i * 2]->dims[0] % 2 != 0 ||
+                    weights[i * 2]->dataType !=
+                        DataType::FP8_E4M3_BLOCK_128 ||
+                    weights[i * 2 + 1]->dataType !=
+                        DataType::FP8_E4M3_BLOCK_128) {
+                    return false;
+                }
+                if (gateUpDim < 0) {
+                    gateUpDim = weights[i * 2]->dims[0];
+                    outputDim = weights[i * 2 + 1]->dims[0];
+                } else if (weights[i * 2]->dims[0] != gateUpDim ||
+                           weights[i * 2 + 1]->dims[0] != outputDim) {
+                    return false;
+                }
+            }
+            return hasGpuExpert;
+        }();
+
+        auto isValidExpert = [&](int idx) {
+            return idx >= 0 && idx < (int)expertTasks.size() &&
+                   expertTasks[idx].size() > 0 &&
+                   experts.find(idx) != experts.end() &&
+                   weights[idx * 2] != nullptr;
+        };
+        auto findNextValidExpert = [&](int after) {
+            for (int j = after + 1; j < (int)expertTasks.size(); j++) {
+                if (isValidExpert(j)) return j;
+            }
+            return -1;
+        };
+
+        int accurateWorkspaceBatch = 0;
+        int accurateWorkspaceExpert = -1;
+        if (accurateFp8Moe) {
+            accurateWorkspaceExpert = findNextValidExpert(-1);
+            for (int i = accurateWorkspaceExpert; i >= 0;
+                 i = findNextValidExpert(i)) {
+                accurateWorkspaceBatch = std::max(
+                    accurateWorkspaceBatch, (int)expertTasks[i].size());
+            }
+            AssertInFastLLM(
+                accurateWorkspaceExpert >= 0 && accurateWorkspaceBatch > 0,
+                "CUDA NUMA MoE has no valid FP8 expert workspace.");
+        }
+
+        std::vector <int> indexVec;
+        std::vector <float> scales;
+        std::vector <int> startIdx;                
+        for (int i = 0; i < expertTasks.size(); i++) {
+            startIdx.push_back(indexVec.size());
+            for (int j = 0; j < expertTasks[i].size(); j++) {
+                indexVec.push_back(expertTasks[i][j].first);
+                scales.push_back(expertTasks[i][j].second);
+            }
+        }
+
+        int *cudaIndex = (int*)FastllmCudaMalloc(indexVec.size() * sizeof(int));
+        float *cudaScales = (float*)FastllmCudaMalloc(scales.size() * sizeof(float));
+        float *cudaUnitScales = nullptr;
+        FastllmCudaCopyFromHostToDevice(cudaIndex, indexVec.data(), indexVec.size() * sizeof(int));
+        FastllmCudaCopyFromHostToDevice(cudaScales, scales.data(), scales.size() * sizeof(float));
+        if (deepSeekV4Mode) {
+            AssertInFastLLM(
+                isCrossSwiglu && gateType == MoeGateSwiglu,
+                "DeepSeek-V4 CUDA NUMA MoE requires cross-SwiGLU weights.");
+            std::vector<float> unitScales(scales.size(), 1.0f);
+            cudaUnitScales = (float*)FastllmCudaMalloc(
+                unitScales.size() * sizeof(float));
+            FastllmCudaCopyFromHostToDevice(
+                cudaUnitScales, unitScales.data(),
+                unitScales.size() * sizeof(float));
+        }
+        tempInput.Resize(
+            accurateFp8Moe
+                ? std::vector<int>{accurateWorkspaceBatch, input.dims[1]}
+                : input.dims);
+        tempInput.dataType = input.dataType;
+        tempInput.ToDevice(
+            input.dataDevice, std::vector<int>{curDeviceId}, false);
+        tempInput.Allocate();
+
+        if (accurateFp8Moe) {
+            int gateUpDim = weights[accurateWorkspaceExpert * 2]->dims[0];
+
+            tempSwiglu.Resize(
+                {accurateWorkspaceBatch, gateUpDim / 2});
+            tempSwiglu.dataType = input.dataType;
+            tempSwiglu.ToDevice(
+                input.dataDevice, std::vector<int>{curDeviceId}, false);
+            tempSwiglu.Allocate();
+
+            tempFloatMiddle.dataType = DataType::FLOAT32;
+            tempFloatMiddle.Resize(
+                {accurateWorkspaceBatch, gateUpDim});
+            tempFloatMiddle.ToDevice(
+                input.dataDevice, std::vector<int>{curDeviceId}, false);
+            tempFloatMiddle.Allocate();
+
+            tempFloatSwiglu.dataType = DataType::FLOAT32;
+            tempFloatSwiglu.Resize(
+                {accurateWorkspaceBatch, gateUpDim / 2});
+            tempFloatSwiglu.ToDevice(
+                input.dataDevice, std::vector<int>{curDeviceId}, false);
+            tempFloatSwiglu.Allocate();
+
+            tempFloatOutput.dataType = DataType::FLOAT32;
+            tempFloatOutput.Resize(
+                {accurateWorkspaceBatch, output.dims[1]});
+            tempFloatOutput.ToDevice(
+                output.dataDevice, std::vector<int>{curDeviceId}, false);
+            tempFloatOutput.Allocate();
+
+            floatOutput.dataType = DataType::FLOAT32;
+            floatOutput.Resize(output.dims);
+            floatOutput.ToDevice(
+                output.dataDevice, std::vector<int>{curDeviceId}, false);
+            floatOutput.Allocate();
+            FastllmCudaMemset0(
+                floatOutput.cudaData, floatOutput.GetBytes());
+        } else {
+            tempMiddle.Resize({input.dims[0], weights[2]->dims[0]});
+            tempMiddle.dataType = input.dataType;
+            tempMiddle.ToDevice(
+                input.dataDevice, std::vector<int>{curDeviceId}, false);
+            tempMiddle.Allocate();
+
+            tempSwiglu.Resize(
+                {input.dims[0], weights[2]->dims[0] / 2});
+            tempSwiglu.dataType = input.dataType;
+            tempSwiglu.ToDevice(
+                input.dataDevice, std::vector<int>{curDeviceId}, false);
+            tempSwiglu.Allocate();
+
+            tempOutput.Resize(output.dims);
+            tempOutput.dataType = input.dataType;
+            tempOutput.ToDevice(
+                output.dataDevice, std::vector<int>{curDeviceId}, false);
+            tempOutput.Allocate();
+        }
+
+        void *copyStream = FastllmCudaStreamCreate(true);
+        void *computeDoneEvent = FastllmCudaEventCreate();
+        int curExpert = findNextValidExpert(-1);
+
+        if (curExpert >= 0) {
+            weights[curExpert * 2]->ToCudaTemporary({}, true);
+            weights[curExpert * 2 + 1]->ToCudaTemporary({}, true);
+        }
+
+        int prevExpert = -1;
+        while (curExpert >= 0) {
+            int nextExpert = findNextValidExpert(curExpert);
+
+            if (nextExpert >= 0) {
+                weights[nextExpert * 2]->ToCudaTemporary({}, true, copyStream);
+                weights[nextExpert * 2 + 1]->ToCudaTemporary({}, true, copyStream);
+            }
+
+            int i = curExpert;
+            tempInput.Resize({(int)expertTasks[i].size(), tempInput.dims[1]});
+            FastllmCudaPickInput (
+                (uint8_t*)input.cudaData, 
+                (uint8_t*)tempInput.cudaData, 
+                expertTasks[i].size(), 
+                GetDataBytes(input.dataType, 1, input.dims[1]), 
+                cudaIndex + startIdx[i]
+            );
+            if (accurateFp8Moe) {
+                int expertBatch = (int)expertTasks[i].size();
+                int hidden = tempInput.dims[1];
+                int gateUp = weights[i * 2]->dims[0];
+                int inter = gateUp / 2;
+                int outputDim = weights[i * 2 + 1]->dims[0];
+
+                tempFloatMiddle.Resize({expertBatch, gateUp});
+                AssertInFastLLM(
+                    FastllmCudaBFloat16MatMulFP8E4M3Block128ToFloat(
+                        tempInput, *weights[i * 2], *GetEmptyData(),
+                        tempFloatMiddle, expertBatch, hidden, gateUp),
+                    "CUDA NUMA MoE failed its FP32 gate/up projection.");
+                ApplyCudaMoeGate(
+                    tempFloatMiddle, tempFloatSwiglu,
+                    gateType, isCrossSwiglu);
+
+                // The down projection consumes BF16 activations on the CPU
+                // reference path, so keep this single precision boundary.
+                tempSwiglu.Resize({expertBatch, inter});
+                FastllmFloatToBF16(
+                    tempFloatSwiglu.cudaData, tempSwiglu.cudaData,
+                    tempFloatSwiglu.Count(0));
+
+                tempFloatOutput.Resize({expertBatch, outputDim});
+                AssertInFastLLM(
+                    FastllmCudaBFloat16MatMulFP8E4M3Block128ToFloat(
+                        tempSwiglu, *weights[i * 2 + 1],
+                        *GetEmptyData(), tempFloatOutput,
+                        expertBatch, inter, outputDim),
+                    "CUDA NUMA MoE failed its FP32 down projection.");
+            } else {
+                DoCudaLinearReshape(
+                    tempInput, *weights[i * 2], tempMiddle);
+                DoCudaLinear(
+                    tempInput, *weights[i * 2],
+                    *GetEmptyData(), tempMiddle);
+
+                if (deepSeekV4Mode) {
+                    AssertInFastLLM(
+                        FastllmCudaDeepSeekV4PrepareMoeDownInput(
+                            tempMiddle, tempSwiglu,
+                            cudaScales + startIdx[i], swigluLimit,
+                            IsDeepSeekV4CudaQuantizedWeight(
+                                *weights[i * 2 + 1])),
+                        "DeepSeek-V4 failed to prepare its CUDA MoE down input.");
+                } else {
+                    ApplyCudaMoeGate(
+                        tempMiddle, tempSwiglu,
+                        gateType, isCrossSwiglu);
+                }
+                DoCudaLinearReshape(
+                    tempSwiglu, *weights[i * 2 + 1], tempOutput);
+                DoCudaLinear(
+                    tempSwiglu, *weights[i * 2 + 1],
+                    *GetEmptyData(), tempOutput);
+            }
+
+            if (accurateFp8Moe) {
+                FastllmCudaPickOutputFloat(
+                    (float*)tempFloatOutput.cudaData,
+                    (float*)floatOutput.cudaData,
+                    expertTasks[i].size(), output.dims[1],
+                    cudaIndex + startIdx[i],
+                    cudaScales + startIdx[i]);
+            } else {
+                FastllmCudaPickOutput (
+                    (uint8_t*)tempOutput.cudaData,
+                    (uint8_t*)output.cudaData,
+                    expertTasks[i].size(),
+                    output.dims[1],
+                    cudaIndex + startIdx[i],
+                    (deepSeekV4Mode ? cudaUnitScales : cudaScales) +
+                        startIdx[i],
+                    tempOutput.dataType
+                );
+            }
+
+            FastllmCudaEventRecord(computeDoneEvent);
+            FastllmCudaStreamWaitEvent(copyStream, computeDoneEvent);
+
+            if (nextExpert >= 0) {
+                FastllmCudaStreamSynchronize(copyStream);
+            }
+
+            if (prevExpert >= 0) {
+                weights[prevExpert * 2]->FreeCudaTemporary({}, false);
+                weights[prevExpert * 2 + 1]->FreeCudaTemporary({}, false);
+            }
+
+            prevExpert = curExpert;
+            curExpert = nextExpert;
+        }
+
+        if (prevExpert >= 0) {
+            FastllmCudaEventSynchronize(computeDoneEvent);
+            weights[prevExpert * 2]->FreeCudaTemporary({}, false);
+            weights[prevExpert * 2 + 1]->FreeCudaTemporary({}, false);
+        }
+        if (accurateFp8Moe) {
+            FastllmFloatToBF16(
+                floatOutput.cudaData, output.cudaData,
+                output.Count(0));
+        }
+        FastllmCudaEventDestroy(computeDoneEvent);
+        FastllmCudaStreamDestroy(copyStream);
+
+        FastllmCudaFree(cudaIndex);
+        FastllmCudaFree(cudaScales);
+        if (cudaUnitScales != nullptr) {
+            FastllmCudaFree(cudaUnitScales);
+        }
+
+        input.FreeCudaTemporary({}, false);
+    }
+
+    void DoCudaKimiK3RoutedExpertsFromCPU(
+            Data &input, Data &output,
+            const int32_t *indexData, const float *scoreData, int topk,
+            Data **w1s, Data **w2s, Data **w3s, int expertCount,
+            float beta, float linearBeta, bool setZero,
+            const std::unordered_set<int> &experts) {
+        AssertInFastLLM(
+            input.dataType == DataType::BFLOAT16 &&
+            input.dataDevice == DataDevice::CUDA &&
+            input.cudaData != nullptr && input.dims.size() == 2 &&
+            output.dataType == DataType::BFLOAT16 &&
+            indexData != nullptr && scoreData != nullptr && topk > 0,
+            "CUDA KimiK3 routed-expert input is invalid.");
+
+        const int gpuId = FastllmCudaGetDevice();
+        output.ToDevice(DataDevice::CUDA, std::vector<int>{gpuId}, false);
+        output.Allocate(false);
+        if (setZero) {
+            FastllmCudaMemset0(output.cudaData, output.GetBytes());
+        }
+
+        const int tokens = input.dims[0];
+        std::vector<std::vector<std::pair<int, float>>> expertTasks(
+            expertCount);
+        for (int token = 0; token < tokens; token++) {
+            for (int slot = 0; slot < topk; slot++) {
+                const int expert = indexData[(size_t)token * topk + slot];
+                if (experts.find(expert) != experts.end()) {
+                    expertTasks[expert].emplace_back(
+                        token, scoreData[(size_t)token * topk + slot]);
+                }
+            }
+        }
+
+        std::vector<int> hostIndices;
+        std::vector<float> hostScales;
+        std::vector<int> expertOffsets(expertCount, -1);
+        int maxExpertRows = 0;
+        for (int expert = 0; expert < expertCount; expert++) {
+            if (expertTasks[expert].empty()) {
+                continue;
+            }
+            maxExpertRows = std::max(
+                maxExpertRows, (int)expertTasks[expert].size());
+            expertOffsets[expert] = (int)hostIndices.size();
+            for (const auto &task : expertTasks[expert]) {
+                hostIndices.push_back(task.first);
+                hostScales.push_back(task.second);
+            }
+        }
+        if (hostIndices.empty()) {
+            return;
+        }
+        constexpr int maxCudaExpertBatchRows = 1024;
+        const int cudaBufferRows = std::min(
+            maxExpertRows, maxCudaExpertBatchRows);
+
+        int *cudaIndices = (int*)FastllmCudaMalloc(
+            hostIndices.size() * sizeof(int));
+        float *cudaScales = (float*)FastllmCudaMalloc(
+            hostScales.size() * sizeof(float));
+        FastllmCudaCopyFromHostToDevice(
+            cudaIndices, hostIndices.data(),
+            hostIndices.size() * sizeof(int));
+        FastllmCudaCopyFromHostToDevice(
+            cudaScales, hostScales.data(),
+            hostScales.size() * sizeof(float));
+
+        const int inputDimension = input.dims[1];
+        const int intermediateDimension = w1s[0]->dims[0];
+        const int outputDimension = output.dims[1];
+        // These buffers are only live while routed experts are executing.
+        // Keeping them static pins roughly one micro-batch of input, three
+        // intermediate tensors and one output tensor across the rest of the
+        // decoder layer.  Large Kimi prefill chunks need that headroom for
+        // full hidden-state rows, and the allocator can reuse local buffers
+        // from its pool on the next routed-expert call.
+        Data tempInput, tempGate, tempUp, tempActivated, tempOutput;
+        auto prepareBuffer = [gpuId](
+                Data &buffer, DataType dataType,
+                const std::vector<int> &dims) {
+            buffer.dataType = dataType;
+            buffer.Resize(dims);
+            buffer.ToDevice(
+                DataDevice::CUDA, std::vector<int>{gpuId}, false);
+            buffer.Allocate(false);
+        };
+        prepareBuffer(
+            tempInput, input.dataType,
+            {cudaBufferRows, inputDimension});
+        prepareBuffer(
+            tempGate, input.dataType,
+            {cudaBufferRows, intermediateDimension});
+        prepareBuffer(
+            tempUp, input.dataType,
+            {cudaBufferRows, intermediateDimension});
+        prepareBuffer(
+            tempActivated, input.dataType,
+            {cudaBufferRows, intermediateDimension});
+        prepareBuffer(
+            tempOutput, input.dataType,
+            {cudaBufferRows, outputDimension});
+
+        auto isValidExpert = [&](int expert) {
+            return expert >= 0 && expert < expertCount &&
+                   !expertTasks[expert].empty() &&
+                   experts.find(expert) != experts.end() &&
+                   w1s[expert] != nullptr && w2s[expert] != nullptr &&
+                   w3s[expert] != nullptr;
+        };
+        auto findNextExpert = [&](int after) {
+            for (int expert = after + 1; expert < expertCount; expert++) {
+                if (isValidExpert(expert)) {
+                    return expert;
+                }
+            }
+            return -1;
+        };
+        auto loadExpert = [&](int expert, void *stream) {
+            w1s[expert]->ToCudaTemporary({}, true, stream);
+            w2s[expert]->ToCudaTemporary({}, true, stream);
+            w3s[expert]->ToCudaTemporary({}, true, stream);
+        };
+        auto freeExpert = [&](int expert) {
+            w1s[expert]->FreeCudaTemporary({}, false);
+            w2s[expert]->FreeCudaTemporary({}, false);
+            w3s[expert]->FreeCudaTemporary({}, false);
+        };
+
+        void *copyStream = FastllmCudaStreamCreate(true);
+        void *computeDoneEvent = FastllmCudaEventCreate();
+        int currentExpert = findNextExpert(-1);
+        if (currentExpert >= 0) {
+            loadExpert(currentExpert, nullptr);
+        }
+
+        int previousExpert = -1;
+        while (currentExpert >= 0) {
+            // The copy stream was synchronized at the end of the preceding
+            // iteration, after waiting for its compute-done event.  The
+            // previous expert is therefore no longer in use and can be
+            // released before prefetching another one.  This preserves the
+            // current-compute/next-copy overlap while reducing steady-state
+            // residency from three expert triplets to two.
+            if (previousExpert >= 0) {
+                freeExpert(previousExpert);
+                previousExpert = -1;
+            }
+            const int nextExpert = findNextExpert(currentExpert);
+            bool nextExpertPrefetched = false;
+            if (nextExpert >= 0) {
+                const long long nextWeightBytes =
+                    (long long)w1s[nextExpert]->GetBytes() +
+                    (long long)w2s[nextExpert]->GetBytes() +
+                    (long long)w3s[nextExpert]->GetBytes();
+                const long long freeBytes = FastllmCudaGetFreeSize();
+                // Keep asynchronous PCIe prefetch in the normal case, but
+                // do not let speculative residency consume the last memory
+                // needed by a full-chunk decoder activation.
+                if (freeBytes >= nextWeightBytes + (128LL << 20)) {
+                    loadExpert(nextExpert, copyStream);
+                    nextExpertPrefetched = true;
+                }
+            }
+
+            const int expertRows =
+                (int)expertTasks[currentExpert].size();
+            for (int rowStart = 0; rowStart < expertRows;
+                 rowStart += maxCudaExpertBatchRows) {
+                const int rows = std::min(
+                    maxCudaExpertBatchRows, expertRows - rowStart);
+                const int routeOffset =
+                    expertOffsets[currentExpert] + rowStart;
+                tempInput.Resize({rows, inputDimension});
+                FastllmCudaPickInput(
+                    (uint8_t*)input.cudaData,
+                    (uint8_t*)tempInput.cudaData,
+                    rows,
+                    GetDataBytes(
+                        input.dataType, 1, inputDimension),
+                    cudaIndices + routeOffset);
+
+                DoCudaLinearReshape(
+                    tempInput, *w1s[currentExpert], tempGate);
+                DoCudaLinear(
+                    tempInput, *w1s[currentExpert],
+                    *GetEmptyData(), tempGate);
+                DoCudaLinearReshape(
+                    tempInput, *w3s[currentExpert], tempUp);
+                DoCudaLinear(
+                    tempInput, *w3s[currentExpert],
+                    *GetEmptyData(), tempUp);
+                tempActivated.Resize(tempGate.dims);
+                AssertInFastLLM(
+                    FastllmCudaKimiK3SiTUAndMul(
+                        tempGate, tempUp, tempActivated,
+                        beta, linearBeta),
+                    "CUDA KimiK3 SiTU activation failed.");
+                DoCudaLinearReshape(
+                    tempActivated, *w2s[currentExpert], tempOutput);
+                DoCudaLinear(
+                    tempActivated, *w2s[currentExpert],
+                    *GetEmptyData(), tempOutput);
+                FastllmCudaPickOutput(
+                    (uint8_t*)tempOutput.cudaData,
+                    (uint8_t*)output.cudaData,
+                    rows, outputDimension,
+                    cudaIndices + routeOffset,
+                    cudaScales + routeOffset,
+                    tempOutput.dataType);
+            }
+
+            FastllmCudaEventRecord(computeDoneEvent);
+            if (nextExpertPrefetched) {
+                FastllmCudaStreamWaitEvent(copyStream, computeDoneEvent);
+                FastllmCudaStreamSynchronize(copyStream);
+                previousExpert = currentExpert;
+            } else {
+                FastllmCudaEventSynchronize(computeDoneEvent);
+                freeExpert(currentExpert);
+                if (nextExpert >= 0) {
+                    loadExpert(nextExpert, nullptr);
+                }
+            }
+            currentExpert = nextExpert;
+        }
+
+        if (previousExpert >= 0) {
+            FastllmCudaEventSynchronize(computeDoneEvent);
+            freeExpert(previousExpert);
+        }
+        FastllmCudaEventDestroy(computeDoneEvent);
+        FastllmCudaStreamDestroy(copyStream);
+        FastllmCudaFree(cudaIndices);
+        FastllmCudaFree(cudaScales);
+    }
+
+    static bool IsCudaMergeMoeFp8InputType(DataType dataType) {
+        return dataType == DataType::FLOAT16 || dataType == DataType::BFLOAT16;
+    }
+
+    static bool IsCudaMergeMoeGGUFInputType(DataType dataType) {
+        return dataType == DataType::FLOAT32 || IsCudaMergeMoeFp8InputType(dataType);
+    }
+
+    static bool IsCudaMergeMoeNVFP4WeightType(DataType dataType) {
+        return dataType == DataType::NVFP4 ||
+               dataType == DataType::NVFP4_BLOCK_16 ||
+               dataType == DataType::NVFP4_BLOCK_16_E8M0;
+    }
+
+    static bool TryCudaMergeMOEBatch1Int8Indexed(
+            const Data &input, Data &output, const Data &index, const Data &score,
+            int topk, Data &scratch, Data **weights, int weightsBatch,
+            MoeGateType gateType) {
+        if (gateType != MoeGateSwiglu || input.dataType != DataType::FLOAT16 ||
+            input.dataDevice != DataDevice::CUDA || input.dims.size() != 2 ||
+            input.dims[0] != 1 || topk <= 0 || topk > 8 ||
+            index.dataDevice != DataDevice::CUDA || index.dataType != DataType::INT32 ||
+            score.dataDevice != DataDevice::CUDA || score.dataType != DataType::FLOAT32 ||
+            index.cudaData == nullptr || score.cudaData == nullptr ||
+            weights == nullptr || weightsBatch < 4 || weights[2] == nullptr ||
+            weights[2]->dataType != DataType::INT8) {
+            return false;
+        }
+        return FastllmCudaHalfMergeMOEInt8Batch1Indexed(
+            input, scratch, output, weights, weightsBatch,
+            (const int32_t*)index.cudaData, (const float*)score.cudaData, topk);
+    }
+
+    static bool TryCudaMergeMOEBatch1Int4GroupIndexed(
+            const Data &input, Data &output, const Data &index, const Data &score,
+            int topk, Data &scratch, Data **weights, int weightsBatch,
+            MoeGateType gateType) {
+        if (gateType != MoeGateSwiglu || input.dataType != DataType::FLOAT16 ||
+            input.dataDevice != DataDevice::CUDA || input.dims.size() != 2 ||
+            input.dims[0] != 1 || topk <= 0 || topk > 8 ||
+            index.dataDevice != DataDevice::CUDA || index.dataType != DataType::INT32 ||
+            score.dataDevice != DataDevice::CUDA || score.dataType != DataType::FLOAT32 ||
+            index.cudaData == nullptr || score.cudaData == nullptr ||
+            weights == nullptr || weightsBatch < 4 || weights[2] == nullptr ||
+            weights[2]->dataType != DataType::INT4_GROUP) {
+            return false;
+        }
+        return FastllmCudaHalfMergeMOEInt4GroupBatch1Indexed(
+            input, scratch, output, weights, weightsBatch,
+            (const int32_t*)index.cudaData, (const float*)score.cudaData, topk);
+    }
+
+    static bool TryCudaMergeMOESmallBatchInt4GroupIndexed(
+            const Data &input, Data &output, const Data &index, const Data &score,
+            int batch, int topk, Data &scratch, Data **weights, int weightsBatch,
+            MoeGateType gateType) {
+        if (!CudaEnvFlagDefaultEnabled(
+                "FASTLLM_CUDA_MOE_INT4_GROUP_SMALL_BATCH", true) ||
+            gateType != MoeGateSwiglu || input.dataType != DataType::FLOAT16 ||
+            input.dataDevice != DataDevice::CUDA || input.dims.size() != 2 ||
+            input.dims[0] != batch || batch <= 1 || batch > 64 ||
+            topk <= 0 || topk > 8 ||
+            index.dataDevice != DataDevice::CUDA || index.dataType != DataType::INT32 ||
+            score.dataDevice != DataDevice::CUDA || score.dataType != DataType::FLOAT32 ||
+            index.cudaData == nullptr || score.cudaData == nullptr ||
+            weights == nullptr || weightsBatch < 4 || weights[2] == nullptr ||
+            weights[2]->dataType != DataType::INT4_GROUP) {
+            return false;
+        }
+        return FastllmCudaHalfMergeMOEInt4GroupSmallBatchIndexed(
+            input, scratch, output, weights, weightsBatch,
+            (const int32_t*)index.cudaData, (const float*)score.cudaData,
+            batch, topk);
+    }
+
+    static bool CudaInt4GroupMoeCompactFallbackUnavailable(
+            Data **weights, int weightsBatch) {
+        if (weights == nullptr || weightsBatch < 4) {
+            return false;
+        }
+        for (int slot = 2; slot < weightsBatch; ++slot) {
+            Data *weight = weights[slot];
+            if (weight != nullptr && weight->dataType == DataType::INT4_GROUP &&
+                weight->cudaData == nullptr) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    [[noreturn]] static void FailCudaInt4GroupMoeAfterRepack(
+            const char *stage) {
+        std::string message =
+            "AWQ grouped-Marlin " + std::string(stage) +
+            " failed after the compact expert weights were released; "
+            "the legacy INT4_GROUP fallback is unavailable.";
+        FastllmCudaSetThreadError();
+        throw std::runtime_error(message);
+    }
+
+    static bool TryCudaMergeMOEInt4GroupMarlinIndexed(
+            const Data &input, Data &output, const Data &index,
+            const Data &score, int batch, int topk, Data &gateOutput,
+            Data &activation, Data **weights, int weightsBatch,
+            MoeGateType gateType) {
+        bool hasAwqCandidate =
+            weights != nullptr && weightsBatch >= 4 &&
+            weights[2] != nullptr &&
+            weights[2]->dataType == DataType::INT4_GROUP;
+        if (gateType != MoeGateSwiglu ||
+            input.dataType != DataType::FLOAT16 ||
+            input.dataDevice != DataDevice::CUDA ||
+            input.dims.size() != 2 || input.dims[0] != batch ||
+            batch <= 0 || topk <= 0 || topk > 8 ||
+            index.dataDevice != DataDevice::CUDA ||
+            index.dataType != DataType::INT32 ||
+            score.dataDevice != DataDevice::CUDA ||
+            score.dataType != DataType::FLOAT32 ||
+            index.cudaData == nullptr || score.cudaData == nullptr ||
+            !hasAwqCandidate) {
+            if (hasAwqCandidate &&
+                CudaInt4GroupMoeCompactFallbackUnavailable(
+                    weights, weightsBatch)) {
+                FailCudaInt4GroupMoeAfterRepack(
+                    "received an incompatible invocation");
+            }
+            return false;
+        }
+        bool success = FastllmCudaHalfMergeMOEInt4GroupMarlinIndexed(
+            input, gateOutput, activation, output, weights, weightsBatch,
+            (const int32_t *)index.cudaData, (const float *)score.cudaData,
+            batch, topk);
+        if (!success &&
+            CudaInt4GroupMoeCompactFallbackUnavailable(
+                weights, weightsBatch)) {
+            FailCudaInt4GroupMoeAfterRepack("execution");
+        }
+        return success;
+    }
+
+    static bool CudaNvfp4E4M3MoeCompactFallbackUnavailable(
+            Data **weights, int weightsBatch) {
+        if (weights == nullptr || weightsBatch < 4) {
+            return false;
+        }
+        for (int slot = 2; slot < weightsBatch; ++slot) {
+            Data *weight = weights[slot];
+            if (weight != nullptr &&
+                weight->dataType == DataType::NVFP4_BLOCK_16_E4M3 &&
+                weight->cudaData == nullptr) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    [[noreturn]] static void FailCudaNvfp4E4M3MoeAfterRepack(
+            const char *stage) {
+        std::string message =
+            "NVFP4 E4M3 grouped-Marlin " + std::string(stage) +
+            " failed after the compact expert weights were released; "
+            "the source-layout fallback is unavailable.";
+        FastllmCudaSetThreadError();
+        throw std::runtime_error(message);
+    }
+
+    static bool TryCudaMergeMOENVFP4E4M3MarlinIndexed(
+            const Data &input, Data &output, const Data &index,
+            const Data &score, int batch, int topk, Data &gateOutput,
+            Data &activation, Data **weights, int weightsBatch,
+            MoeGateType gateType) {
+        bool hasCandidate =
+            weights != nullptr && weightsBatch >= 4 &&
+            weights[2] != nullptr &&
+            weights[2]->dataType == DataType::NVFP4_BLOCK_16_E4M3;
+        if (gateType != MoeGateSwiglu ||
+            (input.dataType != DataType::FLOAT16 &&
+             input.dataType != DataType::FLOAT32) ||
+            input.dataDevice != DataDevice::CUDA ||
+            input.dims.size() != 2 || input.dims[0] != batch ||
+            batch <= 0 || topk <= 0 || topk > 16 ||
+            index.dataDevice != DataDevice::CUDA ||
+            index.dataType != DataType::INT32 ||
+            score.dataDevice != DataDevice::CUDA ||
+            score.dataType != DataType::FLOAT32 ||
+            index.cudaData == nullptr || score.cudaData == nullptr ||
+            !hasCandidate) {
+            if (hasCandidate &&
+                CudaNvfp4E4M3MoeCompactFallbackUnavailable(
+                    weights, weightsBatch)) {
+                FailCudaNvfp4E4M3MoeAfterRepack(
+                    "received an incompatible invocation");
+            }
+            return false;
+        }
+        bool success = FastllmCudaMergeMOENVFP4E4M3MarlinIndexed(
+            input, gateOutput, activation, output, weights, weightsBatch,
+            (const int32_t *)index.cudaData, (const float *)score.cudaData,
+            batch, topk);
+        if (!success &&
+            CudaNvfp4E4M3MoeCompactFallbackUnavailable(
+                weights, weightsBatch)) {
+            FailCudaNvfp4E4M3MoeAfterRepack("execution");
+        }
+        return success;
+    }
+
+#ifndef USE_ROCM
+    static bool TryCudaMergeMOECache(
+            const Data &input, Data &output, const Data &index,
+            const Data &score, Data &gateOutput,
+            Data **weights, int weightsBatch, MoeGateType gateType) {
+        if (!FastllmCudaCanRunMoeCacheSmallBatch(
+                input, index, score, weights, weightsBatch, gateType)) {
+            return false;
+        }
+        const bool success =
+            FastllmCudaMergeMOECache(
+                input, gateOutput, output, weights, weightsBatch,
+                reinterpret_cast<const int32_t *>(index.cudaData),
+                reinterpret_cast<const float *>(score.cudaData), index.dims[1]);
+        AssertInFastLLM(
+            success,
+            "Prepared CUDA expert cache failed during decode.");
+        return true;
+    }
+#endif
+
+    static bool TryCudaMergeMOEBatch1Fp8(
+        Data &input, Data &output, int32_t *indexData, const float *scoreData, bool scoresOnCuda, int topk,
+        Data &w1, Data **weights, float sharedScale, MoeGateType gateType) {
+        if (gateType != MoeGateSwiglu || !IsCudaMergeMoeFp8InputType(input.dataType) || input.dims.size() == 0) {
+            return false;
+        }
+        if (weights[0] != nullptr && sharedScale != 0.0f) {
+            return false;
+        }
+
+        const int hidden = input.dims.back();
+        if (topk > 0) {
+            std::vector<Data*> gateups(topk), downs(topk);
+            int inter = -1;
+            bool canGroupFp8 = true;
+            bool canGroupNVFP4 = true;
+            DataType nvfp4Type = DataType::FLOAT32;
+            for (int j = 0; j < topk; j++) {
+                int idx = indexData[j] + 1;
+                Data *gateup = weights[idx * 2];
+                Data *down = weights[idx * 2 + 1];
+                gateups[j] = gateup;
+                downs[j] = down;
+                if (gateup == nullptr || down == nullptr ||
+                    gateup->dims.size() != 2 || down->dims.size() != 2 ||
+                    gateup->dims[1] != hidden ||
+                    gateup->dims[0] != down->dims[1] * 2 ||
+                    down->dims[0] != hidden) {
+                    canGroupFp8 = false;
+                    canGroupNVFP4 = false;
+                    break;
+                }
+                bool isFp8 = gateup->dataType == DataType::FP8_E4M3 && down->dataType == DataType::FP8_E4M3;
+                bool isNVFP4 = IsCudaMergeMoeNVFP4WeightType(gateup->dataType) && gateup->dataType == down->dataType;
+                if (!isFp8 || gateup->blockM <= 0 || gateup->blockK <= 0 ||
+                    down->blockM <= 0 || down->blockK <= 0) {
+                    canGroupFp8 = false;
+                }
+                if (!isNVFP4) {
+                    canGroupNVFP4 = false;
+                } else if (nvfp4Type == DataType::FLOAT32) {
+                    nvfp4Type = gateup->dataType;
+                } else if (nvfp4Type != gateup->dataType) {
+                    canGroupNVFP4 = false;
+                }
+                if (!canGroupFp8 && !canGroupNVFP4) {
+                    break;
+                }
+                if (inter < 0) {
+                    inter = down->dims[1];
+                } else if (inter != down->dims[1]) {
+                    canGroupFp8 = false;
+                    canGroupNVFP4 = false;
+                    break;
+                }
+            }
+            if (canGroupFp8 && inter > 0) {
+                bool groupOk = input.dataType == DataType::FLOAT16 ?
+                    FastllmCudaHalfMergeMOEFP8E4M3Batch1(input, w1, output, gateups.data(), downs.data(), scoreData, scoresOnCuda, topk, hidden, inter) :
+                    FastllmCudaBFloat16MergeMOEFP8E4M3Batch1(input, w1, output, gateups.data(), downs.data(), scoreData, scoresOnCuda, topk, hidden, inter);
+                if (groupOk) {
+                    return true;
+                }
+            }
+            if (canGroupNVFP4 && inter > 0) {
+                bool groupOk = input.dataType == DataType::FLOAT16 ?
+                    FastllmCudaHalfMergeMOENVFP4Batch1(input, w1, output, gateups.data(), downs.data(), scoreData, scoresOnCuda, topk, hidden, inter) :
+                    FastllmCudaBFloat16MergeMOENVFP4Batch1(input, w1, output, gateups.data(), downs.data(), scoreData, scoresOnCuda, topk, hidden, inter);
+                if (groupOk) {
+                    return true;
+                }
+            }
+        }
+
+        if (scoresOnCuda) {
+            return false;
+        }
+
+        bool wroteOutput = false;
+        for (int j = 0; j < topk; j++) {
+            int idx = indexData[j] + 1;
+            Data *gateup = weights[idx * 2];
+            Data *down = weights[idx * 2 + 1];
+            if (gateup == nullptr || down == nullptr) {
+                continue;
+            }
+            bool isFp8E4M3 = gateup->dataType == DataType::FP8_E4M3 && down->dataType == DataType::FP8_E4M3;
+            bool isFp8Block128 = gateup->dataType == DataType::FP8_E4M3_BLOCK_128 && down->dataType == DataType::FP8_E4M3_BLOCK_128;
+            if ((!isFp8E4M3 && !isFp8Block128) ||
+                gateup->dims.size() != 2 || down->dims.size() != 2 ||
+                gateup->dims[1] != hidden ||
+                gateup->dims[0] != down->dims[1] * 2 ||
+                down->dims[0] != hidden) {
+                return false;
+            }
+            if (isFp8E4M3 && (gateup->blockM <= 0 || gateup->blockK <= 0 || down->blockM <= 0 || down->blockK <= 0)) {
+                return false;
+            }
+
+            int inter = down->dims[1];
+            w1.dataType = input.dataType;
+            w1.Resize({1, inter});
+            bool swigluOk = false;
+            if (input.dataType == DataType::FLOAT16) {
+                swigluOk = isFp8Block128 ?
+                    FastllmCudaHalfMatMulFloatFP8E4M3Block128Swiglu(input, *gateup, *GetEmptyData(), w1, 1, hidden, inter) :
+                    FastllmCudaHalfMatMulFloatFP8E4M3Swiglu(input, *gateup, *GetEmptyData(), w1, 1, hidden, inter);
+            } else {
+                swigluOk = isFp8Block128 ?
+                    FastllmCudaBFloat16MatMulFP8E4M3Block128Swiglu(input, *gateup, *GetEmptyData(), w1, 1, hidden, inter) :
+                    FastllmCudaBFloat16MatMulFP8E4M3Swiglu(input, *gateup, *GetEmptyData(), w1, 1, hidden, inter);
+            }
+            if (!swigluOk) {
+                return false;
+            }
+
+            output.dataType = input.dataType;
+            output.Resize({1, hidden});
+            bool downOk = false;
+            if (input.dataType == DataType::FLOAT16) {
+                downOk = isFp8Block128 ?
+                    FastllmCudaHalfMatMulFloatFP8E4M3Block128AddTo(w1, *down, output, scoreData[j], !wroteOutput, 1, inter, hidden) :
+                    FastllmCudaHalfMatMulFloatFP8E4M3AddTo(w1, *down, output, scoreData[j], !wroteOutput, 1, inter, hidden);
+            } else {
+                downOk = isFp8Block128 ?
+                    FastllmCudaBFloat16MatMulFP8E4M3Block128AddTo(w1, *down, output, scoreData[j], !wroteOutput, 1, inter, hidden) :
+                    FastllmCudaBFloat16MatMulFP8E4M3AddTo(w1, *down, output, scoreData[j], !wroteOutput, 1, inter, hidden);
+            }
+            if (!downOk) {
+                return false;
+            }
+            wroteOutput = true;
+        }
+
+        return wroteOutput;
+    }
+
+    static bool TryCudaMergeMOEBatch1GGUF(
+        Data &input, Data &output, int32_t *indexData, const float *scoreData, bool scoresOnCuda, int topk,
+        Data &w1, Data **weights, int weightsBatch, float sharedScale, MoeGateType gateType) {
+        if (gateType != MoeGateSwiglu) {
+            return false;
+        }
+        if (!IsCudaMergeMoeGGUFInputType(input.dataType) || input.dataDevice != DataDevice::CUDA ||
+            input.dims.size() == 0) {
+            return false;
+        }
+        if (indexData == nullptr || scoreData == nullptr || topk <= 0) {
+            return false;
+        }
+        if (weights == nullptr || weightsBatch < 4) {
+            return false;
+        }
+        if (weights[0] != nullptr && sharedScale != 0.0f) {
+            return false;
+        }
+
+        const int hidden = input.dims.back();
+        std::vector<Data*> gateups(topk), downs(topk);
+        int inter = -1;
+        for (int j = 0; j < topk; j++) {
+            int expert = indexData[j];
+            int idx = expert + 1;
+            if (idx < 0 || idx * 2 + 1 >= weightsBatch) {
+                return false;
+            }
+            Data *gateup = weights[idx * 2];
+            Data *down = weights[idx * 2 + 1];
+            gateups[j] = gateup;
+            downs[j] = down;
+            if (gateup == nullptr || down == nullptr) {
+                return false;
+            }
+            if (gateup->dataType != DataType::DATA_GGUF_FORMAT ||
+                down->dataType != DataType::DATA_GGUF_FORMAT) {
+                return false;
+            }
+            if (gateup->dims.size() != 2 || down->dims.size() != 2 ||
+                gateup->dims[1] != hidden || gateup->dims[0] != down->dims[1] * 2 || down->dims[0] != hidden) {
+                return false;
+            }
+            if (gateup->ggmlType < 0 || down->ggmlType < 0) {
+                return false;
+            }
+            if (gateup->cudaData == nullptr || down->cudaData == nullptr) {
+                return false;
+            }
+            if (inter < 0) {
+                inter = down->dims[1];
+            } else if (inter != down->dims[1]) {
+                return false;
+            }
+        }
+        if (inter <= 0) {
+            return false;
+        }
+
+        if (input.dataType == DataType::FLOAT32) {
+            return FastllmCudaFloatMergeMOEGGUFBatch1(input, w1, output, gateups.data(), downs.data(),
+                                                      scoreData, scoresOnCuda, topk, hidden, inter);
+        } else if (input.dataType == DataType::FLOAT16) {
+            return FastllmCudaHalfMergeMOEGGUFBatch1(input, w1, output, gateups.data(), downs.data(),
+                                                     scoreData, scoresOnCuda, topk, hidden, inter);
+        }
+        return FastllmCudaBFloat16MergeMOEGGUFBatch1(input, w1, output, gateups.data(), downs.data(),
+                                                     scoreData, scoresOnCuda, topk, hidden, inter);
+    }
+
+    static bool TryCudaMergeMOEBatch1Fp8Indexed(
+        Data &input, Data &output, Data &index, Data &score, int topk,
+        Data &w1, Data **weights, int weightsBatch, float sharedScale, MoeGateType gateType) {
+        if (gateType != MoeGateSwiglu || !IsCudaMergeMoeFp8InputType(input.dataType) || input.dims.size() == 0 ||
+            index.dataDevice != DataDevice::CUDA || index.dataType != DataType::INT32 ||
+            score.dataDevice != DataDevice::CUDA || score.dataType != DataType::FLOAT32 ||
+            weightsBatch < 4) {
+            return false;
+        }
+        bool hasSharedExpert = weights[0] != nullptr && weights[1] != nullptr && sharedScale != 0.0f;
+        const int hidden = input.dims.back();
+        Data *gateup = weights[2];
+        Data *down = weights[3];
+        bool isFp8 = gateup != nullptr && down != nullptr &&
+                     gateup->dataType == DataType::FP8_E4M3 && down->dataType == DataType::FP8_E4M3;
+        bool isFp8Block128 = gateup != nullptr && down != nullptr &&
+                             gateup->dataType == DataType::FP8_E4M3_BLOCK_128 &&
+                             down->dataType == DataType::FP8_E4M3_BLOCK_128;
+        bool isNVFP4 = gateup != nullptr && down != nullptr &&
+                       IsCudaMergeMoeNVFP4WeightType(gateup->dataType) && gateup->dataType == down->dataType;
+        if (gateup == nullptr || down == nullptr ||
+            (!isFp8 && !isFp8Block128 && !isNVFP4) ||
+            gateup->dims.size() != 2 || down->dims.size() != 2 ||
+            gateup->dims[1] != hidden || gateup->dims[0] != down->dims[1] * 2 ||
+            down->dims[0] != hidden) {
+            return false;
+        }
+
+        int inter = down->dims[1];
+        if (hasSharedExpert && !isNVFP4) {
+            return false;
+        }
+        if (isFp8) {
+            if (TryCudaTritonMergeMOEFp8Indexed(input, output, index, score, 1, topk,
+                                                w1, weights, weightsBatch, sharedScale, gateType)) {
+                return true;
+            }
+            return input.dataType == DataType::FLOAT16 ?
+                FastllmCudaHalfMergeMOEFP8E4M3Batch1Indexed(input, w1, output, weights, weightsBatch,
+                                                            (const int32_t*)index.cudaData, (const float*)score.cudaData,
+                                                            topk, hidden, inter) :
+                FastllmCudaBFloat16MergeMOEFP8E4M3Batch1Indexed(input, w1, output, weights, weightsBatch,
+                                                                (const int32_t*)index.cudaData, (const float*)score.cudaData,
+                                                                topk, hidden, inter);
+        }
+        if (isFp8Block128) {
+            return input.dataType == DataType::FLOAT16 ?
+                FastllmCudaHalfMergeMOEFP8E4M3Block128Batch1Indexed(input, w1, output, weights, weightsBatch,
+                                                                    (const int32_t*)index.cudaData, (const float*)score.cudaData,
+                                                                    topk, hidden, inter) :
+                FastllmCudaBFloat16MergeMOEFP8E4M3Block128Batch1Indexed(input, w1, output, weights, weightsBatch,
+                                                                        (const int32_t*)index.cudaData, (const float*)score.cudaData,
+                                                                        topk, hidden, inter);
+        }
+        bool ok;
+        if (hasSharedExpert) {
+            ok = input.dataType == DataType::FLOAT16 ?
+                FastllmCudaHalfMergeMOENVFP4Batch1IndexedSharedFP8(
+                    input, w1, output, weights, weightsBatch,
+                    (const int32_t*)index.cudaData, (const float*)score.cudaData,
+                    sharedScale, topk, hidden, inter) :
+                FastllmCudaBFloat16MergeMOENVFP4Batch1IndexedSharedFP8(
+                    input, w1, output, weights, weightsBatch,
+                    (const int32_t*)index.cudaData, (const float*)score.cudaData,
+                    sharedScale, topk, hidden, inter);
+        } else {
+            ok = input.dataType == DataType::FLOAT16 ?
+                FastllmCudaHalfMergeMOENVFP4Batch1Indexed(input, w1, output, weights, weightsBatch,
+                                                          (const int32_t*)index.cudaData, (const float*)score.cudaData,
+                                                          topk, hidden, inter) :
+                FastllmCudaBFloat16MergeMOENVFP4Batch1Indexed(input, w1, output, weights, weightsBatch,
+                                                              (const int32_t*)index.cudaData, (const float*)score.cudaData,
+                                                              topk, hidden, inter);
+        }
+        return ok;
+    }
+
+    static bool TryCudaMergeMOESmallBatchFp8Indexed(
+        Data &input, Data &output, Data &index, Data &score, int batch, int topk,
+        Data &w1, Data **weights, int weightsBatch, float sharedScale, MoeGateType gateType) {
+        if (batch <= 1 || batch > 64 ||
+            gateType != MoeGateSwiglu || !IsCudaMergeMoeFp8InputType(input.dataType) || input.dims.size() == 0 ||
+            index.dataDevice != DataDevice::CUDA || index.dataType != DataType::INT32 ||
+            score.dataDevice != DataDevice::CUDA || score.dataType != DataType::FLOAT32 ||
+            weightsBatch < 4) {
+            return false;
+        }
+        if (weights[0] != nullptr && sharedScale != 0.0f) {
+            return false;
+        }
+
+        const int hidden = input.dims.back();
+        Data *gateup = weights[2];
+        Data *down = weights[3];
+        bool isFp8 = gateup != nullptr && down != nullptr &&
+                     gateup->dataType == DataType::FP8_E4M3 && down->dataType == DataType::FP8_E4M3;
+        bool isNVFP4 = gateup != nullptr && down != nullptr &&
+                       IsCudaMergeMoeNVFP4WeightType(gateup->dataType) && gateup->dataType == down->dataType;
+        if (gateup == nullptr || down == nullptr ||
+            (!isFp8 && !isNVFP4) ||
+            gateup->dims.size() != 2 || down->dims.size() != 2 ||
+            gateup->dims[1] != hidden || gateup->dims[0] != down->dims[1] * 2 ||
+            down->dims[0] != hidden) {
+            return false;
+        }
+
+        int inter = down->dims[1];
+        if (isFp8) {
+            if (TryCudaTritonMergeMOEFp8Indexed(input, output, index, score, batch, topk,
+                                                w1, weights, weightsBatch, sharedScale, gateType)) {
+                return true;
+            }
+            return input.dataType == DataType::FLOAT16 ?
+                FastllmCudaHalfMergeMOEFP8E4M3SmallBatchIndexed(input, w1, output, weights, weightsBatch,
+                                                                (const int32_t*)index.cudaData, (const float*)score.cudaData,
+                                                                batch, topk, hidden, inter) :
+                FastllmCudaBFloat16MergeMOEFP8E4M3SmallBatchIndexed(input, w1, output, weights, weightsBatch,
+                                                                    (const int32_t*)index.cudaData, (const float*)score.cudaData,
+                                                                    batch, topk, hidden, inter);
+        }
+        bool ok = input.dataType == DataType::FLOAT16 ?
+            FastllmCudaHalfMergeMOENVFP4SmallBatchIndexed(input, w1, output, weights, weightsBatch,
+                                                          (const int32_t*)index.cudaData, (const float*)score.cudaData,
+                                                          batch, topk, hidden, inter) :
+            FastllmCudaBFloat16MergeMOENVFP4SmallBatchIndexed(input, w1, output, weights, weightsBatch,
+                                                              (const int32_t*)index.cudaData, (const float*)score.cudaData,
+                                                              batch, topk, hidden, inter);
+        return ok;
+    }
+
+    static bool TryCudaMergeMOELargeBatchFp8Grouped(
+        Data &input, Data &output, const int32_t *indexData, const float *scoreData, int batch, int topk,
+        Data &w1, Data &w2, Data **weights, int weightsBatch, float sharedScale, MoeGateType gateType) {
+        int minGroupedBatch = CudaEnvInt("FASTLLM_CUDA_MOE_GROUPED_INDEXED_MIN_BATCH", 16);
+        if (batch < minGroupedBatch || gateType != MoeGateSwiglu || !IsCudaMergeMoeFp8InputType(input.dataType) ||
+            input.dims.size() == 0 || weightsBatch < 4 || (weightsBatch & 1) ||
+            indexData == nullptr || scoreData == nullptr) {
+            return false;
+        }
+        if (weights[0] != nullptr && sharedScale != 0.0f) {
+            return false;
+        }
+
+        const int hidden = input.dims.back();
+        Data *gateup = weights[2];
+        Data *down = weights[3];
+        bool isFp8 = gateup != nullptr && down != nullptr &&
+                     gateup->dataType == DataType::FP8_E4M3 && down->dataType == DataType::FP8_E4M3;
+        bool isNVFP4 = gateup != nullptr && down != nullptr &&
+                       IsCudaMergeMoeNVFP4WeightType(gateup->dataType) && gateup->dataType == down->dataType;
+        if (gateup == nullptr || down == nullptr ||
+            (!isFp8 && !isNVFP4) ||
+            gateup->dims.size() != 2 || down->dims.size() != 2 ||
+            gateup->dims[1] != hidden || gateup->dims[0] != down->dims[1] * 2 ||
+            down->dims[0] != hidden) {
+            return false;
+        }
+
+        int inter = down->dims[1];
+        int experts = weightsBatch / 2 - 1;
+        if (experts <= 0) {
+            return false;
+        }
+
+        std::vector<int> expertCounts(experts, 0);
+        for (int b = 0; b < batch; b++) {
+            for (int j = 0; j < topk; j++) {
+                int expert = indexData[b * topk + j];
+                if (expert < 0 || expert >= experts) {
+                    return false;
+                }
+                expertCounts[expert]++;
+            }
+        }
+
+        std::vector<int> expertStarts(experts, 0);
+        int totalTasks = 0;
+        int maxExpertTasks = 0;
+        for (int e = 0; e < experts; e++) {
+            expertStarts[e] = totalTasks;
+            totalTasks += expertCounts[e];
+            if (expertCounts[e] > maxExpertTasks) {
+                maxExpertTasks = expertCounts[e];
+            }
+        }
+        if (totalTasks <= 0 || maxExpertTasks <= 0) {
+            return false;
+        }
+
+        std::vector<int> offsets = expertStarts;
+        std::vector<int> routeRows(totalTasks);
+        std::vector<float> routeScales(totalTasks);
+        std::vector<int> routePositions((size_t)batch * topk);
+        for (int b = 0; b < batch; b++) {
+            for (int j = 0; j < topk; j++) {
+                int expert = indexData[b * topk + j];
+                int pos = offsets[expert]++;
+                routeRows[pos] = b;
+                routeScales[pos] = scoreData[b * topk + j];
+                routePositions[b * topk + j] = pos;
+            }
+        }
+        if (input.dataType == DataType::FLOAT16) {
+            bool ok = isFp8 ? FastllmCudaHalfMergeMOEFP8E4M3GroupedIndexed(
+                input, w1, w2, output, weights, weightsBatch,
+                routeRows.data(), routeScales.data(), routePositions.data(), expertStarts.data(), expertCounts.data(),
+                batch, topk, totalTasks, maxExpertTasks, hidden, inter) :
+                FastllmCudaHalfMergeMOENVFP4GroupedIndexed(
+                    input, w1, w2, output, weights, weightsBatch,
+                    routeRows.data(), routeScales.data(), routePositions.data(), expertStarts.data(), expertCounts.data(),
+                    batch, topk, totalTasks, maxExpertTasks, hidden, inter);
+            return ok;
+        }
+        bool ok = isFp8 ? FastllmCudaBFloat16MergeMOEFP8E4M3GroupedIndexed(
+                input, w1, w2, output, weights, weightsBatch,
+                routeRows.data(), routeScales.data(), routePositions.data(), expertStarts.data(), expertCounts.data(),
+                batch, topk, totalTasks, maxExpertTasks, hidden, inter) :
+                FastllmCudaBFloat16MergeMOENVFP4GroupedIndexed(
+                    input, w1, w2, output, weights, weightsBatch,
+                    routeRows.data(), routeScales.data(), routePositions.data(), expertStarts.data(), expertCounts.data(),
+                    batch, topk, totalTasks, maxExpertTasks, hidden, inter);
+        return ok;
+    }
+
+    void DoCudaMergeMOE(Data &input, Data &output, Data &index, Data &score, Data &w1, Data &w2, Data &w3, 
+                        Data **weights, Data **biass, float sharedScale, MoeGateType gateType, int weightsBatch) {
+// static std::map<std::string, float> mergeMoeTimeCnt;
+// auto st = std::chrono::system_clock::now();
+        int curDeviceId = FastllmCudaGetDevice();
+        auto clearIfOnOtherDevice = [curDeviceId](Data &data) {
+            if (data.cudaData == nullptr) {
+                return;
+            }
+            int ptrDevice = GetPointerDeviceId(data.cudaData);
+            if (ptrDevice >= 0 && ptrDevice != curDeviceId) {
+                FastllmCudaSetDevice(ptrDevice);
+                FastllmCudaFree(data.cudaData);
+                FastllmCudaSetDevice(curDeviceId);
+                data.cudaData = nullptr;
+            }
+        };
+        clearIfOnOtherDevice(w1);
+        clearIfOnOtherDevice(w2);
+        clearIfOnOtherDevice(w3);
+        clearIfOnOtherDevice(output);
+// ForceDeviceSync(); mergeMoeTimeCnt["allocate"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
+        {
+            int batch = input.dims[0];
+
+            int marlinTopk = index.dims.size() >= 2 ? index.dims[1] : 0;
+#ifndef USE_ROCM
+            if (TryCudaMergeMOECache(
+                    input, output, index, score,
+                    w1, weights, weightsBatch, gateType)) {
+                return;
+            }
+#endif
+            if (TryCudaMergeMOENVFP4E4M3MarlinIndexed(
+                    input, output, index, score, batch, marlinTopk,
+                    w1, w2, weights, weightsBatch, gateType)) {
+                return;
+            }
+#ifndef USE_ROCM
+            if (gateType == MoeGateSwiglu &&
+                FastllmCudaFloat32MergeMOEBFloat16Indexed(
+                    input, index, score, w3, w1, w2, output, weights, weightsBatch)) {
+                return;
+            }
+#endif
+            // The NVFP4 grouped-Marlin implementation sizes and completely
+            // overwrites output itself. Delay the generic zero allocation
+            // until after that path so decode does not enqueue one redundant
+            // output memset per MoE layer.
+            output.Allocate();
+            if (TryCudaMergeMOEInt4GroupMarlinIndexed(
+                    input, output, index, score, batch, marlinTopk, w1, w2,
+                    weights, weightsBatch, gateType)) {
+                return;
+            }
+            if (batch == 1 && index.dims.size() >= 2) {
+                int topk = index.dims[1];
+                if (TryCudaMergeMOEBatch1Int8Indexed(
+                        input, output, index, score, topk, w1,
+                        weights, weightsBatch, gateType)) {
+                    return;
+                }
+                if (TryCudaMergeMOEBatch1Int4GroupIndexed(
+                        input, output, index, score, topk, w1,
+                        weights, weightsBatch, gateType)) {
+                    return;
+                }
+                if (TryCudaMergeMOEBatch1Fp8Indexed(input, output, index, score, topk,
+                                                    w1, weights, weightsBatch, sharedScale, gateType)) {
+                    return;
+                }
+            } else if (batch > 1 && batch <= 64 && index.dims.size() >= 2) {
+                int topk = index.dims[1];
+                if (TryCudaMergeMOESmallBatchInt4GroupIndexed(
+                        input, output, index, score, batch, topk, w1,
+                        weights, weightsBatch, gateType)) {
+                    return;
+                }
+                if (TryCudaMergeMOESmallBatchFp8Indexed(input, output, index, score, batch, topk,
+                                                        w1, weights, weightsBatch, sharedScale, gateType)) {
+                    return;
+                }
+            } else if (batch > 64 && index.dims.size() >= 2) {
+                int topk = index.dims[1];
+                if (TryCudaTritonMergeMOEFp8Indexed(input, output, index, score, batch, topk,
+                                                    w1, weights, weightsBatch, sharedScale, gateType)) {
+                    return;
+                }
+            }
+            cudaMergeMOEUsedGraphUnsafeFallback = true;
+            // batch=1 fast path only needs index on CPU to choose expert weights;
+            // scores can stay on CUDA and be consumed by the grouped down kernel.
+            index.ToDevice(DataDevice::CPU);
+            ToDataType(index, DataType::INT32);
+            
+            int32_t *indexData = (int32_t*)index.cpuData;
+            int n = index.dims[0];
+            int topk = index.dims[1];
+            
+            if (batch == 1) {
+                if (score.dataDevice == DataDevice::CUDA && score.dataType == DataType::FLOAT32 &&
+                    TryCudaMergeMOEBatch1Fp8(input, output, indexData, (float*)score.cudaData, true, topk, w1, weights, sharedScale, gateType)) {
+                    return;
+                }
+                if (score.dataDevice == DataDevice::CUDA && score.dataType == DataType::FLOAT32 &&
+                    TryCudaMergeMOEBatch1GGUF(input, output, indexData, (float*)score.cudaData, true, topk,
+                                              w1, weights, weightsBatch, sharedScale, gateType)) {
+                    return;
+                }
+            }
+
+            score.ToDevice(DataDevice::CPU);
+            ToDataType(score, DataType::FLOAT32);
+            float *scoreData = (float*)score.cpuData;
+
+            if (batch == 1) {
+                if (TryCudaMergeMOEBatch1Fp8(input, output, indexData, scoreData, false, topk, w1, weights, sharedScale, gateType)) {
+                    return;
+                }
+                if (TryCudaMergeMOEBatch1GGUF(input, output, indexData, scoreData, false, topk,
+                                              w1, weights, weightsBatch, sharedScale, gateType)) {
+                    return;
+                }
+                std::vector <std::pair <int, float> > v;
+                v.resize(topk + 1);
+                for (int j = 0; j < topk; j++) {
+                    // index 存储的是专家索引（从0开始），需要+1因为0表示shared expert
+                    int expertIdx = indexData[j];
+                    float expertScore = scoreData[j];
+                    v[j] = std::make_pair(expertIdx + 1, expertScore);
+                }
+                v.back() = (std::make_pair(0, sharedScale));
+// ForceDeviceSync(); mergeMoeTimeCnt["get_experts"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
+                bool wroteOutput = false;
+                for (int j = 0; j < v.size(); j++) {
+                    int idx = v[j].first;
+                    float value = v[j].second;
+                    if (weights[idx * 2] == nullptr) {
+                        continue;
+                    }
+
+                    DoCudaLinearReshape(input, *weights[idx * 2], w3);
+                    DoCudaLinear(input, *weights[idx * 2], *GetEmptyData(), w3);
+// ForceDeviceSync(); mergeMoeTimeCnt["linear1"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
+
+                    ApplyCudaMoeGate(w3, w1, gateType);
+// ForceDeviceSync(); mergeMoeTimeCnt["swiglu"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
+
+                    DoCudaLinearReshape(w1, *weights[idx * 2 + 1], w2);
+                    DoCudaLinear(w1, *weights[idx * 2 + 1], *GetEmptyData(), w2);
+// ForceDeviceSync(); mergeMoeTimeCnt["linear2"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
+                    if (!wroteOutput) {
+                        output.dataType = w2.dataType;
+                        output.Resize(w2.dims);
+                        FastllmCudaMul(w2, value, output);
+                        wroteOutput = true;
+                    } else {
+                        FastllmCudaAddTo(output, w2, value);
+                    }
+// ForceDeviceSync(); mergeMoeTimeCnt["mul_add"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
+                }
+                if (!wroteOutput) {
+                    output.dataType = input.dataType;
+                    output.Resize(input.dims);
+                    output.Allocate(false);
+                    FastllmCudaMemset0(output.cudaData, output.GetBytes());
+                }
+            } else {
+
+                if (CudaEnvFlagEnabled("FASTLLM_CUDA_MOE_GROUPED_INDEXED") &&
+                    TryCudaMergeMOELargeBatchFp8Grouped(input, output, indexData, scoreData, batch, topk,
+                                                        w1, w2, weights, weightsBatch, sharedScale, gateType)) {
+                    return;
+                }
+
+                FastllmCudaMemset0(output.cudaData, output.GetBytes());
+                
+                // 计算最大专家数量
+                int maxExpert = 0;
+                for (int i = 0; i < n; i++) {
+                    for (int j = 0; j < topk; j++) {
+                        int expertIdx = indexData[i * topk + j];
+                        if (expertIdx > maxExpert) {
+                            maxExpert = expertIdx;
+                        }
+                    }
+                }
+                int m = maxExpert + 1; // 专家数量
+                
+                std::vector <std::vector <std::pair <int, float> > > expertTasks; // expertTasks[i]代表专家i的task, expertTasks[i][j] = (第j个任务对应的行数， 权重)
+                expertTasks.resize(m + 1);
+                for (int b = 0; b < batch; b++) {
+                    expertTasks[0].push_back(std::make_pair(b, sharedScale));
+                    for (int j = 0; j < topk; j++) {
+                        int expertIdx = indexData[b * topk + j];
+                        float value = scoreData[b * topk + j];
+                        expertTasks[expertIdx + 1].push_back(std::make_pair(b, value));
+                    }
+                }
+
+                std::vector <int> indexVec2;
+                std::vector <float> scales;
+                std::vector <int> startIdx;                
+                for (int i = 0; i < expertTasks.size(); i++) {
+                    startIdx.push_back(indexVec2.size());
+                    for (int j = 0; j < expertTasks[i].size(); j++) {
+                        indexVec2.push_back(expertTasks[i][j].first);
+                        scales.push_back(expertTasks[i][j].second);
+                    }
+                }
+// ForceDeviceSync(); mergeMoeTimeCnt["get_experts"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
+
+                int *cudaIndex = (int*)FastllmCudaMalloc(indexVec2.size() * sizeof(int));
+// ForceDeviceSync(); mergeMoeTimeCnt["malloc_index"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
+                FastllmCudaCopyFromHostToDevice(cudaIndex, indexVec2.data(), indexVec2.size() * sizeof(int));
+
+                float *cudaScales = (float*)FastllmCudaMalloc(scales.size() * sizeof(float));
+                FastllmCudaCopyFromHostToDevice(cudaScales, scales.data(), scales.size() * sizeof(float));
+// ForceDeviceSync(); mergeMoeTimeCnt["copy_index"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
+
+                Data *firstLocalGate = nullptr;
+                int localWeightsBatch = weightsBatch > 0 ? weightsBatch : (int)expertTasks.size() * 2;
+                for (int i = 0; i < expertTasks.size(); i++) {
+                    if (i * 2 + 1 < localWeightsBatch && weights[i * 2] != nullptr && weights[i * 2 + 1] != nullptr) {
+                        firstLocalGate = weights[i * 2];
+                        break;
+                    }
+                }
+                if (firstLocalGate == nullptr) {
+                    FastllmCudaFree(cudaIndex);
+                    FastllmCudaFree(cudaScales);
+                    return;
+                }
+
+                Data tempInput, tempMiddle, tempSwiglu, tempOutput;
+                tempInput.Resize(input.dims);
+                tempInput.dataType = input.dataType;
+                tempInput.ToDevice(input.dataDevice);
+                tempInput.Allocate();
+
+                tempMiddle.Resize({input.dims[0], firstLocalGate->dims[0]});
+                tempMiddle.dataType = input.dataType;
+                tempMiddle.ToDevice(input.dataDevice);
+                tempMiddle.Allocate();
+
+                tempSwiglu.Resize({input.dims[0], firstLocalGate->dims[0] / 2});
+                tempSwiglu.dataType = input.dataType;
+                tempSwiglu.ToDevice(input.dataDevice);
+                tempSwiglu.Allocate();
+
+                tempOutput.Resize(output.dims);
+                tempOutput.dataType = output.dataType;
+                tempOutput.ToDevice(output.dataDevice);
+                tempOutput.Allocate();
+// ForceDeviceSync(); mergeMoeTimeCnt["alloc_data"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
+
+                for (int i = 0; i < expertTasks.size(); i++) {
+                    if (expertTasks[i].size() == 0 || weights[i * 2] == nullptr) {
+                        continue;
+                    }
+// ForceDeviceSync(); mergeMoeTimeCnt["expert_start"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
+
+                    tempInput.Resize({(int)expertTasks[i].size(), tempInput.dims[1]});
+                    FastllmCudaPickInput (
+                        (uint8_t*)input.cudaData, 
+                        (uint8_t*)tempInput.cudaData, 
+                        expertTasks[i].size(), 
+                        GetDataBytes(input.dataType, 1, input.dims[1]), 
+                        cudaIndex + startIdx[i]
+                    );
+// ForceDeviceSync(); mergeMoeTimeCnt["pick_input"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
+
+                    DoCudaLinearReshape(tempInput, *weights[i * 2], tempMiddle);
+                    DoCudaLinear(tempInput, *weights[i * 2], *GetEmptyData(), tempMiddle);
+// ForceDeviceSync(); mergeMoeTimeCnt["linear1"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
+
+                    ApplyCudaMoeGate(tempMiddle, tempSwiglu, gateType);
+// ForceDeviceSync(); mergeMoeTimeCnt["swiglu"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
+
+                    DoCudaLinearReshape(tempSwiglu, *weights[i * 2 + 1], tempOutput);
+                    DoCudaLinear(tempSwiglu, *weights[i * 2 + 1], *GetEmptyData(), tempOutput);
+// ForceDeviceSync(); mergeMoeTimeCnt["linear2"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
+
+                    FastllmCudaPickOutput (
+                        (uint8_t*)tempOutput.cudaData, 
+                        (uint8_t*)output.cudaData, 
+                        expertTasks[i].size(), 
+                        output.dims[1], 
+                        cudaIndex + startIdx[i],
+                        cudaScales + startIdx[i], 
+                        output.dataType
+                    );
+// ForceDeviceSync(); mergeMoeTimeCnt["pick_output"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
+                }
+
+                FastllmCudaFree(cudaIndex);
+                FastllmCudaFree(cudaScales);
+// ForceDeviceSync(); mergeMoeTimeCnt["free"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
+            }
+        }
+// float totalTime = 0.0f;
+// for (auto &it : mergeMoeTimeCnt) {
+    // printf("[DoCudaMergeMOE] %s: %f s.\n", it.first.c_str(), it.second);
+    // totalTime += it.second;
+// }
+// printf("[DoCudaMergeMOE] total: %f s.\n", totalTime);
+    }
+
+    void CudaMergeMOE::Run(const std::string &opType, const fastllm::DataDict &datas,
+                    const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        Data &index = *(datas.find("index")->second);
+        Data &score = *(datas.find("score")->second);
+        Data &w1 = *(datas.find("w1")->second);
+        Data &w2 = *(datas.find("w2")->second);
+        Data &w3 = *(datas.find("w3")->second);
+        Data **weights = (Data**)(datas.find("weights")->second);
+        Data **biass = (Data**)(datas.find("biass")->second);
+        float sharedScale = floatParams.find("sharedScale") != floatParams.end() ? floatParams.find("sharedScale")->second : 1.0f;
+        MoeGateType gateType = intParams.find("gateType") != intParams.end() ?
+            (MoeGateType) intParams.find("gateType")->second : MoeGateSwiglu;
+        int weightsBatch = intParams.find("weights___batch") != intParams.end() ? intParams.find("weights___batch")->second : -1;
+
+        DoCudaMergeMOE (
+            input, output, index, score, w1, w2, w3, weights, biass, sharedScale, gateType, weightsBatch
+        );
+    }
+
+    void DoCudaFusedMOE(Data &input, Data &output, Data &index, Data &score,
+                        Data &gate, Data &up, Data &down, Data &w1,
+                        MoeGateType gateType, float swigluLimit,
+                        bool allowTriton) {
+        if (gateType != MoeGateSwiglu) {
+            ErrorInFastLLM("CudaFusedMOE only supports swiglu gate type.\n");
+        }
+        if (swigluLimit < 0.0f) {
+            ErrorInFastLLM("CudaFusedMOE swigluLimit should be non-negative.\n");
+        }
+        bool isFp8 = gate.dataType == DataType::FP8_E4M3 &&
+                     up.dataType == DataType::FP8_E4M3 &&
+                     down.dataType == DataType::FP8_E4M3;
+        bool isFp8Block128 = gate.dataType == DataType::FP8_E4M3_BLOCK_128 &&
+                             up.dataType == DataType::FP8_E4M3_BLOCK_128 &&
+                             down.dataType == DataType::FP8_E4M3_BLOCK_128;
+        if (!IsCudaMergeMoeFp8InputType(input.dataType) || input.dataDevice != DataDevice::CUDA ||
+            index.dataDevice != DataDevice::CUDA || index.dataType != DataType::INT32 ||
+            score.dataDevice != DataDevice::CUDA || score.dataType != DataType::FLOAT32 ||
+            gate.dataDevice != DataDevice::CUDA || up.dataDevice != DataDevice::CUDA || down.dataDevice != DataDevice::CUDA ||
+            (!isFp8 && !isFp8Block128) ||
+            input.dims.size() < 2 || index.dims.size() < 2 ||
+            gate.dims.size() != 3 || up.dims.size() != 3 || down.dims.size() != 3) {
+            ErrorInFastLLM("CudaFusedMOE only supports CUDA fp16/bf16 input, CUDA int32 index, CUDA fp32 score and 3D FP8 weights.\n");
+        }
+
+        int hidden = input.dims.back();
+        int batch = input.Count(0) / hidden;
+        int topk = index.dims.back();
+        int experts = gate.dims[0];
+        int inter = gate.dims[1];
+        if (batch <= 0 || topk <= 0 || experts <= 0 || inter <= 0 ||
+            index.Count(0) != (uint64_t)batch * topk ||
+            score.Count(0) != (uint64_t)batch * topk ||
+            gate.dims[2] != hidden ||
+            up.dims[0] != experts || up.dims[1] != inter || up.dims[2] != hidden ||
+            down.dims[0] != experts || down.dims[1] != hidden || down.dims[2] != inter) {
+            ErrorInFastLLM("CudaFusedMOE input/index/weight shapes mismatch.\n");
+        }
+        if (isFp8) {
+            if (gate.blockM <= 0 || gate.blockK <= 0 ||
+                up.blockM != gate.blockM || up.blockK != gate.blockK ||
+                down.blockM <= 0 || down.blockK <= 0 ||
+                gate.extraCudaData.empty() || up.extraCudaData.empty() || down.extraCudaData.empty()) {
+                ErrorInFastLLM("CudaFusedMOE FP8 scales should be prepared on CUDA before running the operator.\n");
+            }
+        }
+
+        int curDeviceId = FastllmCudaGetDevice();
+        auto clearIfOnOtherDevice = [curDeviceId](Data &data) {
+            if (data.cudaData == nullptr) {
+                return;
+            }
+            int ptrDevice = GetPointerDeviceId(data.cudaData);
+            if (ptrDevice >= 0 && ptrDevice != curDeviceId) {
+                FastllmCudaSetDevice(ptrDevice);
+                FastllmCudaFree(data.cudaData);
+                FastllmCudaSetDevice(curDeviceId);
+                data.cudaData = nullptr;
+            }
+        };
+        clearIfOnOtherDevice(w1);
+        clearIfOnOtherDevice(output);
+
+        if (allowTriton && isFp8 &&
+            TryCudaTritonFusedMOEFp8(input, output, index, score, gate, up, down, w1,
+                                     batch, topk, hidden, inter, experts, gateType, swigluLimit)) {
+            return;
+        }
+
+        bool ok = false;
+        if (isFp8Block128) {
+            ok = input.dataType == DataType::FLOAT16 ?
+                FastllmCudaHalfFusedMOEFP8E4M3Block128(input, gate, up, down, index, score, w1, output,
+                                                       batch, topk, hidden, inter, experts, swigluLimit) :
+                FastllmCudaBFloat16FusedMOEFP8E4M3Block128(input, gate, up, down, index, score, w1, output,
+                                                           batch, topk, hidden, inter, experts, swigluLimit);
+        } else {
+            ok = input.dataType == DataType::FLOAT16 ?
+                FastllmCudaHalfFusedMOEFP8E4M3(input, gate, up, down, index, score, w1, output,
+                                               batch, topk, hidden, inter, experts, swigluLimit) :
+                FastllmCudaBFloat16FusedMOEFP8E4M3(input, gate, up, down, index, score, w1, output,
+                                                   batch, topk, hidden, inter, experts, swigluLimit);
+        }
+        if (!ok) {
+            ErrorInFastLLM("CudaFusedMOE failed.\n");
+        }
+    }
+
+    void CudaFusedMOE::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                    const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &index = *(datas.find("index")->second);
+        Data &gate = *(datas.find("gate")->second);
+        Data &w1 = *(datas.find("w1")->second);
+        Data &output = *(datas.find("output")->second);
+        output.dataType = input.dataType;
+        output.Resize(input.dims);
+        if (index.dims.size() >= 2 && gate.dims.size() == 3) {
+            w1.dataType = input.dataType;
+            w1.Resize({(int)index.Count(0), gate.dims[1]});
+        }
+    }
+
+    void CudaFusedMOE::Run(const std::string &opType, const fastllm::DataDict &datas,
+                    const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        Data &index = *(datas.find("index")->second);
+        Data &score = *(datas.find("score")->second);
+        Data &gate = *(datas.find("gate")->second);
+        Data &up = *(datas.find("up")->second);
+        Data &down = *(datas.find("down")->second);
+        Data &w1 = *(datas.find("w1")->second);
+        MoeGateType gateType = intParams.find("gateType") != intParams.end() ?
+            (MoeGateType) intParams.find("gateType")->second : MoeGateSwiglu;
+        float swigluLimit = floatParams.find("swigluLimit") != floatParams.end() ?
+            floatParams.find("swigluLimit")->second : 0.0f;
+        bool allowTriton = intParams.find("allowTriton") == intParams.end() ||
+                           intParams.find("allowTriton")->second != 0;
+        DoCudaFusedMOE(input, output, index, score, gate, up, down, w1,
+                       gateType, swigluLimit, allowTriton);
+    }
+
+    void CudaMergeAttention::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                               const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &weight1 = *(datas.find("weight1")->second);
+        Data &output = *(datas.find("output")->second);
+        std::vector <int> dims = input.dims;
+        dims.back() = weight1.dims[0];
+        output.dataType = input.dataType;
+        output.Resize(dims);
+    }
+
+    void CudaMergeAttention::Run(const std::string &opType, const fastllm::DataDict &datas,
+                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &weight0 = *(datas.find("weight0")->second);
+        Data &bias0 = *(datas.find("bias0")->second);
+        Data &weight1 = *(datas.find("weight1")->second);
+        Data &bias1 = *(datas.find("bias1")->second);
+        Data &positionIds = *(datas.find("positionIds")->second);
+        Data &sinData = *(datas.find("sinData")->second);
+        Data &cosData = *(datas.find("cosData")->second);
+        Data &output = *(datas.find("output")->second);
+        Data &qkv = *(datas.find("qkv")->second);
+        Data &q = *(datas.find("q")->second);
+        Data &k = *(datas.find("k")->second);
+        Data &v = *(datas.find("v")->second);
+        int qNum = intParams.find("qNum")->second;
+        int kvNum = intParams.find("kvNum")->second;
+        int headDim = intParams.find("headDim")->second;
+        int rotDim = intParams.find("rotDim")->second;
+        float attentionScale = floatParams.find("attentionScale")->second;
+        Data **keys = (Data**)(datas.find("keys")->second);
+        Data **values = (Data**)(datas.find("values")->second);
+        Data **masks = (Data**)(datas.find("masks")->second);
+        output.Allocate();
+
+        int bsz = input.dims[0], seqlen = input.dims[1];
+        DoCudaLinearReshape(input, weight0, qkv);
+        DoCudaLinear(input, weight0, bias0, qkv);
+
+        int per = qkv.dims.back() / (qNum / kvNum + 2);
+        int qdim = per * (qNum / kvNum);
+        
+        DoCudaSplitReshape(qkv, -1, 0, qdim, q);
+        DoCudaSplitReshape(qkv, -1, qdim, qdim + per, k);
+        DoCudaSplitReshape(qkv, -1, qdim + per, qdim + per * 2, v);
+        DoCudaSplit(qkv, -1, 0, qdim, q);
+        DoCudaSplit(qkv, -1, qdim, qdim + per, k);
+        DoCudaSplit(qkv, -1, qdim + per, qdim + per * 2, v);
+
+        std::vector <int> qkvSize = {bsz, seqlen, -1, headDim};
+        q.Reshape(qkvSize);
+        k.Reshape(qkvSize);
+        v.Reshape(qkvSize);
+
+        FastllmCudaLlamaRotatePosition2D(q, positionIds, sinData, cosData, rotDim);
+        FastllmCudaLlamaRotatePosition2D(k, positionIds, sinData, cosData, rotDim);
+
+        DoCudaPermuteSelf(q, {0, 2, 1, 3});
+        DoCudaPermuteSelf(k, {0, 2, 1, 3});
+        DoCudaPermuteSelf(v, {0, 2, 1, 3});
+
+        qkvSize = {-1, seqlen, headDim};
+        q.Reshape(qkvSize);
+        k.Reshape(qkvSize);
+        v.Reshape(qkvSize);
+
+        int unitLen = 128;
+        Data &pastKey = *keys[0];
+        Data &pastValue = *values[0];
+        while ((pastKey.dims.size() == 0 && (pastKey.expansionDims.size() == 0 || seqlen > pastKey.expansionDims[1]))
+            || (pastKey.dims.size() > 0 && pastKey.dims[1] + seqlen > pastKey.expansionDims[1])) {
+            std::vector <int> newDims;
+            if (pastKey.Count(0) == 0 || pastKey.dims.size() == 0) {
+                newDims = std::vector <int> {kvNum, ((seqlen - 1) / unitLen + 1) * unitLen, headDim};
+            } else {
+                newDims = pastKey.dims;
+                newDims[1] += ((seqlen - 1) / unitLen + 1) * unitLen;
+            }
+            pastKey.Expansion(newDims);
+        }
+        while ((pastValue.dims.size() == 0 && (pastValue.expansionDims.size() == 0 || seqlen > pastValue.expansionDims[1]))
+            || (pastValue.dims.size() > 0 && pastValue.dims[1] + seqlen > pastValue.expansionDims[1])) {
+            std::vector <int> newDims;
+            if (pastValue.Count(0) == 0 || pastValue.dims.size() == 0) {
+                newDims = std::vector <int> {kvNum, ((seqlen - 1) / unitLen + 1) * unitLen, headDim};
+            } else {
+                newDims = pastValue.dims;
+                newDims[1] += ((seqlen - 1) / unitLen + 1) * unitLen;
+            }
+            pastValue.Expansion(newDims);
+        }
+
+        DoCudaCatDirect(pastKey, k, 1);
+        DoCudaCatDirect(pastValue, v, 1);
+
+        DoCudaAttentionReshape(q, pastValue, qkv);
+        DoCudaAttention(q, pastKey, pastValue, *masks[0], qkv, q.dims[0] / pastKey.dims[0], attentionScale, 0);
+
+        DoCudaPermuteSelf(qkv, {1, 0, 2});
+        qkv.Reshape({seqlen, bsz, -1});
+        DoCudaPermuteSelf(qkv, {1, 0, 2});
+
+        DoCudaLinearReshape(qkv, weight1, output);
+        DoCudaLinear(qkv, weight1, bias1, output);
+    }
+
+    void CudaAppendPagedCacheOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+        const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &cache = *(datas.find("cache")->second);
+        Data &input = *(datas.find("input")->second);
+        PagedCacheManager &pagedCacheManager = *((PagedCacheManager*)datas.find("pagedCacheManager")->second);
+
+        AssertInFastLLM(cache.dataType == DataType::FLOAT32 ||
+                        cache.dataType == DataType::FLOAT16 ||
+                        cache.dataType == DataType::BFLOAT16 ||
+                        cache.dataType == DataType::FP8_E4M3 || cache.dataType == DataType::FP4_E2M1,
+                        "CudaAppendPagedCacheOp's cache's type should be float32, float16, bfloat16, fp8_e4m3 or fp4_e2m1.\n");
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
+                        input.dataType == DataType::FLOAT16 ||
+                        input.dataType == DataType::BFLOAT16,
+                        "CudaAppendPagedCacheOp's input type should be float32, float16 or bfloat16.\n");
+        AssertInFastLLM(input.dims.size() == 3,
+                        "CudaAppendPagedCacheOp's input should have 3 dimensions [numHeads, seqLen, headDim].\n");
+
+        cache.isPagedKVCache = true;
+
+        int numHeads = input.dims[0];
+        int seqLen = input.dims[1];
+        int headDim = input.dims[2];
+
+        if (cache.pagedKVCacheData == nullptr) {
+            cache.pagedKVCacheData = &pagedCacheManager;
+        }
+        cache.pageLen = pagedCacheManager.pageLen;
+
+        AssertInFastLLM(cache.pagedKVCacheData->dims.size() == 4,
+                        "CudaAppendPagedCacheOp's pagedKVCacheData should have 4 dimensions.\n");
+        AssertInFastLLM(cache.pagedKVCacheData->dims[1] == cache.pageLen,
+                        "CudaAppendPagedCacheOp's pagedKVCacheData pageLen mismatch.\n");
+        AssertInFastLLM(cache.pagedKVCacheData->dims[2] == numHeads,
+                        "CudaAppendPagedCacheOp's pagedKVCacheData numHeads mismatch.\n");
+        AssertInFastLLM(cache.pagedKVCacheData->dims[3] == headDim,
+                        "CudaAppendPagedCacheOp's pagedKVCacheData headDim mismatch.\n");
+
+        int currentUsedTokens = 0;
+        if (cache.pageIndex.size() > 0) {
+            currentUsedTokens = (cache.pageIndex.size() - 1) * cache.pageLen + cache.lastPageLen;
+        }
+        int totalNeededTokens = currentUsedTokens + seqLen;
+        int totalNeededPages = (totalNeededTokens + cache.pageLen - 1) / cache.pageLen;
+        int maxPages = cache.pagedKVCacheData->dims[0];
+        if (totalNeededPages > maxPages) {
+            ErrorInFastLLM("CudaAppendPagedCacheOp: No more pages available. Need to resize pagedKVCacheData. "
+                           "seqLen = " + std::to_string(seqLen) +
+                           ", currentUsedTokens = " + std::to_string(currentUsedTokens) +
+                           ", pageLen = " + std::to_string(cache.pageLen) +
+                           ", currentPages = " + std::to_string((int)cache.pageIndex.size()) +
+                           ", totalNeededPages = " + std::to_string(totalNeededPages) +
+                           ", maxPages = " + std::to_string(maxPages) + ".\n");
+        }
+
+        if (cache.dims.size() == 0) {
+            cache.Resize(input.dims);
+        } else {
+            cache.Resize({cache.dims[0], cache.dims[1] + input.dims[1], cache.dims[2]});
+        }
+    }
+
+    void CudaAppendPagedCacheOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+        const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &cache = *(datas.find("cache")->second);
+        Data &input = *(datas.find("input")->second);
+
+        // CUDA实现分页缓存追加
+        int numHeads = input.dims[0];
+        int seqLen = input.dims[1];
+        int headDim = input.dims[2];
+        int unitSize = input.unitSize;
+        int tokensToAppend = seqLen;
+        int inputOffset = 0;
+
+        // pagedKVCacheData shape: [maxPages, pageLen, numHeads, headDim]
+        Data *pagedKVCache = cache.pagedKVCacheData;
+        int maxPages = pagedKVCache->dims[0];
+        int pageLen = cache.pageLen;
+        uint8_t *pagedData = (uint8_t*)pagedKVCache->cudaData;
+        uint8_t *inputData = (uint8_t*)input.cudaData;
+
+        // A chunked prefill commonly spans many 128-token pages.  The legacy
+        // loop below launches one kernel per page.  Pack up to 256 page ids
+        // into a kernel argument so the whole input tensor is appended with
+        // one launch while preserving arbitrary physical page allocation.
+        bool useCurrentPage = !cache.pageIndex.empty() &&
+                              cache.lastPageLen < pageLen;
+        int firstPageOffset = useCurrentPage ? cache.lastPageLen : 0;
+        int firstPageCapacity = pageLen - firstPageOffset;
+        int remainingAfterFirst = std::max(0, seqLen - firstPageCapacity);
+        int appendPageCount = 1 +
+            (remainingAfterFirst + pageLen - 1) / pageLen;
+        bool useMultiPageCopy =
+            CudaEnvFlagDefaultEnabled(
+                "FASTLLM_CUDA_PAGED_CACHE_MULTI_PAGE_COPY", true) &&
+            seqLen > 0 && appendPageCount > 1 && appendPageCount <= 256;
+        if (useMultiPageCopy) {
+            std::vector<int> appendPages;
+            appendPages.reserve(appendPageCount);
+            int remaining = seqLen;
+            if (useCurrentPage) {
+                appendPages.push_back(cache.pageIndex.back());
+                int copyLen = std::min(firstPageCapacity, remaining);
+                cache.lastPageLen += copyLen;
+                remaining -= copyLen;
+            }
+            while (remaining > 0) {
+                int newPageIdx =
+                    cache.pagedKVCacheData->GetUnusedPageIndex(true);
+                cache.pageIndex.push_back(newPageIdx);
+                appendPages.push_back(newPageIdx);
+                int copyLen = std::min(pageLen, remaining);
+                cache.lastPageLen = copyLen;
+                remaining -= copyLen;
+            }
+            bool launched = FastllmCudaPagedCacheCopyMultiPage(
+                pagedData, appendPages.data(), (int)appendPages.size(),
+                firstPageOffset, pageLen, numHeads, headDim,
+                pagedKVCache->dataType, inputData, input.dataType, seqLen);
+            AssertInFastLLM(
+                launched,
+                "CudaAppendPagedCacheOp failed to launch multi-page copy.\n");
+            return;
+        }
+        
+        // 计算当前page的剩余空间
+        int remainingInCurrentPage = 0;
+        if (cache.pageIndex.size() > 0) {
+            remainingInCurrentPage = pageLen - cache.lastPageLen;
+        }
+        
+        // 先填充当前page的剩余空间
+        if (remainingInCurrentPage > 0 && tokensToAppend > 0) {
+            int currentPageIdx = cache.pageIndex.back();
+            int copyLen = std::min(remainingInCurrentPage, tokensToAppend);
+            
+            // kernel复制 input 到 pagedKVCacheData 的当前 page 的剩余空间
+            // input: [numHeads, seqLen, headDim], pagedKVCacheData: [maxPages, pageLen, numHeads, headDim]
+            FastllmCudaPagedCacheCopy(
+                pagedData, // dst: pagedKVCache->cudaData
+                currentPageIdx, // page idx
+                pageLen,
+                numHeads,
+                headDim,
+                pagedKVCache->dataType,
+                inputData, // src: input.cudaData
+                input.dataType,
+                seqLen,    // input sequence length
+                inputOffset,
+                copyLen,
+                cache.lastPageLen // page offset: 从当前page的lastPageLen位置开始写入
+            );
+            
+            cache.lastPageLen += copyLen;
+            tokensToAppend -= copyLen;
+            inputOffset += copyLen;
+        }
+        
+        // 如果还有剩余的数据，需要分配新的 pages
+        while (tokensToAppend > 0) {
+            int newPageIdx = cache.pagedKVCacheData->GetUnusedPageIndex(true);
+            cache.pageIndex.push_back(newPageIdx);
+            int copyLen = std::min(pageLen, tokensToAppend);
+
+            // kernel复制 input 的一个 page 到 pagedKVCacheData 的新 page
+            // input: [numHeads, seqLen, headDim], pagedKVCacheData: [maxPages, pageLen, numHeads, headDim]
+            FastllmCudaPagedCacheCopy(
+                pagedData, // dst: pagedKVCache->cudaData
+                newPageIdx, // page idx
+                pageLen,
+                numHeads,
+                headDim,
+                pagedKVCache->dataType,
+                inputData, // src: input.cudaData
+                input.dataType,
+                seqLen,    // input sequence length
+                inputOffset,
+                copyLen,
+                0 // page offset: 新page从0开始写入
+            );
+
+            cache.lastPageLen = copyLen;
+            tokensToAppend -= copyLen;
+            inputOffset += copyLen;
+        }
+    }
+
+    void DoCudaAttentionPaged(Data &q, Data &k, Data &v, Data &output, int group, float scale, bool inited) {
+        FastllmCudaHalfPagedAttention(q, k, v, output, group, scale, inited);
+    }
+
+    void CudaAttentionPagedOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                               const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &q = *(datas.find("q")->second);
+        Data &k = *(datas.find("k")->second);
+        Data &v = *(datas.find("v")->second);
+        Data &output = *(datas.find("output")->second);
+        int group = intParams.find("group") != intParams.end() ? intParams.find("group")->second : q.dims[0] / k.dims[0];
+        float scale = floatParams.find("scale") != floatParams.end() ? floatParams.find("scale")->second : 1.0;
+        bool inited = intParams.find("inited") != intParams.end() ? (intParams.find("inited")->second != 0) : false;
+        output.Allocate();
+        DoCudaAttentionPaged(q, k, v, output, group, scale, inited);
+    }
+
+    void CudaAppendPagedCacheBatchOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+        const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data **currentCaches = (Data**)(datas.find("currentCaches")->second);
+        Data &insertIndexs = *(datas.find("insertIndexs")->second);
+        Data &insertPositions = *(datas.find("insertPositions")->second);
+        PagedCacheManager &manager = *(PagedCacheManager*)datas.find("pagedCacheManager")->second;
+
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
+                        input.dataType == DataType::FLOAT16 ||
+                        input.dataType == DataType::BFLOAT16,
+                        "CudaAppendPagedCacheBatchOp's input type should be float32, float16 or bfloat16.\n");
+        AssertInFastLLM(((Data*)&manager)->dataType == DataType::FLOAT32 ||
+                        ((Data*)&manager)->dataType == DataType::FLOAT16 ||
+                        ((Data*)&manager)->dataType == DataType::BFLOAT16 ||
+                        ((Data*)&manager)->dataType == DataType::FP8_E4M3 ||
+                        ((Data*)&manager)->dataType == DataType::FP4_E2M1,
+                        "CudaAppendPagedCacheBatchOp's cache type should be float32, float16, bfloat16, fp8_e4m3 or fp4_e2m1.\n");
+        AssertInFastLLM(input.dims.size() == 3,
+                        "CudaAppendPagedCacheBatchOp's input should have 3 dimensions [batch, numHeads, headDim].\n");
+        AssertInFastLLM(insertIndexs.dims.size() == 1 && insertIndexs.dims[0] == input.dims[0],
+                        "CudaAppendPagedCacheBatchOp's insertIndexs length should match batch.\n");
+        AssertInFastLLM(insertPositions.dims.size() == 1 && insertPositions.dims[0] == input.dims[0],
+                        "CudaAppendPagedCacheBatchOp's insertPositions length should match batch.\n");
+        AssertInFastLLM(((Data*)&manager)->dims.size() == 4,
+                        "CudaAppendPagedCacheBatchOp's pagedCacheManager storage should have 4 dimensions.\n");
+
+        int batch = input.dims[0];
+        for (int i = 0; i < batch; i++) {
+            Data *currentCache = currentCaches[i];
+            int pageLen = currentCache->pageLen;
+            if (currentCache->pageIndex.empty() || currentCache->lastPageLen >= pageLen) {
+                currentCache->pageIndex.push_back(manager.GetUnusedPageIndex(true));
+                currentCache->lastPageLen = 1;
+            } else {
+                currentCache->lastPageLen++;
+            }
+        }
+    }
+
+    void CudaAppendPagedCacheBatchOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+        const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second); // batch, num_heads, head_dim
+        Data &insertIndexs = *(datas.find("insertIndexs")->second);
+        Data &insertPositions = *(datas.find("insertPositions")->second);
+        PagedCacheManager &manager = *(PagedCacheManager*)datas.find("pagedCacheManager")->second;
+
+        int batch = input.dims[0], numHeads = input.dims[1], headDim = input.dims[2];
+        int pageLen = ((Data*)&manager)->dims[1];
+        int unitSize = input.unitSize;
+        uint8_t *pagedData = (uint8_t*)((Data*)&manager)->cudaData;
+        uint8_t *inputData = (uint8_t*)input.cudaData;
+        int32_t *idxDataCuda = (int32_t*)insertIndexs.cudaData;
+        int32_t *posDataCuda = (int32_t*)insertPositions.cudaData;
+        // 使用batch函数一次性处理所有batch
+        FastllmCudaPagedCacheCopyBatch(
+            pagedData,
+            idxDataCuda,
+            posDataCuda,
+            pageLen,
+            batch,
+            numHeads,
+            headDim,
+            ((Data*)&manager)->dataType,
+            inputData,
+            input.dataType
+        );
+    }
+
+    void CudaGenerateAppendPagedCacheBatchParamsOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+        const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        PagedCacheManager &manager = *(PagedCacheManager*)datas.find("pagedCacheManager")->second;
+        Data **pastKeys = (Data**)(datas.find("pastKeys")->second);
+        Data &insertIndexs = *(datas.find("insertIndexs")->second);
+        Data &insertPositions = *(datas.find("insertPositions")->second);
+        int batch = intParams.find("pastKeys___batch") != intParams.end() ? intParams.find("pastKeys___batch")->second : 1;
+        if (batch <= 0 && intParams.find("batch") != intParams.end()) {
+            batch = intParams.find("batch")->second;
+        }
+        AssertInFastLLM(batch > 0, "CudaGenerateAppendPagedCacheBatchParamsOp: batch must be positive.\n");
+
+        insertIndexs.dataType = DataType::INT32;
+        insertPositions.dataType = DataType::INT32;
+        insertIndexs.Resize({batch});
+        insertPositions.Resize({batch});
+        
+        // 先在CPU上准备数据
+        auto &idxDataHost = insertIndexs.cpuIntDatas;
+        auto &posDataHost = insertPositions.cpuIntDatas;
+        idxDataHost.resize(batch);
+        posDataHost.resize(batch);
+
+        int newPageCount = 0;
+        for (int b = 0; b < batch; b++) {
+            Data *pk = pastKeys[b];
+            if (pk->pageIndex.empty() || pk->lastPageLen >= pk->pageLen) {
+                newPageCount++;
+            }
+        }
+
+        std::vector<int> previewNewPages;
+        previewNewPages.reserve(newPageCount);
+        if (newPageCount > 0) {
+            std::lock_guard<std::mutex> guard(manager.pageIndexLocker);
+            for (int i = 0; i < newPageCount && i < (int)manager.freePages.size(); i++) {
+                previewNewPages.push_back(manager.freePages[(int)manager.freePages.size() - 1 - i]);
+            }
+            int trieOffset = newPageCount - (int)previewNewPages.size();
+            for (int i = 0; i < trieOffset && i < (int)manager.triePages.size(); i++) {
+                previewNewPages.push_back(manager.triePages[(int)manager.triePages.size() - 1 - i]);
+            }
+        }
+        AssertInFastLLM((int)previewNewPages.size() >= newPageCount,
+                        "CudaGenerateAppendPagedCacheBatchParamsOp: no enough pages for batch append.\n");
+
+        int newPageOffset = 0;
+        for (int b = 0; b < batch; b++) {
+            Data *pk = pastKeys[b];
+            int pageLen = pk->pageLen;
+            int insertIdx, insertPos;
+            if (pk->pageIndex.empty() || pk->lastPageLen >= pageLen) {
+                insertIdx = previewNewPages[newPageOffset++];
+                insertPos = 0;
+            } else {
+                insertIdx = pk->pageIndex.back();
+                insertPos = pk->lastPageLen;
+            }
+            idxDataHost[b] = insertIdx;
+            posDataHost[b] = insertPos;
+        }
+
+        auto prepareCudaInt = [](Data &data, int count) {
+            int currentDevice = FastllmCudaGetDevice();
+            if (data.isFake) {
+                data.isFake = false;
+                data.cudaData = nullptr;
+                data.cpuData = nullptr;
+                data.expansionSize = 0;
+                data.expansionBytes = 0;
+            } else if (data.dataDevice != DataDevice::CUDA && (data.cpuData != nullptr || data.cudaData != nullptr)) {
+                data.FreeSpace();
+            } else if (data.dataDevice == DataDevice::CUDA && data.cudaData != nullptr) {
+                if (!data.dataDeviceIds.empty() && data.dataDeviceIds[0] != currentDevice) {
+                    data.FreeSpace();
+                } else if (data.dataDeviceIds.empty()) {
+                    int ptrDevice = GetPointerDeviceId(data.cudaData);
+                    if (ptrDevice >= 0 && ptrDevice != currentDevice) {
+                        data.FreeSpace();
+                    }
+                }
+            }
+            for (auto &it : data.multiDeviceDatas) {
+                delete it.second;
+            }
+            data.multiDeviceDatas.clear();
+            data.multiDeviceData = false;
+            data.ClearTensorParallelLayout();
+            data.dataType = DataType::INT32;
+            data.dataDevice = DataDevice::CUDA;
+            data.dataDeviceIds = {currentDevice};
+            data.Resize({count});
+            data.Allocate(false);
+        };
+
+        prepareCudaInt(insertIndexs, batch);
+        prepareCudaInt(insertPositions, batch);
+        FastllmCudaCopyFromHostToDevice(insertIndexs.cudaData, (void*)idxDataHost.data(), batch * sizeof(int32_t));
+        FastllmCudaCopyFromHostToDevice(insertPositions.cudaData, (void*)posDataHost.data(), batch * sizeof(int32_t));
+    }
+
+    void DoCudaAttentionPagedBatch(Data &q, Data &kCaches, Data &vCaches, Data &qSizes, Data &pageSizes, Data &pageIndexs, Data &lastPageLens, Data &output, int group, float scale, int attentionType, bool inited, bool sync = true, bool enableCudaGraph = false, int flashInferCudaGraph = -1, int windowLeft = -1) {
+        FastllmCudaHalfPagedAttentionBatch(q, kCaches, vCaches, qSizes, pageSizes, pageIndexs, lastPageLens, output, group, scale, attentionType, inited, sync, enableCudaGraph, flashInferCudaGraph, windowLeft);
+    }
+
+    void CudaAttentionPagedBatchOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+        const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &q = *(datas.find("q")->second);
+        Data &kCaches = *(datas.find("kCaches")->second);
+        Data &vCaches = *(datas.find("vCaches")->second);
+        Data &qSizes = *(datas.find("qSizes")->second);
+        Data &pageSizes = *(datas.find("pageSizes")->second);
+        Data &pageIndexs = *(datas.find("pageIndexs")->second);
+        Data &lastPageLens = *(datas.find("lastPageLens")->second);
+        Data &output = *(datas.find("output")->second);
+        int group = intParams.find("group") != intParams.end() ? intParams.find("group")->second : q.dims[0] / kCaches.dims[0];
+        float scale = floatParams.find("scale") != floatParams.end() ? floatParams.find("scale")->second : 1.0;
+        int attentionType = intParams.find("attentionType") != intParams.end() ? intParams.find("attentionType")->second : 0;
+        bool inited = intParams.find("inited") != intParams.end() ? (intParams.find("inited")->second != 0) : false;
+        bool sync = intParams.find("sync") != intParams.end() ? (intParams.find("sync")->second != 0) : true;
+        bool enableCudaGraph = intParams.find("enableCudaGraph") != intParams.end() ? (intParams.find("enableCudaGraph")->second != 0) : false;
+        int flashInferCudaGraph = intParams.find("flashInferCudaGraph") != intParams.end() ? intParams.find("flashInferCudaGraph")->second : -1;
+        int windowLeft = intParams.find("windowLeft") != intParams.end() ? intParams.find("windowLeft")->second : -1;
+        output.Allocate(false);
+        DoCudaAttentionPagedBatch(q, kCaches, vCaches, qSizes, pageSizes, pageIndexs, lastPageLens, output, group, scale, attentionType, inited, sync, enableCudaGraph, flashInferCudaGraph, windowLeft);
+    }
+
+    void CudaGeneratePagedBatchParamsOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+        const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &q = *(datas.find("q")->second);
+        Data **pastKeys = (Data**)(datas.find("pastKeys")->second);
+        Data &qSizes = *(datas.find("qSizes")->second);
+        Data &pageSizes = *(datas.find("pageSizes")->second);
+        Data &pageIndexs = *(datas.find("pageIndexs")->second);
+        Data &lastPageLens = *(datas.find("lastPageLens")->second);
+        
+        int batch = intParams.find("pastKeys___batch") != intParams.end() ? intParams.find("pastKeys___batch")->second : 1;
+        AssertInFastLLM(batch > 0, "CudaGeneratePagedBatchParamsOp: batch must be positive.\n");
+        
+        // 先在CPU上计算，然后拷贝到GPU
+        auto &qSizesHost = qSizes.cpuIntDatas;
+        qSizesHost.resize(batch + 1);
+
+        auto &pageSizesHost = pageSizes.cpuIntDatas;
+        pageSizesHost.resize(batch + 1);
+
+        auto &lastPageLensHost = lastPageLens.cpuIntDatas;
+        lastPageLensHost.resize(batch);
+
+        auto &pageIndexsHost = pageIndexs.cpuIntDatas;
+        
+        // 计算总的page数量
+        int totalPages = 0;
+        for (int b = 0; b < batch; b++) {
+            totalPages += pastKeys[b]->pageIndex.size();
+        }
+        int totalPageSlots = std::max(totalPages, 1);
+        pageIndexsHost.resize(totalPageSlots);
+        if (totalPages == 0) {
+            pageIndexsHost[0] = 0;
+        }
+
+        qSizes.dataType = DataType::INT32;
+        pageSizes.dataType = DataType::INT32;
+        lastPageLens.dataType = DataType::INT32;
+        pageIndexs.dataType = DataType::INT32;
+        qSizes.Resize({batch + 1});
+        pageSizes.Resize({batch + 1});
+        lastPageLens.Resize({batch});
+        pageIndexs.Resize({totalPageSlots});
+
+        // 生成qSizes: 如果有 seqLens 则按 seqLens 的前缀和，否则按 [0, 1, 2, ..., batch]
+        int seqLensSize = intParams.find("seqLens___size") != intParams.end() ? intParams.find("seqLens___size")->second : 0;
+        bool lastPageLensOnDevice = seqLensSize == 0 &&
+            intParams.find("lastPageLensOnDevice") != intParams.end() &&
+            intParams.find("lastPageLensOnDevice")->second != 0 &&
+            lastPageLens.dataDevice == DataDevice::CUDA &&
+            lastPageLens.cudaData != nullptr &&
+            lastPageLens.expansionSize >= (uint64_t)batch;
+        qSizesHost[0] = 0;
+        if (seqLensSize > 0) {
+            for (int b = 0; b < batch; b++) {
+                int seqLen = intParams.find("seqLens___" + std::to_string(b))->second;
+                qSizesHost[b + 1] = qSizesHost[b] + seqLen;
+            }
+        } else {
+            for (int b = 0; b < batch; b++) {
+                qSizesHost[b + 1] = b + 1;
+            }
+        }
+        
+        // 生成pageSizes, pageIndexs, lastPageLens
+        int pageOffset = 0;
+        pageSizesHost[0] = 0;
+        for (int b = 0; b < batch; b++) {
+            int numPages = pastKeys[b]->pageIndex.size();
+            pageSizesHost[b + 1] = pageSizesHost[b] + numPages;
+            
+            // 复制pageIndex
+            for (int i = 0; i < numPages; i++) {
+                pageIndexsHost[pageOffset + i] = pastKeys[b]->pageIndex[i];
+            }
+            pageOffset += numPages;
+            
+            // 设置lastPageLen
+            lastPageLensHost[b] = pastKeys[b]->lastPageLen;
+        }
+
+        auto prepareCudaInt = [](Data &data, int count) {
+            int currentDevice = FastllmCudaGetDevice();
+            if (data.isFake) {
+                data.isFake = false;
+                data.cudaData = nullptr;
+                data.cpuData = nullptr;
+                data.expansionSize = 0;
+                data.expansionBytes = 0;
+            } else if (data.dataDevice != DataDevice::CUDA && (data.cpuData != nullptr || data.cudaData != nullptr)) {
+                data.FreeSpace();
+            } else if (data.dataDevice == DataDevice::CUDA && data.cudaData != nullptr) {
+                if (!data.dataDeviceIds.empty() && data.dataDeviceIds[0] != currentDevice) {
+                    data.FreeSpace();
+                } else if (data.dataDeviceIds.empty()) {
+                    int ptrDevice = GetPointerDeviceId(data.cudaData);
+                    if (ptrDevice >= 0 && ptrDevice != currentDevice) {
+                        data.FreeSpace();
+                    }
+                }
+            }
+            for (auto &it : data.multiDeviceDatas) {
+                delete it.second;
+            }
+            data.multiDeviceDatas.clear();
+            data.multiDeviceData = false;
+            data.ClearTensorParallelLayout();
+            data.dataType = DataType::INT32;
+            data.dataDevice = DataDevice::CUDA;
+            data.dataDeviceIds = {currentDevice};
+            data.Resize({count});
+            data.Allocate(false);
+        };
+
+        prepareCudaInt(qSizes, batch + 1);
+        prepareCudaInt(pageSizes, batch + 1);
+        prepareCudaInt(pageIndexs, totalPageSlots);
+        if (!lastPageLensOnDevice) {
+            prepareCudaInt(lastPageLens, batch);
+        }
+
+        bool singleBatchPrepared = false;
+        if (batch == 1 && !lastPageLensOnDevice &&
+            totalPageSlots <= 256 &&
+            CudaEnvFlagDefaultEnabled(
+                "FASTLLM_CUDA_PAGED_BATCH_PARAMS_SINGLE_KERNEL", true)) {
+            singleBatchPrepared = FastllmCudaPreparePagedBatchParamsSingle(
+                (int32_t*)qSizes.cudaData,
+                (int32_t*)pageSizes.cudaData,
+                (int32_t*)pageIndexs.cudaData,
+                (int32_t*)lastPageLens.cudaData,
+                pageIndexsHost.data(), totalPageSlots, totalPages,
+                qSizesHost[1], lastPageLensHost[0]);
+        }
+        if (!singleBatchPrepared) {
+            FastllmCudaCopyFromHostToDevice(qSizes.cudaData, (void*)qSizesHost.data(), (batch + 1) * sizeof(int32_t));
+            FastllmCudaCopyFromHostToDevice(pageSizes.cudaData, (void*)pageSizesHost.data(), (batch + 1) * sizeof(int32_t));
+            FastllmCudaCopyFromHostToDevice(pageIndexs.cudaData, (void*)pageIndexsHost.data(), totalPageSlots * sizeof(int32_t));
+            if (!lastPageLensOnDevice) {
+                FastllmCudaCopyFromHostToDevice(lastPageLens.cudaData, (void*)lastPageLensHost.data(), batch * sizeof(int32_t));
+            }
+        }
+    }
+}
