@@ -41,7 +41,7 @@ CMake Deprecation Warning at CMakeLists.txt:1 (cmake_minimum_required):
 -- DeepSeek-V4 SM120 sparse MLA kernel: OFF
 -- DeepSeek-V4 SM120 DeepGEMM MoE kernel: OFF
 -- DeepSeek-V4 SM120 DeepGEMM WoA kernel: OFF
--- Configuring done (17.0s)
+-- Configuring done (16.3s)
 -- Generating done (0.2s)
 -- Build files have been written to: D:/a/nerv/nerv/build-x86_64-win7/fastllm/cuda
 ==> CMake cache summary
@@ -59,3 +59,85 @@ ninja: error: build.ninja:2961: bad $-escape (literal $ must be written as $$)
 ---- CMake command output (tail) ----
 ninja: error: build.ninja:2961: bad $-escape (literal $ must be written as $$)
 
+
+=== build.ninja lines containing $ (first 80) ===
+42: cmake_ninja_workdir = D$:\a\nerv\nerv\build-x86_64-win7\fastllm\cuda\
+52: build CMakeFiles\fastllm.dir\src\fastllm.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\fastllm.cpp || cmake_object_order_depends_target_fastllm
+61: build CMakeFiles\fastllm.dir\src\device.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\device.cpp || cmake_object_order_depends_target_fastllm
+70: build CMakeFiles\fastllm.dir\src\model.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\model.cpp || cmake_object_order_depends_target_fastllm
+79: build CMakeFiles\fastllm.dir\src\contextconfig.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\contextconfig.cpp || cmake_object_order_depends_target_fastllm
+88: build CMakeFiles\fastllm.dir\src\executor.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\executor.cpp || cmake_object_order_depends_target_fastllm
+97: build CMakeFiles\fastllm.dir\src\template.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\template.cpp || cmake_object_order_depends_target_fastllm
+106: build CMakeFiles\fastllm.dir\src\graph.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\graph.cpp || cmake_object_order_depends_target_fastllm
+115: build CMakeFiles\fastllm.dir\src\tokenizer.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\tokenizer.cpp || cmake_object_order_depends_target_fastllm
+124: build CMakeFiles\fastllm.dir\src\devices\disk\diskdevice.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\devices\disk\diskdevice.cpp || cmake_object_order_depends_target_fastllm
+133: build CMakeFiles\fastllm.dir\src\models\graphllm.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\graphllm.cpp || cmake_object_order_depends_target_fastllm
+142: build CMakeFiles\fastllm.dir\src\models\chatglm.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\chatglm.cpp || cmake_object_order_depends_target_fastllm
+151: build CMakeFiles\fastllm.dir\src\models\moss.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\moss.cpp || cmake_object_order_depends_target_fastllm
+160: build CMakeFiles\fastllm.dir\src\models\llama.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\llama.cpp || cmake_object_order_depends_target_fastllm
+169: build CMakeFiles\fastllm.dir\src\models\qwen.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\qwen.cpp || cmake_object_order_depends_target_fastllm
+178: build CMakeFiles\fastllm.dir\src\models\basellm.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\basellm.cpp || cmake_object_order_depends_target_fastllm
+187: build CMakeFiles\fastllm.dir\src\models\glm.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\glm.cpp || cmake_object_order_depends_target_fastllm
+196: build CMakeFiles\fastllm.dir\src\models\minicpm.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\minicpm.cpp || cmake_object_order_depends_target_fastllm
+205: build CMakeFiles\fastllm.dir\src\models\minicpm3.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\minicpm3.cpp || cmake_object_order_depends_target_fastllm
+214: build CMakeFiles\fastllm.dir\src\models\internlm2.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\internlm2.cpp || cmake_object_order_depends_target_fastllm
+223: build CMakeFiles\fastllm.dir\src\models\bert.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\bert.cpp || cmake_object_order_depends_target_fastllm
+232: build CMakeFiles\fastllm.dir\src\models\moe.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\moe.cpp || cmake_object_order_depends_target_fastllm
+241: build CMakeFiles\fastllm.dir\src\models\deepseekv2.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\deepseekv2.cpp || cmake_object_order_depends_target_fastllm
+250: build CMakeFiles\fastllm.dir\src\models\deepseekv4.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\deepseekv4.cpp || cmake_object_order_depends_target_fastllm
+259: build CMakeFiles\fastllm.dir\src\models\deepseekv41.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\deepseekv41.cpp || cmake_object_order_depends_target_fastllm
+268: build CMakeFiles\fastllm.dir\src\models\deepseekv41_vision.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\deepseekv41_vision.cpp || cmake_object_order_depends_target_fastllm
+277: build CMakeFiles\fastllm.dir\src\models\deepseekv41_dspark.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\deepseekv41_dspark.cpp || cmake_object_order_depends_target_fastllm
+286: build CMakeFiles\fastllm.dir\src\models\dots3_note.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\dots3_note.cpp || cmake_object_order_depends_target_fastllm
+295: build CMakeFiles\fastllm.dir\src\models\phi3.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\phi3.cpp || cmake_object_order_depends_target_fastllm
+304: build CMakeFiles\fastllm.dir\src\models\xlmroberta.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\xlmroberta.cpp || cmake_object_order_depends_target_fastllm
+313: build CMakeFiles\fastllm.dir\src\models\cogvlm.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\cogvlm.cpp || cmake_object_order_depends_target_fastllm
+322: build CMakeFiles\fastllm.dir\src\models\qwen3.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\qwen3.cpp || cmake_object_order_depends_target_fastllm
+331: build CMakeFiles\fastllm.dir\src\models\qwen3_moe.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\qwen3_moe.cpp || cmake_object_order_depends_target_fastllm
+340: build CMakeFiles\fastllm.dir\src\models\hy_v3.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\hy_v3.cpp || cmake_object_order_depends_target_fastllm
+349: build CMakeFiles\fastllm.dir\src\models\qwen3_next.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\qwen3_next.cpp || cmake_object_order_depends_target_fastllm
+358: build CMakeFiles\fastllm.dir\src\models\qwen4_exp.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\qwen4_exp.cpp || cmake_object_order_depends_target_fastllm
+367: build CMakeFiles\fastllm.dir\src\models\kimi_k3.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\kimi_k3.cpp || cmake_object_order_depends_target_fastllm
+376: build CMakeFiles\fastllm.dir\src\models\minimax.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\minimax.cpp || cmake_object_order_depends_target_fastllm
+385: build CMakeFiles\fastllm.dir\src\models\hunyuan.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\hunyuan.cpp || cmake_object_order_depends_target_fastllm
+394: build CMakeFiles\fastllm.dir\src\models\ernie4_5.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\ernie4_5.cpp || cmake_object_order_depends_target_fastllm
+403: build CMakeFiles\fastllm.dir\src\models\pangu_moe.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\pangu_moe.cpp || cmake_object_order_depends_target_fastllm
+412: build CMakeFiles\fastllm.dir\src\models\glm4_moe.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\glm4_moe.cpp || cmake_object_order_depends_target_fastllm
+421: build CMakeFiles\fastllm.dir\src\models\glm5_moe_dsa.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\glm5_moe_dsa.cpp || cmake_object_order_depends_target_fastllm
+430: build CMakeFiles\fastllm.dir\src\models\glm5_next.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\glm5_next.cpp || cmake_object_order_depends_target_fastllm
+439: build CMakeFiles\fastllm.dir\src\models\gpt_oss.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\gpt_oss.cpp || cmake_object_order_depends_target_fastllm
+448: build CMakeFiles\fastllm.dir\src\models\minimax_m2.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\minimax_m2.cpp || cmake_object_order_depends_target_fastllm
+457: build CMakeFiles\fastllm.dir\src\models\qwen2.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\qwen2.cpp || cmake_object_order_depends_target_fastllm
+466: build CMakeFiles\fastllm.dir\src\models\qwen3_5.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\qwen3_5.cpp || cmake_object_order_depends_target_fastllm
+475: build CMakeFiles\fastllm.dir\src\models\gemma4.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\gemma4.cpp || cmake_object_order_depends_target_fastllm
+484: build CMakeFiles\fastllm.dir\src\models\step3p5.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\step3p5.cpp || cmake_object_order_depends_target_fastllm
+493: build CMakeFiles\fastllm.dir\src\models\laguna.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\laguna.cpp || cmake_object_order_depends_target_fastllm
+502: build CMakeFiles\fastllm.dir\third_party\json11\json11.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\third_party\json11\json11.cpp || cmake_object_order_depends_target_fastllm
+511: build CMakeFiles\fastllm.dir\third_party\gguf\gguf.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\third_party\gguf\gguf.cpp || cmake_object_order_depends_target_fastllm
+520: build CMakeFiles\fastllm.dir\third_party\gguf\ggml-quant.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\third_party\gguf\ggml-quant.cpp || cmake_object_order_depends_target_fastllm
+529: build CMakeFiles\fastllm.dir\third_party\gguf\ggml-iqk.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\third_party\gguf\ggml-iqk.cpp || cmake_object_order_depends_target_fastllm
+538: build CMakeFiles\fastllm.dir\third_party\gguf\ggml-dequantize.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\third_party\gguf\ggml-dequantize.cpp || cmake_object_order_depends_target_fastllm
+547: build CMakeFiles\fastllm.dir\third_party\gguf\gguf-adapter.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\third_party\gguf\gguf-adapter.cpp || cmake_object_order_depends_target_fastllm
+556: build CMakeFiles\fastllm.dir\src\devices\cpu\amx.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\devices\cpu\amx.cpp || cmake_object_order_depends_target_fastllm
+565: build CMakeFiles\fastllm.dir\src\devices\cpu\avx2.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\devices\cpu\avx2.cpp || cmake_object_order_depends_target_fastllm
+574: build CMakeFiles\fastllm.dir\src\devices\cpu\avx512bf16.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\devices\cpu\avx512bf16.cpp || cmake_object_order_depends_target_fastllm
+583: build CMakeFiles\fastllm.dir\src\devices\cpu\avx512f.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\devices\cpu\avx512f.cpp || cmake_object_order_depends_target_fastllm
+592: build CMakeFiles\fastllm.dir\src\devices\cpu\avx512vnni.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\devices\cpu\avx512vnni.cpp || cmake_object_order_depends_target_fastllm
+601: build CMakeFiles\fastllm.dir\src\devices\cpu\cpudevice.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\devices\cpu\cpudevice.cpp || cmake_object_order_depends_target_fastllm
+610: build CMakeFiles\fastllm.dir\src\devices\cpu\cpudevicebatch.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\devices\cpu\cpudevicebatch.cpp || cmake_object_order_depends_target_fastllm
+619: build CMakeFiles\fastllm.dir\src\devices\cpu\deepseekv41ops.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\devices\cpu\deepseekv41ops.cpp || cmake_object_order_depends_target_fastllm
+628: build CMakeFiles\fastllm.dir\src\devices\cpu\deepseekv4ops.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\devices\cpu\deepseekv4ops.cpp || cmake_object_order_depends_target_fastllm
+637: build CMakeFiles\fastllm.dir\src\devices\cpu\kimi_k3_ops.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\devices\cpu\kimi_k3_ops.cpp || cmake_object_order_depends_target_fastllm
+646: build CMakeFiles\fastllm.dir\src\devices\cpu\linear.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\devices\cpu\linear.cpp || cmake_object_order_depends_target_fastllm
+655: build CMakeFiles\fastllm.dir\src\devices\cpu\qwen4ops.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\devices\cpu\qwen4ops.cpp || cmake_object_order_depends_target_fastllm
+664: build CMakeFiles\fastllm.dir\src\blocks\attentionpagedblock.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\blocks\attentionpagedblock.cpp || cmake_object_order_depends_target_fastllm
+673: build CMakeFiles\fastllm.dir\src\blocks\embeddingblock.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\blocks\embeddingblock.cpp || cmake_object_order_depends_target_fastllm
+682: build CMakeFiles\fastllm.dir\src\blocks\linearaddblock.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\blocks\linearaddblock.cpp || cmake_object_order_depends_target_fastllm
+691: build CMakeFiles\fastllm.dir\src\blocks\linearswiglublock.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\blocks\linearswiglublock.cpp || cmake_object_order_depends_target_fastllm
+700: build CMakeFiles\fastllm.dir\src\blocks\llmsamplingblock.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\blocks\llmsamplingblock.cpp || cmake_object_order_depends_target_fastllm
+709: build CMakeFiles\fastllm.dir\src\blocks\mergemoeblock.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\blocks\mergemoeblock.cpp || cmake_object_order_depends_target_fastllm
+718: build CMakeFiles\fastllm.dir\src\blocks\mlpblock.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\blocks\mlpblock.cpp || cmake_object_order_depends_target_fastllm
+727: build CMakeFiles\fastllm.dir\src\models\graph\fastllmjson.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\graph\fastllmjson.cpp || cmake_object_order_depends_target_fastllm
+736: build CMakeFiles\fastllm.dir\src\models\graph\gemma2.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\graph\gemma2.cpp || cmake_object_order_depends_target_fastllm
+745: build CMakeFiles\fastllm.dir\src\models\graph\minicpm3.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\graph\minicpm3.cpp || cmake_object_order_depends_target_fastllm
+754: build CMakeFiles\fastllm.dir\src\models\graph\phi3.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\graph\phi3.cpp || cmake_object_order_depends_target_fastllm
