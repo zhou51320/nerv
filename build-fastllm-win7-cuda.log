@@ -40,7 +40,7 @@ CMake Deprecation Warning at CMakeLists.txt:1 (cmake_minimum_required):
 -- DeepSeek-V4 SM120 sparse MLA kernel: OFF
 -- DeepSeek-V4 SM120 DeepGEMM MoE kernel: OFF
 -- DeepSeek-V4 SM120 DeepGEMM WoA kernel: OFF
--- Configuring done (17.1s)
+-- Configuring done (15.8s)
 -- Generating done (0.2s)
 -- Build files have been written to: D:/a/nerv/nerv/build-x86_64-win7/fastllm/cuda
 ==> CMake cache summary
@@ -219,7 +219,43 @@ D:\a\nerv\nerv\fastllm\src\fastllm.cpp(3945): warning C4267: 'initializing': con
 D:\a\nerv\nerv\fastllm\src\fastllm.cpp(3999): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
 D:\a\nerv\nerv\fastllm\src\fastllm.cpp(5617): warning C4244: 'initializing': conversion from 'double' to 'float', possible loss of data
 D:\a\nerv\nerv\fastllm\src\fastllm.cpp(5618): warning C4244: 'initializing': conversion from 'double' to 'float', possible loss of data
-[4/294] Building CXX object CMakeFiles\fastllm.dir\src\model.cpp.obj
+[4/294] Building CXX object CMakeFiles\fastllm.dir\src\executor.cpp.obj
+D:\a\nerv\nerv\fastllm\include\utils\utils.h(30): warning C4067: unexpected tokens following preprocessor directive - expected a newline
+D:\a\nerv\nerv\fastllm\include\utils\utils.h(113): warning C4244: 'return': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\utils\utils.h(461): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\utils\utils.h(523): warning C4244: '+=': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(8): warning C4005: '_USE_MATH_DEFINES': macro redefinition
+D:\a\nerv\nerv\fastllm\src\executor.cpp: note: see previous definition of '_USE_MATH_DEFINES'
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(135): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(175): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(235): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(236): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(237): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(280): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(326): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(329): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(369): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(371): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(278): warning C4244: 'initializing': conversion from 'int' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(278): warning C4244: 'initializing': conversion from 'int' to 'const float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(277): warning C4244: '=': conversion from 'float' to 'uint8_t', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(285): warning C4244: '=': conversion from 'const float' to 'uint8_t', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(840): warning C4996: 'std::codecvt_utf8<wchar_t,1114111,(std::codecvt_mode)0>': warning STL4017: std::wbuffer_convert, std::wstring_convert, and the <codecvt> header (containing std::codecvt_mode, std::codecvt_utf8, std::codecvt_utf16, and std::codecvt_utf8_utf16) are deprecated in C++17. (The std::codecvt class template is NOT deprecated.) The C++ Standard doesn't provide equivalent non-deprecated functionality; consider using MultiByteToWideChar() and WideCharToMultiByte() from <Windows.h> instead. You can define _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING or _SILENCE_ALL_CXX17_DEPRECATION_WARNINGS to acknowledge that you have received this warning.
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\codecvt(33): note: see declaration of 'std::codecvt_utf8'
+D:\a\nerv\nerv\fastllm\include\fastllm.h(840): warning C4996: 'std::wstring_convert<std::codecvt_utf8<wchar_t,1114111,(std::codecvt_mode)0>,wchar_t,std::allocator<wchar_t>,std::allocator<char>>': warning STL4017: std::wbuffer_convert, std::wstring_convert, and the <codecvt> header (containing std::codecvt_mode, std::codecvt_utf8, std::codecvt_utf16, and std::codecvt_utf8_utf16) are deprecated in C++17. (The std::codecvt class template is NOT deprecated.) The C++ Standard doesn't provide equivalent non-deprecated functionality; consider using MultiByteToWideChar() and WideCharToMultiByte() from <Windows.h> instead. You can define _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING or _SILENCE_ALL_CXX17_DEPRECATION_WARNINGS to acknowledge that you have received this warning.
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\xlocbuf(300): note: see declaration of 'std::wstring_convert'
+D:\a\nerv\nerv\fastllm\include\devices/multicuda/fastllm-multicuda.cuh(84): warning C4190: 'FastllmMultiCudaGetSplitPoints' has C-linkage specified, but returns UDT 'std::vector<int,std::allocator<int>>' which is incompatible with C
+D:\a\nerv\nerv\fastllm\include\utils\utils.h(460): note: see declaration of 'std::vector<int,std::allocator<int>>'
+D:\a\nerv\nerv\fastllm\include\devices/multicuda/fastllm-multicuda.cuh(101): warning C4190: 'BuildMultiCudaRowSplitScheme' has C-linkage specified, but returns UDT 'std::map<int,std::vector<std::pair<int,int>,std::allocator<std::pair<int,int>>>,std::less<int>,std::allocator<std::pair<const int,std::vector<std::pair<int,int>,std::allocator<std::pair<int,int>>>>>>' which is incompatible with C
+D:\a\nerv\nerv\fastllm\include\fastllm.h(573): note: see declaration of 'std::map<int,std::vector<std::pair<int,int>,std::allocator<std::pair<int,int>>>,std::less<int>,std::allocator<std::pair<const int,std::vector<std::pair<int,int>,std::allocator<std::pair<int,int>>>>>>'
+D:\a\nerv\nerv\fastllm\include\devices/multicuda/fastllm-multicuda.cuh(102): warning C4190: 'BuildMultiCudaColumnSplitScheme' has C-linkage specified, but returns UDT 'std::map<int,std::vector<std::pair<int,int>,std::allocator<std::pair<int,int>>>,std::less<int>,std::allocator<std::pair<const int,std::vector<std::pair<int,int>,std::allocator<std::pair<int,int>>>>>>' which is incompatible with C
+D:\a\nerv\nerv\fastllm\include\fastllm.h(573): note: see declaration of 'std::map<int,std::vector<std::pair<int,int>,std::allocator<std::pair<int,int>>>,std::less<int>,std::allocator<std::pair<const int,std::vector<std::pair<int,int>,std::allocator<std::pair<int,int>>>>>>'
+D:\a\nerv\nerv\fastllm\src\executor.cpp(303): warning C4804: '>': unsafe use of type 'bool' in operation
+D:\a\nerv\nerv\fastllm\src\executor.cpp(401): warning C4244: 'initializing': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\executor.cpp(380): warning C4996: 'getenv': This function or variable may be unsafe. Consider using _dupenv_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.
+D:\a\nerv\nerv\fastllm\src\executor.cpp(424): warning C4804: '>': unsafe use of type 'bool' in operation
+D:\a\nerv\nerv\fastllm\src\executor.cpp(482): warning C4244: 'initializing': conversion from 'double' to 'float', possible loss of data
+[5/294] Building CXX object CMakeFiles\fastllm.dir\src\model.cpp.obj
 D:\a\nerv\nerv\fastllm\include\utils\utils.h(30): warning C4067: unexpected tokens following preprocessor directive - expected a newline
 D:\a\nerv\nerv\fastllm\include\utils\utils.h(113): warning C4244: 'return': conversion from 'double' to 'float', possible loss of data
 D:\a\nerv\nerv\fastllm\include\utils\utils.h(461): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
@@ -417,42 +453,6 @@ C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.301
         [
             _Ty1=unsigned __int64
         ]
-[5/294] Building CXX object CMakeFiles\fastllm.dir\src\executor.cpp.obj
-D:\a\nerv\nerv\fastllm\include\utils\utils.h(30): warning C4067: unexpected tokens following preprocessor directive - expected a newline
-D:\a\nerv\nerv\fastllm\include\utils\utils.h(113): warning C4244: 'return': conversion from 'double' to 'float', possible loss of data
-D:\a\nerv\nerv\fastllm\include\utils\utils.h(461): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
-D:\a\nerv\nerv\fastllm\include\utils\utils.h(523): warning C4244: '+=': conversion from 'double' to 'float', possible loss of data
-D:\a\nerv\nerv\fastllm\include\fastllm.h(8): warning C4005: '_USE_MATH_DEFINES': macro redefinition
-D:\a\nerv\nerv\fastllm\src\executor.cpp: note: see previous definition of '_USE_MATH_DEFINES'
-D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(135): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
-D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(175): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
-D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(235): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
-D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(236): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
-D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(237): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
-D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(280): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
-D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(326): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
-D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(329): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
-D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(369): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
-D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(371): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
-D:\a\nerv\nerv\fastllm\include\fastllm.h(278): warning C4244: 'initializing': conversion from 'int' to 'float', possible loss of data
-D:\a\nerv\nerv\fastllm\include\fastllm.h(278): warning C4244: 'initializing': conversion from 'int' to 'const float', possible loss of data
-D:\a\nerv\nerv\fastllm\include\fastllm.h(277): warning C4244: '=': conversion from 'float' to 'uint8_t', possible loss of data
-D:\a\nerv\nerv\fastllm\include\fastllm.h(285): warning C4244: '=': conversion from 'const float' to 'uint8_t', possible loss of data
-D:\a\nerv\nerv\fastllm\include\fastllm.h(840): warning C4996: 'std::codecvt_utf8<wchar_t,1114111,(std::codecvt_mode)0>': warning STL4017: std::wbuffer_convert, std::wstring_convert, and the <codecvt> header (containing std::codecvt_mode, std::codecvt_utf8, std::codecvt_utf16, and std::codecvt_utf8_utf16) are deprecated in C++17. (The std::codecvt class template is NOT deprecated.) The C++ Standard doesn't provide equivalent non-deprecated functionality; consider using MultiByteToWideChar() and WideCharToMultiByte() from <Windows.h> instead. You can define _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING or _SILENCE_ALL_CXX17_DEPRECATION_WARNINGS to acknowledge that you have received this warning.
-C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\codecvt(33): note: see declaration of 'std::codecvt_utf8'
-D:\a\nerv\nerv\fastllm\include\fastllm.h(840): warning C4996: 'std::wstring_convert<std::codecvt_utf8<wchar_t,1114111,(std::codecvt_mode)0>,wchar_t,std::allocator<wchar_t>,std::allocator<char>>': warning STL4017: std::wbuffer_convert, std::wstring_convert, and the <codecvt> header (containing std::codecvt_mode, std::codecvt_utf8, std::codecvt_utf16, and std::codecvt_utf8_utf16) are deprecated in C++17. (The std::codecvt class template is NOT deprecated.) The C++ Standard doesn't provide equivalent non-deprecated functionality; consider using MultiByteToWideChar() and WideCharToMultiByte() from <Windows.h> instead. You can define _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING or _SILENCE_ALL_CXX17_DEPRECATION_WARNINGS to acknowledge that you have received this warning.
-C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\xlocbuf(300): note: see declaration of 'std::wstring_convert'
-D:\a\nerv\nerv\fastllm\include\devices/multicuda/fastllm-multicuda.cuh(84): warning C4190: 'FastllmMultiCudaGetSplitPoints' has C-linkage specified, but returns UDT 'std::vector<int,std::allocator<int>>' which is incompatible with C
-D:\a\nerv\nerv\fastllm\include\utils\utils.h(460): note: see declaration of 'std::vector<int,std::allocator<int>>'
-D:\a\nerv\nerv\fastllm\include\devices/multicuda/fastllm-multicuda.cuh(101): warning C4190: 'BuildMultiCudaRowSplitScheme' has C-linkage specified, but returns UDT 'std::map<int,std::vector<std::pair<int,int>,std::allocator<std::pair<int,int>>>,std::less<int>,std::allocator<std::pair<const int,std::vector<std::pair<int,int>,std::allocator<std::pair<int,int>>>>>>' which is incompatible with C
-D:\a\nerv\nerv\fastllm\include\fastllm.h(573): note: see declaration of 'std::map<int,std::vector<std::pair<int,int>,std::allocator<std::pair<int,int>>>,std::less<int>,std::allocator<std::pair<const int,std::vector<std::pair<int,int>,std::allocator<std::pair<int,int>>>>>>'
-D:\a\nerv\nerv\fastllm\include\devices/multicuda/fastllm-multicuda.cuh(102): warning C4190: 'BuildMultiCudaColumnSplitScheme' has C-linkage specified, but returns UDT 'std::map<int,std::vector<std::pair<int,int>,std::allocator<std::pair<int,int>>>,std::less<int>,std::allocator<std::pair<const int,std::vector<std::pair<int,int>,std::allocator<std::pair<int,int>>>>>>' which is incompatible with C
-D:\a\nerv\nerv\fastllm\include\fastllm.h(573): note: see declaration of 'std::map<int,std::vector<std::pair<int,int>,std::allocator<std::pair<int,int>>>,std::less<int>,std::allocator<std::pair<const int,std::vector<std::pair<int,int>,std::allocator<std::pair<int,int>>>>>>'
-D:\a\nerv\nerv\fastllm\src\executor.cpp(303): warning C4804: '>': unsafe use of type 'bool' in operation
-D:\a\nerv\nerv\fastllm\src\executor.cpp(401): warning C4244: 'initializing': conversion from 'double' to 'float', possible loss of data
-D:\a\nerv\nerv\fastllm\src\executor.cpp(380): warning C4996: 'getenv': This function or variable may be unsafe. Consider using _dupenv_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.
-D:\a\nerv\nerv\fastllm\src\executor.cpp(424): warning C4804: '>': unsafe use of type 'bool' in operation
-D:\a\nerv\nerv\fastllm\src\executor.cpp(482): warning C4244: 'initializing': conversion from 'double' to 'float', possible loss of data
 [6/294] Building CXX object CMakeFiles\fastllm.dir\src\template.cpp.obj
 D:\a\nerv\nerv\fastllm\include\utils/utils.h(30): warning C4067: unexpected tokens following preprocessor directive - expected a newline
 D:\a\nerv\nerv\fastllm\include\utils/utils.h(113): warning C4244: 'return': conversion from 'double' to 'float', possible loss of data
@@ -470,37 +470,7 @@ D:\a\nerv\nerv\fastllm\src\template.cpp(836): warning C4267: 'argument': convers
 D:\a\nerv\nerv\fastllm\src\template.cpp(859): warning C4267: 'argument': conversion from 'size_t' to 'int', possible loss of data
 D:\a\nerv\nerv\fastllm\src\template.cpp(865): warning C4267: 'argument': conversion from 'size_t' to 'int', possible loss of data
 D:\a\nerv\nerv\fastllm\src\template.cpp(877): warning C4267: 'argument': conversion from 'size_t' to 'int', possible loss of data
-[7/294] Building CXX object CMakeFiles\fastllm.dir\src\devices\disk\diskdevice.cpp.obj
-FAILED: [code=2] CMakeFiles/fastllm.dir/src/devices/disk/diskdevice.cpp.obj 
-C:\PROGRA~1\MICROS~2\2022\ENTERP~1\VC\Tools\MSVC\1429~1.301\bin\HostX64\x64\cl.exe  /nologo /TP -DFASTLLM_SOURCE_DIR=\"D:/a/nerv/nerv/fastllm\" -DUSE_CUDA -D_USE_MATH_DEFINES -D_WIN32_WINNT=0x0601 -ID:\a\nerv\nerv\fastllm\include -ID:\a\nerv\nerv\fastllm\include\utils -ID:\a\nerv\nerv\fastllm\include\models -ID:\a\nerv\nerv\fastllm\include\blocks -ID:\a\nerv\nerv\fastllm\include\devices\cpu -ID:\a\nerv\nerv\fastllm\include\devices\disk -ID:\a\nerv\nerv\fastllm\third_party\json11 -ID:\a\nerv\nerv\fastllm\third_party\gguf -ID:\a\nerv\nerv\fastllm\third_party\flashinfer -ID:\a\nerv\nerv\fastllm\include\devices\cuda -ID:\a\nerv\nerv\fastllm\src\devices\cuda\linear\marlin_dense_fp8 -ID:\a\nerv\nerv\fastllm\third_party\turbomind -ID:\a\nerv\nerv\fastllm\include\devices\multicuda -ID:\a\nerv\nerv\fastllm\third_party\nccl_stub /DWIN32 /D_WINDOWS /W3 /GR /EHsc -DNOMINMAX /std:c++17 /arch:AVX2 /source-charset:utf-8 /MD /O2 /Ob1 /Gy /DNDEBUG /showIncludes /FoCMakeFiles\fastllm.dir\src\devices\disk\diskdevice.cpp.obj /FdCMakeFiles\fastllm.dir\ /FS -c D:\a\nerv\nerv\fastllm\src\devices\disk\diskdevice.cpp
-D:\a\nerv\nerv\fastllm\include\fastllm.h(8): warning C4005: '_USE_MATH_DEFINES': macro redefinition
-D:\a\nerv\nerv\fastllm\src\devices\disk\diskdevice.cpp: note: see previous definition of '_USE_MATH_DEFINES'
-D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(135): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
-D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(175): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
-D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(235): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
-D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(236): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
-D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(237): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
-D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(280): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
-D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(326): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
-D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(329): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
-D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(369): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
-D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(371): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
-D:\a\nerv\nerv\fastllm\include\fastllm.h(278): warning C4244: 'initializing': conversion from 'int' to 'float', possible loss of data
-D:\a\nerv\nerv\fastllm\include\fastllm.h(278): warning C4244: 'initializing': conversion from 'int' to 'const float', possible loss of data
-D:\a\nerv\nerv\fastllm\include\fastllm.h(277): warning C4244: '=': conversion from 'float' to 'uint8_t', possible loss of data
-D:\a\nerv\nerv\fastllm\include\fastllm.h(285): warning C4244: '=': conversion from 'const float' to 'uint8_t', possible loss of data
-D:\a\nerv\nerv\fastllm\include\fastllm.h(840): warning C4996: 'std::codecvt_utf8<wchar_t,1114111,(std::codecvt_mode)0>': warning STL4017: std::wbuffer_convert, std::wstring_convert, and the <codecvt> header (containing std::codecvt_mode, std::codecvt_utf8, std::codecvt_utf16, and std::codecvt_utf8_utf16) are deprecated in C++17. (The std::codecvt class template is NOT deprecated.) The C++ Standard doesn't provide equivalent non-deprecated functionality; consider using MultiByteToWideChar() and WideCharToMultiByte() from <Windows.h> instead. You can define _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING or _SILENCE_ALL_CXX17_DEPRECATION_WARNINGS to acknowledge that you have received this warning.
-C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\codecvt(33): note: see declaration of 'std::codecvt_utf8'
-D:\a\nerv\nerv\fastllm\include\fastllm.h(840): warning C4996: 'std::wstring_convert<std::codecvt_utf8<wchar_t,1114111,(std::codecvt_mode)0>,wchar_t,std::allocator<wchar_t>,std::allocator<char>>': warning STL4017: std::wbuffer_convert, std::wstring_convert, and the <codecvt> header (containing std::codecvt_mode, std::codecvt_utf8, std::codecvt_utf16, and std::codecvt_utf8_utf16) are deprecated in C++17. (The std::codecvt class template is NOT deprecated.) The C++ Standard doesn't provide equivalent non-deprecated functionality; consider using MultiByteToWideChar() and WideCharToMultiByte() from <Windows.h> instead. You can define _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING or _SILENCE_ALL_CXX17_DEPRECATION_WARNINGS to acknowledge that you have received this warning.
-C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\xlocbuf(300): note: see declaration of 'std::wstring_convert'
-D:\a\nerv\nerv\fastllm\include\utils\utils.h(30): warning C4067: unexpected tokens following preprocessor directive - expected a newline
-D:\a\nerv\nerv\fastllm\include\utils\utils.h(113): warning C4244: 'return': conversion from 'double' to 'float', possible loss of data
-D:\a\nerv\nerv\fastllm\include\utils\utils.h(461): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
-D:\a\nerv\nerv\fastllm\include\utils\utils.h(523): warning C4244: '+=': conversion from 'double' to 'float', possible loss of data
-D:\a\nerv\nerv\fastllm\include\models\basellm.h(525): warning C4305: 'initializing': truncation from 'double' to 'float'
-D:\a\nerv\nerv\fastllm\include\models\basellm.h(529): warning C4244: 'initializing': conversion from 'double' to 'const float', possible loss of data
-D:\a\nerv\nerv\fastllm\src\devices\disk\diskdevice.cpp(19): fatal error C1083: Cannot open include file: 'sys/mman.h': No such file or directory
-[8/294] Building CXX object CMakeFiles\fastllm.dir\src\graph.cpp.obj
+[7/294] Building CXX object CMakeFiles\fastllm.dir\src\graph.cpp.obj
 D:\a\nerv\nerv\fastllm\include\utils\utils.h(30): warning C4067: unexpected tokens following preprocessor directive - expected a newline
 D:\a\nerv\nerv\fastllm\include\utils\utils.h(113): warning C4244: 'return': conversion from 'double' to 'float', possible loss of data
 D:\a\nerv\nerv\fastllm\include\utils\utils.h(461): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
@@ -539,7 +509,7 @@ D:\a\nerv\nerv\fastllm\src\graph.cpp(593): warning C4267: '=': conversion from '
         [
             _Ty=int
         ]
-[9/294] Building CXX object CMakeFiles\fastllm.dir\src\tokenizer.cpp.obj
+[8/294] Building CXX object CMakeFiles\fastllm.dir\src\tokenizer.cpp.obj
 D:\a\nerv\nerv\fastllm\include\utils\utils.h(30): warning C4067: unexpected tokens following preprocessor directive - expected a newline
 D:\a\nerv\nerv\fastllm\include\utils\utils.h(113): warning C4244: 'return': conversion from 'double' to 'float', possible loss of data
 D:\a\nerv\nerv\fastllm\include\utils\utils.h(461): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
@@ -658,7 +628,7 @@ D:\a\nerv\nerv\fastllm\src\tokenizer.cpp(511): note: see reference to function t
             _Other1=unsigned __int64,
             _Other2=int
         ]
-[10/294] Building CXX object CMakeFiles\fastllm.dir\src\models\graphllm.cpp.obj
+[9/294] Building CXX object CMakeFiles\fastllm.dir\src\models\graphllm.cpp.obj
 D:\a\nerv\nerv\fastllm\include\utils\utils.h(30): warning C4067: unexpected tokens following preprocessor directive - expected a newline
 D:\a\nerv\nerv\fastllm\include\utils\utils.h(113): warning C4244: 'return': conversion from 'double' to 'float', possible loss of data
 D:\a\nerv\nerv\fastllm\include\utils\utils.h(461): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
@@ -717,75 +687,749 @@ D:\a\nerv\nerv\fastllm\src\models\graphllm.cpp(265): note: see reference to func
             _Ty=float,
             _FwdIt=float *
         ]
+[10/294] Building CXX object CMakeFiles\fastllm.dir\src\models\chatglm.cpp.obj
+D:\a\nerv\nerv\fastllm\include\utils\utils.h(30): warning C4067: unexpected tokens following preprocessor directive - expected a newline
+D:\a\nerv\nerv\fastllm\include\utils\utils.h(113): warning C4244: 'return': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\utils\utils.h(461): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\utils\utils.h(523): warning C4244: '+=': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(8): warning C4005: '_USE_MATH_DEFINES': macro redefinition
+D:\a\nerv\nerv\fastllm\src\models\chatglm.cpp: note: see previous definition of '_USE_MATH_DEFINES'
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(135): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(175): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(235): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(236): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(237): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(280): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(326): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(329): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(369): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(371): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(278): warning C4244: 'initializing': conversion from 'int' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(278): warning C4244: 'initializing': conversion from 'int' to 'const float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(277): warning C4244: '=': conversion from 'float' to 'uint8_t', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(285): warning C4244: '=': conversion from 'const float' to 'uint8_t', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(840): warning C4996: 'std::codecvt_utf8<wchar_t,1114111,(std::codecvt_mode)0>': warning STL4017: std::wbuffer_convert, std::wstring_convert, and the <codecvt> header (containing std::codecvt_mode, std::codecvt_utf8, std::codecvt_utf16, and std::codecvt_utf8_utf16) are deprecated in C++17. (The std::codecvt class template is NOT deprecated.) The C++ Standard doesn't provide equivalent non-deprecated functionality; consider using MultiByteToWideChar() and WideCharToMultiByte() from <Windows.h> instead. You can define _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING or _SILENCE_ALL_CXX17_DEPRECATION_WARNINGS to acknowledge that you have received this warning.
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\codecvt(33): note: see declaration of 'std::codecvt_utf8'
+D:\a\nerv\nerv\fastllm\include\fastllm.h(840): warning C4996: 'std::wstring_convert<std::codecvt_utf8<wchar_t,1114111,(std::codecvt_mode)0>,wchar_t,std::allocator<wchar_t>,std::allocator<char>>': warning STL4017: std::wbuffer_convert, std::wstring_convert, and the <codecvt> header (containing std::codecvt_mode, std::codecvt_utf8, std::codecvt_utf16, and std::codecvt_utf8_utf16) are deprecated in C++17. (The std::codecvt class template is NOT deprecated.) The C++ Standard doesn't provide equivalent non-deprecated functionality; consider using MultiByteToWideChar() and WideCharToMultiByte() from <Windows.h> instead. You can define _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING or _SILENCE_ALL_CXX17_DEPRECATION_WARNINGS to acknowledge that you have received this warning.
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\xlocbuf(300): note: see declaration of 'std::wstring_convert'
+D:\a\nerv\nerv\fastllm\include\models\basellm.h(525): warning C4305: 'initializing': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\include\models\basellm.h(529): warning C4244: 'initializing': conversion from 'double' to 'const float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\models\chatglm.h(79): warning C4305: 'initializing': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\src\models\chatglm.cpp(37): warning C4244: 'initializing': conversion from 'float' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\chatglm.cpp(38): warning C4244: 'argument': conversion from 'double' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=float
+        ]
+D:\a\nerv\nerv\fastllm\src\models\chatglm.cpp(100): warning C4244: '=': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\chatglm.cpp(106): warning C4244: 'argument': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\chatglm.cpp(265): warning C4244: 'argument': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\chatglm.cpp(299): warning C4244: 'initializing': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\chatglm.cpp(601): warning C4244: 'argument': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\chatglm.cpp(615): warning C4244: 'argument': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\chatglm.cpp(617): warning C4244: 'argument': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\chatglm.cpp(628): warning C4244: 'initializing': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\chatglm.cpp(709): warning C4244: '=': conversion from 'int' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=float
+        ]
+D:\a\nerv\nerv\fastllm\src\models\chatglm.cpp(763): warning C4244: 'argument': conversion from 'int' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=float
+        ]
+D:\a\nerv\nerv\fastllm\src\models\chatglm.cpp(764): warning C4244: 'argument': conversion from 'int' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=float
+        ]
+D:\a\nerv\nerv\fastllm\src\models\chatglm.cpp(769): warning C4244: 'argument': conversion from 'int' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=float
+        ]
+D:\a\nerv\nerv\fastllm\src\models\chatglm.cpp(770): warning C4244: 'argument': conversion from 'int' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=float
+        ]
+D:\a\nerv\nerv\fastllm\src\models\chatglm.cpp(778): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\chatglm.cpp(781): warning C4244: '=': conversion from 'int' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=float
+        ]
+D:\a\nerv\nerv\fastllm\src\models\chatglm.cpp(783): warning C4244: '=': conversion from 'int' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=float
+        ]
+D:\a\nerv\nerv\fastllm\src\models\chatglm.cpp(788): warning C4244: '=': conversion from 'int' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=float
+        ]
+D:\a\nerv\nerv\fastllm\src\models\chatglm.cpp(796): warning C4244: '=': conversion from 'int' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=float
+        ]
+D:\a\nerv\nerv\fastllm\src\models\chatglm.cpp(835): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\chatglm.cpp(857): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\chatglm.cpp(862): warning C4244: '=': conversion from 'int' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=float
+        ]
+D:\a\nerv\nerv\fastllm\src\models\chatglm.cpp(863): warning C4244: '=': conversion from 'int' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=float
+        ]
+D:\a\nerv\nerv\fastllm\src\models\chatglm.cpp(867): warning C4244: '=': conversion from 'int' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=float
+        ]
+D:\a\nerv\nerv\fastllm\src\models\chatglm.cpp(869): warning C4244: '=': conversion from 'int' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=float
+        ]
+D:\a\nerv\nerv\fastllm\src\models\chatglm.cpp(882): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\chatglm.cpp(884): warning C4244: '=': conversion from 'int' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=float
+        ]
+D:\a\nerv\nerv\fastllm\src\models\chatglm.cpp(885): warning C4244: '=': conversion from 'int' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=float
+        ]
+D:\a\nerv\nerv\fastllm\src\models\chatglm.cpp(892): warning C4244: '=': conversion from 'int' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=float
+        ]
+D:\a\nerv\nerv\fastllm\src\models\chatglm.cpp(922): warning C4244: '=': conversion from 'int' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=float
+        ]
+D:\a\nerv\nerv\fastllm\src\models\chatglm.cpp(924): warning C4244: '=': conversion from 'int' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=float
+        ]
+D:\a\nerv\nerv\fastllm\src\models\chatglm.cpp(926): warning C4244: '=': conversion from 'int' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=float
+        ]
+D:\a\nerv\nerv\fastllm\src\models\chatglm.cpp(970): warning C4067: unexpected tokens following preprocessor directive - expected a newline
+D:\a\nerv\nerv\fastllm\src\models\chatglm.cpp(986): warning C4067: unexpected tokens following preprocessor directive - expected a newline
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\xutility(4484): warning C4244: '=': conversion from 'const _Ty' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=double
+        ]
+        and
+        [
+            _Ty=float
+        ]
+D:\a\nerv\nerv\fastllm\src\models\chatglm.cpp(872): note: see reference to function template instantiation 'void std::fill<_Ty*,double>(const _FwdIt,const _FwdIt,const double &)' being compiled
+        with
+        [
+            _Ty=float,
+            _FwdIt=float *
+        ]
+[11/294] Building CXX object CMakeFiles\fastllm.dir\src\models\moss.cpp.obj
+D:\a\nerv\nerv\fastllm\include\utils\utils.h(30): warning C4067: unexpected tokens following preprocessor directive - expected a newline
+D:\a\nerv\nerv\fastllm\include\utils\utils.h(113): warning C4244: 'return': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\utils\utils.h(461): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\utils\utils.h(523): warning C4244: '+=': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(8): warning C4005: '_USE_MATH_DEFINES': macro redefinition
+D:\a\nerv\nerv\fastllm\src\models\moss.cpp: note: see previous definition of '_USE_MATH_DEFINES'
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(135): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(175): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(235): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(236): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(237): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(280): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(326): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(329): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(369): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(371): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(278): warning C4244: 'initializing': conversion from 'int' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(278): warning C4244: 'initializing': conversion from 'int' to 'const float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(277): warning C4244: '=': conversion from 'float' to 'uint8_t', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(285): warning C4244: '=': conversion from 'const float' to 'uint8_t', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(840): warning C4996: 'std::codecvt_utf8<wchar_t,1114111,(std::codecvt_mode)0>': warning STL4017: std::wbuffer_convert, std::wstring_convert, and the <codecvt> header (containing std::codecvt_mode, std::codecvt_utf8, std::codecvt_utf16, and std::codecvt_utf8_utf16) are deprecated in C++17. (The std::codecvt class template is NOT deprecated.) The C++ Standard doesn't provide equivalent non-deprecated functionality; consider using MultiByteToWideChar() and WideCharToMultiByte() from <Windows.h> instead. You can define _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING or _SILENCE_ALL_CXX17_DEPRECATION_WARNINGS to acknowledge that you have received this warning.
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\codecvt(33): note: see declaration of 'std::codecvt_utf8'
+D:\a\nerv\nerv\fastllm\include\fastllm.h(840): warning C4996: 'std::wstring_convert<std::codecvt_utf8<wchar_t,1114111,(std::codecvt_mode)0>,wchar_t,std::allocator<wchar_t>,std::allocator<char>>': warning STL4017: std::wbuffer_convert, std::wstring_convert, and the <codecvt> header (containing std::codecvt_mode, std::codecvt_utf8, std::codecvt_utf16, and std::codecvt_utf8_utf16) are deprecated in C++17. (The std::codecvt class template is NOT deprecated.) The C++ Standard doesn't provide equivalent non-deprecated functionality; consider using MultiByteToWideChar() and WideCharToMultiByte() from <Windows.h> instead. You can define _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING or _SILENCE_ALL_CXX17_DEPRECATION_WARNINGS to acknowledge that you have received this warning.
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\xlocbuf(300): note: see declaration of 'std::wstring_convert'
+D:\a\nerv\nerv\fastllm\include\models\basellm.h(525): warning C4305: 'initializing': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\include\models\basellm.h(529): warning C4244: 'initializing': conversion from 'double' to 'const float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\moss.cpp(39): warning C4244: 'argument': conversion from 'double' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=float
+        ]
+D:\a\nerv\nerv\fastllm\src\models\moss.cpp(54): warning C4244: 'initializing': conversion from 'uint64_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\moss.cpp(68): warning C4244: 'initializing': conversion from 'uint64_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\moss.cpp(142): warning C4244: 'argument': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\moss.cpp(201): warning C4244: 'initializing': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\moss.cpp(227): warning C4244: '=': conversion from 'int' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\moss.cpp(241): warning C4244: 'argument': conversion from 'int' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=float
+        ]
+D:\a\nerv\nerv\fastllm\src\models\moss.cpp(329): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\moss.cpp(333): warning C4244: '=': conversion from 'int' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=float
+        ]
+[12/294] Building CXX object CMakeFiles\fastllm.dir\src\models\llama.cpp.obj
+D:\a\nerv\nerv\fastllm\include\utils\utils.h(30): warning C4067: unexpected tokens following preprocessor directive - expected a newline
+D:\a\nerv\nerv\fastllm\include\utils\utils.h(113): warning C4244: 'return': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\utils\utils.h(461): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\utils\utils.h(523): warning C4244: '+=': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(8): warning C4005: '_USE_MATH_DEFINES': macro redefinition
+D:\a\nerv\nerv\fastllm\src\models\llama.cpp: note: see previous definition of '_USE_MATH_DEFINES'
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(135): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(175): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(235): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(236): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(237): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(280): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(326): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(329): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(369): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(371): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(278): warning C4244: 'initializing': conversion from 'int' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(278): warning C4244: 'initializing': conversion from 'int' to 'const float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(277): warning C4244: '=': conversion from 'float' to 'uint8_t', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(285): warning C4244: '=': conversion from 'const float' to 'uint8_t', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(840): warning C4996: 'std::codecvt_utf8<wchar_t,1114111,(std::codecvt_mode)0>': warning STL4017: std::wbuffer_convert, std::wstring_convert, and the <codecvt> header (containing std::codecvt_mode, std::codecvt_utf8, std::codecvt_utf16, and std::codecvt_utf8_utf16) are deprecated in C++17. (The std::codecvt class template is NOT deprecated.) The C++ Standard doesn't provide equivalent non-deprecated functionality; consider using MultiByteToWideChar() and WideCharToMultiByte() from <Windows.h> instead. You can define _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING or _SILENCE_ALL_CXX17_DEPRECATION_WARNINGS to acknowledge that you have received this warning.
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\codecvt(33): note: see declaration of 'std::codecvt_utf8'
+D:\a\nerv\nerv\fastllm\include\fastllm.h(840): warning C4996: 'std::wstring_convert<std::codecvt_utf8<wchar_t,1114111,(std::codecvt_mode)0>,wchar_t,std::allocator<wchar_t>,std::allocator<char>>': warning STL4017: std::wbuffer_convert, std::wstring_convert, and the <codecvt> header (containing std::codecvt_mode, std::codecvt_utf8, std::codecvt_utf16, and std::codecvt_utf8_utf16) are deprecated in C++17. (The std::codecvt class template is NOT deprecated.) The C++ Standard doesn't provide equivalent non-deprecated functionality; consider using MultiByteToWideChar() and WideCharToMultiByte() from <Windows.h> instead. You can define _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING or _SILENCE_ALL_CXX17_DEPRECATION_WARNINGS to acknowledge that you have received this warning.
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\xlocbuf(300): note: see declaration of 'std::wstring_convert'
+D:\a\nerv\nerv\fastllm\include\models\basellm.h(525): warning C4305: 'initializing': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\include\models\basellm.h(529): warning C4244: 'initializing': conversion from 'double' to 'const float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\models\llama.h(76): warning C4305: 'initializing': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\src\models\llama.cpp(21): warning C4244: 'argument': conversion from 'int' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\llama.cpp(25): warning C4244: 'argument': conversion from 'int' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\llama.cpp(80): warning C4244: '=': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\llama.cpp(90): warning C4244: '=': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\llama.cpp(93): warning C4244: '=': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\llama.cpp(129): warning C4244: 'argument': conversion from 'double' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=float
+        ]
+D:\a\nerv\nerv\fastllm\src\models\llama.cpp(131): warning C4244: 'initializing': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\llama.cpp(215): warning C4244: 'argument': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\llama.cpp(218): warning C4305: 'argument': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\src\models\llama.cpp(262): warning C4244: 'initializing': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\llama.cpp(316): warning C4244: 'argument': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\llama.cpp(318): warning C4244: 'argument': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\llama.cpp(525): warning C4244: 'argument': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\llama.cpp(528): warning C4305: 'argument': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\src\models\llama.cpp(575): warning C4244: 'initializing': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\llama.cpp(691): warning C4244: 'argument': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\llama.cpp(706): warning C4244: 'argument': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\llama.cpp(708): warning C4244: 'argument': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\llama.cpp(721): warning C4244: 'argument': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\llama.cpp(723): warning C4244: 'argument': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\llama.cpp(726): warning C4244: 'argument': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\llama.cpp(845): warning C4244: '=': conversion from 'int' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=float
+        ]
+D:\a\nerv\nerv\fastllm\src\models\llama.cpp(906): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\llama.cpp(922): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\llama.cpp(927): warning C4244: '=': conversion from 'int' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=float
+        ]
+D:\a\nerv\nerv\fastllm\src\models\llama.cpp(956): warning C4244: '=': conversion from 'int' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=float
+        ]
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\xutility(4484): warning C4244: '=': conversion from 'const _Ty' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=double
+        ]
+        and
+        [
+            _Ty=float
+        ]
+D:\a\nerv\nerv\fastllm\src\models\llama.cpp(931): note: see reference to function template instantiation 'void std::fill<_Ty*,double>(const _FwdIt,const _FwdIt,const double &)' being compiled
+        with
+        [
+            _Ty=float,
+            _FwdIt=float *
+        ]
+[13/294] Building CXX object CMakeFiles\fastllm.dir\src\models\qwen.cpp.obj
+D:\a\nerv\nerv\fastllm\include\utils\utils.h(30): warning C4067: unexpected tokens following preprocessor directive - expected a newline
+D:\a\nerv\nerv\fastllm\include\utils\utils.h(113): warning C4244: 'return': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\utils\utils.h(461): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\utils\utils.h(523): warning C4244: '+=': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(8): warning C4005: '_USE_MATH_DEFINES': macro redefinition
+D:\a\nerv\nerv\fastllm\src\models\qwen.cpp: note: see previous definition of '_USE_MATH_DEFINES'
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(135): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(175): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(235): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(236): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(237): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(280): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(326): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(329): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(369): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(371): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(278): warning C4244: 'initializing': conversion from 'int' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(278): warning C4244: 'initializing': conversion from 'int' to 'const float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(277): warning C4244: '=': conversion from 'float' to 'uint8_t', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(285): warning C4244: '=': conversion from 'const float' to 'uint8_t', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(840): warning C4996: 'std::codecvt_utf8<wchar_t,1114111,(std::codecvt_mode)0>': warning STL4017: std::wbuffer_convert, std::wstring_convert, and the <codecvt> header (containing std::codecvt_mode, std::codecvt_utf8, std::codecvt_utf16, and std::codecvt_utf8_utf16) are deprecated in C++17. (The std::codecvt class template is NOT deprecated.) The C++ Standard doesn't provide equivalent non-deprecated functionality; consider using MultiByteToWideChar() and WideCharToMultiByte() from <Windows.h> instead. You can define _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING or _SILENCE_ALL_CXX17_DEPRECATION_WARNINGS to acknowledge that you have received this warning.
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\codecvt(33): note: see declaration of 'std::codecvt_utf8'
+D:\a\nerv\nerv\fastllm\include\fastllm.h(840): warning C4996: 'std::wstring_convert<std::codecvt_utf8<wchar_t,1114111,(std::codecvt_mode)0>,wchar_t,std::allocator<wchar_t>,std::allocator<char>>': warning STL4017: std::wbuffer_convert, std::wstring_convert, and the <codecvt> header (containing std::codecvt_mode, std::codecvt_utf8, std::codecvt_utf16, and std::codecvt_utf8_utf16) are deprecated in C++17. (The std::codecvt class template is NOT deprecated.) The C++ Standard doesn't provide equivalent non-deprecated functionality; consider using MultiByteToWideChar() and WideCharToMultiByte() from <Windows.h> instead. You can define _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING or _SILENCE_ALL_CXX17_DEPRECATION_WARNINGS to acknowledge that you have received this warning.
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\xlocbuf(300): note: see declaration of 'std::wstring_convert'
+D:\a\nerv\nerv\fastllm\include\models\basellm.h(525): warning C4305: 'initializing': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\include\models\basellm.h(529): warning C4244: 'initializing': conversion from 'double' to 'const float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\qwen.cpp(54): warning C4244: '=': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\qwen.cpp(106): warning C4305: 'argument': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\src\models\qwen.cpp(120): warning C4244: 'initializing': conversion from 'const _Ty' to 'float', possible loss of data
+        with
+        [
+            _Ty=double
+        ]
+D:\a\nerv\nerv\fastllm\src\models\qwen.cpp(172): warning C4244: 'argument': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\qwen.cpp(192): warning C4305: 'argument': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\src\models\qwen.cpp(205): warning C4305: 'argument': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\src\models\qwen.cpp(257): warning C4305: 'argument': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\src\models\qwen.cpp(290): warning C4244: 'initializing': conversion from 'const _Ty' to 'float', possible loss of data
+        with
+        [
+            _Ty=double
+        ]
+D:\a\nerv\nerv\fastllm\src\models\qwen.cpp(342): warning C4244: 'argument': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\qwen.cpp(370): warning C4305: 'argument': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\src\models\qwen.cpp(383): warning C4305: 'argument': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\src\models\qwen.cpp(444): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\qwen.cpp(448): warning C4244: '=': conversion from 'int' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=float
+        ]
+D:\a\nerv\nerv\fastllm\src\models\qwen.cpp(466): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\qwen.cpp(483): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\qwen.cpp(489): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\qwen.cpp(494): warning C4244: '=': conversion from 'int' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=float
+        ]
+D:\a\nerv\nerv\fastllm\src\models\qwen.cpp(522): warning C4244: '=': conversion from 'int' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=float
+        ]
+D:\a\nerv\nerv\fastllm\src\models\qwen.cpp(561): warning C4244: 'argument': conversion from 'double' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=float
+        ]
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\xutility(4484): warning C4244: '=': conversion from 'const _Ty' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=double
+        ]
+        and
+        [
+            _Ty=float
+        ]
+D:\a\nerv\nerv\fastllm\src\models\qwen.cpp(498): note: see reference to function template instantiation 'void std::fill<_Ty*,double>(const _FwdIt,const _FwdIt,const double &)' being compiled
+        with
+        [
+            _Ty=float,
+            _FwdIt=float *
+        ]
+[14/294] Building CXX object CMakeFiles\fastllm.dir\src\models\basellm.cpp.obj
+FAILED: [code=2] CMakeFiles/fastllm.dir/src/models/basellm.cpp.obj 
+C:\PROGRA~1\MICROS~2\2022\ENTERP~1\VC\Tools\MSVC\1429~1.301\bin\HostX64\x64\cl.exe  /nologo /TP -DFASTLLM_SOURCE_DIR=\"D:/a/nerv/nerv/fastllm\" -DUSE_CUDA -D_USE_MATH_DEFINES -D_WIN32_WINNT=0x0601 -ID:\a\nerv\nerv\fastllm\include -ID:\a\nerv\nerv\fastllm\include\utils -ID:\a\nerv\nerv\fastllm\include\models -ID:\a\nerv\nerv\fastllm\include\blocks -ID:\a\nerv\nerv\fastllm\include\devices\cpu -ID:\a\nerv\nerv\fastllm\include\devices\disk -ID:\a\nerv\nerv\fastllm\third_party\json11 -ID:\a\nerv\nerv\fastllm\third_party\gguf -ID:\a\nerv\nerv\fastllm\third_party\flashinfer -ID:\a\nerv\nerv\fastllm\include\devices\cuda -ID:\a\nerv\nerv\fastllm\src\devices\cuda\linear\marlin_dense_fp8 -ID:\a\nerv\nerv\fastllm\third_party\turbomind -ID:\a\nerv\nerv\fastllm\include\devices\multicuda -ID:\a\nerv\nerv\fastllm\third_party\nccl_stub /DWIN32 /D_WINDOWS /W3 /GR /EHsc -DNOMINMAX /std:c++17 /arch:AVX2 /source-charset:utf-8 /MD /O2 /Ob1 /Gy /DNDEBUG /showIncludes /FoCMakeFiles\fastllm.dir\src\models\basellm.cpp.obj /FdCMakeFiles\fastllm.dir\ /FS -c D:\a\nerv\nerv\fastllm\src\models\basellm.cpp
+D:\a\nerv\nerv\fastllm\include\fastllm.h(8): warning C4005: '_USE_MATH_DEFINES': macro redefinition
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp: note: see previous definition of '_USE_MATH_DEFINES'
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(135): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(175): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(235): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(236): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(237): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(280): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(326): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(329): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(369): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(371): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(278): warning C4244: 'initializing': conversion from 'int' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(278): warning C4244: 'initializing': conversion from 'int' to 'const float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(277): warning C4244: '=': conversion from 'float' to 'uint8_t', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(285): warning C4244: '=': conversion from 'const float' to 'uint8_t', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(840): warning C4996: 'std::codecvt_utf8<wchar_t,1114111,(std::codecvt_mode)0>': warning STL4017: std::wbuffer_convert, std::wstring_convert, and the <codecvt> header (containing std::codecvt_mode, std::codecvt_utf8, std::codecvt_utf16, and std::codecvt_utf8_utf16) are deprecated in C++17. (The std::codecvt class template is NOT deprecated.) The C++ Standard doesn't provide equivalent non-deprecated functionality; consider using MultiByteToWideChar() and WideCharToMultiByte() from <Windows.h> instead. You can define _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING or _SILENCE_ALL_CXX17_DEPRECATION_WARNINGS to acknowledge that you have received this warning.
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\codecvt(33): note: see declaration of 'std::codecvt_utf8'
+D:\a\nerv\nerv\fastllm\include\fastllm.h(840): warning C4996: 'std::wstring_convert<std::codecvt_utf8<wchar_t,1114111,(std::codecvt_mode)0>,wchar_t,std::allocator<wchar_t>,std::allocator<char>>': warning STL4017: std::wbuffer_convert, std::wstring_convert, and the <codecvt> header (containing std::codecvt_mode, std::codecvt_utf8, std::codecvt_utf16, and std::codecvt_utf8_utf16) are deprecated in C++17. (The std::codecvt class template is NOT deprecated.) The C++ Standard doesn't provide equivalent non-deprecated functionality; consider using MultiByteToWideChar() and WideCharToMultiByte() from <Windows.h> instead. You can define _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING or _SILENCE_ALL_CXX17_DEPRECATION_WARNINGS to acknowledge that you have received this warning.
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\xlocbuf(300): note: see declaration of 'std::wstring_convert'
+D:\a\nerv\nerv\fastllm\include\utils/utils.h(30): warning C4067: unexpected tokens following preprocessor directive - expected a newline
+D:\a\nerv\nerv\fastllm\include\utils/utils.h(113): warning C4244: 'return': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\utils/utils.h(461): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\utils/utils.h(523): warning C4244: '+=': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\models\basellm.h(525): warning C4305: 'initializing': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\include\models\basellm.h(529): warning C4244: 'initializing': conversion from 'double' to 'const float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(186): warning C4566: character represented by universal-character-name '\uFF5C' cannot be represented in the current code page (1252)
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(253): warning C4566: character represented by universal-character-name '\uFF5C' cannot be represented in the current code page (1252)
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(409): warning C4244: 'initializing': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(516): warning C4267: 'argument': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(978): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(993): warning C4244: 'argument': conversion from 'int' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=float
+        ]
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(1066): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(1118): warning C4244: 'argument': conversion from '_Ty' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=int
+        ]
+        and
+        [
+            _Ty=float
+        ]
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(1133): warning C4244: 'argument': conversion from '_Ty' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=int
+        ]
+        and
+        [
+            _Ty=float
+        ]
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(1525): warning C4244: 'initializing': conversion from '__int64' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(2290): warning C4267: '=': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(2300): warning C4244: 'argument': conversion from 'int' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=float
+        ]
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(2305): warning C4244: 'argument': conversion from 'uint64_t' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=int
+        ]
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(2569): warning C4244: 'initializing': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(2570): warning C4244: 'initializing': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(2582): warning C4267: 'argument': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(2586): warning C4267: 'argument': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(2597): warning C4244: 'initializing': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(2623): warning C4244: 'initializing': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(1329): warning C4996: 'getenv': This function or variable may be unsafe. Consider using _dupenv_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(1632): warning C4996: 'getenv': This function or variable may be unsafe. Consider using _dupenv_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(1636): warning C4996: 'getenv': This function or variable may be unsafe. Consider using _dupenv_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(2761): warning C4244: 'initializing': conversion from '__int64' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(2765): warning C4244: '=': conversion from '__int64' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(2768): warning C4244: '=': conversion from '__int64' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(2944): warning C4267: '+=': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(2957): warning C4267: '=': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(2966): warning C4244: 'argument': conversion from 'int' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=float
+        ]
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(2971): warning C4244: 'argument': conversion from 'uint64_t' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=int
+        ]
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(2994): warning C4267: '+=': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(3041): warning C4267: 'argument': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(3052): warning C4244: 'initializing': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(3091): warning C4244: 'initializing': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(2711): warning C4996: 'getenv': This function or variable may be unsafe. Consider using _dupenv_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(3386): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(3391): warning C4244: 'argument': conversion from 'const _Ty' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=int
+        ]
+        and
+        [
+            _Ty=float
+        ]
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(3397): warning C4267: 'argument': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(3416): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(3419): warning C4244: '=': conversion from 'int' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=float
+        ]
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(3427): warning C4244: '=': conversion from 'int' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=float
+        ]
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(3451): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(3467): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(3472): warning C4244: '=': conversion from 'int' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=float
+        ]
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(3501): warning C4244: '=': conversion from 'int' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=float
+        ]
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(3694): warning C4244: 'argument': conversion from 'float' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=int
+        ]
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(3719): warning C4244: 'argument': conversion from 'float' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=int
+        ]
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(3729): warning C4267: 'return': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(4121): warning C4244: '=': conversion from 'int' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=float
+        ]
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(4165): warning C4244: '=': conversion from 'int' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=float
+        ]
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(4646): error C4235: nonstandard extension used: '__int128' keyword not supported on this architecture
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(4646): error C4235: nonstandard extension used: '__int128' keyword not supported on this architecture
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(4652): error C4235: nonstandard extension used: '__int128' keyword not supported on this architecture
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(4652): error C4235: nonstandard extension used: '__int128' keyword not supported on this architecture
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(4653): error C4235: nonstandard extension used: '__int128' keyword not supported on this architecture
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(4646): error C2065: 'budget': undeclared identifier
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(4646): error C2059: syntax error: ')'
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(4652): error C2065: 'fixedNeed': undeclared identifier
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(4652): error C2059: syntax error: ')'
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(4654): error C2065: 'fixedNeed': undeclared identifier
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(4654): error C2065: 'budget': undeclared identifier
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(4751): error C4235: nonstandard extension used: '__int128' keyword not supported on this architecture
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(4751): error C4235: nonstandard extension used: '__int128' keyword not supported on this architecture
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(4752): error C4235: nonstandard extension used: '__int128' keyword not supported on this architecture
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(4753): error C4235: nonstandard extension used: '__int128' keyword not supported on this architecture
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(4754): error C4235: nonstandard extension used: '__int128' keyword not supported on this architecture
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(4751): error C2065: 'need': undeclared identifier
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(4751): error C2059: syntax error: ')'
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(4755): error C2065: 'need': undeclared identifier
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(5112): error C4235: nonstandard extension used: '__int128' keyword not supported on this architecture
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(5113): error C4235: nonstandard extension used: '__int128' keyword not supported on this architecture
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(5114): error C4235: nonstandard extension used: '__int128' keyword not supported on this architecture
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(5115): error C4235: nonstandard extension used: '__int128' keyword not supported on this architecture
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(5112): error C2065: 'freedCurrentCacheBytes': undeclared identifier
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(5113): error C2059: syntax error: ')'
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(5114): error C2065: 'finalPageBudget': undeclared identifier
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(5115): error C2059: syntax error: ')'
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(5116): error C2065: 'finalPageBudget': undeclared identifier
+D:\a\nerv\nerv\fastllm\src\models\basellm.cpp(5117): error C2065: 'finalPageBudget': undeclared identifier
+[15/294] Building CXX object CMakeFiles\fastllm.dir\src\models\glm.cpp.obj
+D:\a\nerv\nerv\fastllm\include\utils\utils.h(30): warning C4067: unexpected tokens following preprocessor directive - expected a newline
+D:\a\nerv\nerv\fastllm\include\utils\utils.h(113): warning C4244: 'return': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\utils\utils.h(461): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\utils\utils.h(523): warning C4244: '+=': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(8): warning C4005: '_USE_MATH_DEFINES': macro redefinition
+D:\a\nerv\nerv\fastllm\src\models\glm.cpp: note: see previous definition of '_USE_MATH_DEFINES'
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(135): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(175): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(235): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(236): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(237): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(280): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(326): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(329): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(369): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(371): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(278): warning C4244: 'initializing': conversion from 'int' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(278): warning C4244: 'initializing': conversion from 'int' to 'const float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(277): warning C4244: '=': conversion from 'float' to 'uint8_t', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(285): warning C4244: '=': conversion from 'const float' to 'uint8_t', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(840): warning C4996: 'std::codecvt_utf8<wchar_t,1114111,(std::codecvt_mode)0>': warning STL4017: std::wbuffer_convert, std::wstring_convert, and the <codecvt> header (containing std::codecvt_mode, std::codecvt_utf8, std::codecvt_utf16, and std::codecvt_utf8_utf16) are deprecated in C++17. (The std::codecvt class template is NOT deprecated.) The C++ Standard doesn't provide equivalent non-deprecated functionality; consider using MultiByteToWideChar() and WideCharToMultiByte() from <Windows.h> instead. You can define _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING or _SILENCE_ALL_CXX17_DEPRECATION_WARNINGS to acknowledge that you have received this warning.
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\codecvt(33): note: see declaration of 'std::codecvt_utf8'
+D:\a\nerv\nerv\fastllm\include\fastllm.h(840): warning C4996: 'std::wstring_convert<std::codecvt_utf8<wchar_t,1114111,(std::codecvt_mode)0>,wchar_t,std::allocator<wchar_t>,std::allocator<char>>': warning STL4017: std::wbuffer_convert, std::wstring_convert, and the <codecvt> header (containing std::codecvt_mode, std::codecvt_utf8, std::codecvt_utf16, and std::codecvt_utf8_utf16) are deprecated in C++17. (The std::codecvt class template is NOT deprecated.) The C++ Standard doesn't provide equivalent non-deprecated functionality; consider using MultiByteToWideChar() and WideCharToMultiByte() from <Windows.h> instead. You can define _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING or _SILENCE_ALL_CXX17_DEPRECATION_WARNINGS to acknowledge that you have received this warning.
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\xlocbuf(300): note: see declaration of 'std::wstring_convert'
+D:\a\nerv\nerv\fastllm\include\models\basellm.h(525): warning C4305: 'initializing': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\include\models\basellm.h(529): warning C4244: 'initializing': conversion from 'double' to 'const float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\glm.cpp(237): warning C4267: '=': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\glm.cpp(242): warning C4244: 'argument': conversion from 'int' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=float
+        ]
+D:\a\nerv\nerv\fastllm\src\models\glm.cpp(245): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\glm.cpp(248): warning C4244: '=': conversion from 'int' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=float
+        ]
+D:\a\nerv\nerv\fastllm\src\models\glm.cpp(251): warning C4244: '=': conversion from 'int' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=float
+        ]
+D:\a\nerv\nerv\fastllm\src\models\glm.cpp(252): warning C4244: '=': conversion from 'int' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=float
+        ]
+D:\a\nerv\nerv\fastllm\src\models\glm.cpp(254): warning C4244: '=': conversion from 'int' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=float
+        ]
+D:\a\nerv\nerv\fastllm\src\models\glm.cpp(267): warning C4267: 'initializing': conversion from 'size_t' to 'unsigned long', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\glm.cpp(288): warning C4244: '=': conversion from 'double' to 'float', possible loss of data
+[16/294] Building CXX object CMakeFiles\fastllm.dir\src\models\minicpm.cpp.obj
+D:\a\nerv\nerv\fastllm\include\utils\utils.h(30): warning C4067: unexpected tokens following preprocessor directive - expected a newline
+D:\a\nerv\nerv\fastllm\include\utils\utils.h(113): warning C4244: 'return': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\utils\utils.h(461): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\utils\utils.h(523): warning C4244: '+=': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(8): warning C4005: '_USE_MATH_DEFINES': macro redefinition
+D:\a\nerv\nerv\fastllm\src\models\minicpm.cpp: note: see previous definition of '_USE_MATH_DEFINES'
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(135): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(175): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(235): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(236): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(237): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(280): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(326): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(329): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(369): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(371): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(278): warning C4244: 'initializing': conversion from 'int' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(278): warning C4244: 'initializing': conversion from 'int' to 'const float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(277): warning C4244: '=': conversion from 'float' to 'uint8_t', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(285): warning C4244: '=': conversion from 'const float' to 'uint8_t', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(840): warning C4996: 'std::codecvt_utf8<wchar_t,1114111,(std::codecvt_mode)0>': warning STL4017: std::wbuffer_convert, std::wstring_convert, and the <codecvt> header (containing std::codecvt_mode, std::codecvt_utf8, std::codecvt_utf16, and std::codecvt_utf8_utf16) are deprecated in C++17. (The std::codecvt class template is NOT deprecated.) The C++ Standard doesn't provide equivalent non-deprecated functionality; consider using MultiByteToWideChar() and WideCharToMultiByte() from <Windows.h> instead. You can define _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING or _SILENCE_ALL_CXX17_DEPRECATION_WARNINGS to acknowledge that you have received this warning.
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\codecvt(33): note: see declaration of 'std::codecvt_utf8'
+D:\a\nerv\nerv\fastllm\include\fastllm.h(840): warning C4996: 'std::wstring_convert<std::codecvt_utf8<wchar_t,1114111,(std::codecvt_mode)0>,wchar_t,std::allocator<wchar_t>,std::allocator<char>>': warning STL4017: std::wbuffer_convert, std::wstring_convert, and the <codecvt> header (containing std::codecvt_mode, std::codecvt_utf8, std::codecvt_utf16, and std::codecvt_utf8_utf16) are deprecated in C++17. (The std::codecvt class template is NOT deprecated.) The C++ Standard doesn't provide equivalent non-deprecated functionality; consider using MultiByteToWideChar() and WideCharToMultiByte() from <Windows.h> instead. You can define _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING or _SILENCE_ALL_CXX17_DEPRECATION_WARNINGS to acknowledge that you have received this warning.
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\xlocbuf(300): note: see declaration of 'std::wstring_convert'
+D:\a\nerv\nerv\fastllm\include\models\basellm.h(525): warning C4305: 'initializing': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\include\models\basellm.h(529): warning C4244: 'initializing': conversion from 'double' to 'const float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\models\llama.h(76): warning C4305: 'initializing': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\include\models\minicpm.h(55): warning C4244: 'initializing': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\minicpm.cpp(36): warning C4244: 'argument': conversion from 'double' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=float
+        ]
+D:\a\nerv\nerv\fastllm\src\models\minicpm.cpp(65): warning C4244: '=': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\minicpm.cpp(91): warning C4305: 'argument': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\src\models\minicpm.cpp(169): warning C4244: 'argument': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\minicpm.cpp(186): warning C4305: 'argument': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\src\models\minicpm.cpp(208): warning C4305: 'argument': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\src\models\minicpm.cpp(248): warning C4305: 'argument': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\src\models\minicpm.cpp(327): warning C4244: 'argument': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\minicpm.cpp(344): warning C4305: 'argument': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\src\models\minicpm.cpp(367): warning C4305: 'argument': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\src\models\minicpm.cpp(410): warning C4305: 'argument': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\src\models\minicpm.cpp(507): warning C4244: 'argument': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\minicpm.cpp(531): warning C4305: 'argument': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\src\models\minicpm.cpp(542): warning C4305: 'argument': truncation from 'double' to 'float'
+[17/294] Building CXX object CMakeFiles\fastllm.dir\src\models\minicpm3.cpp.obj
+D:\a\nerv\nerv\fastllm\include\utils\utils.h(30): warning C4067: unexpected tokens following preprocessor directive - expected a newline
+D:\a\nerv\nerv\fastllm\include\utils\utils.h(113): warning C4244: 'return': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\utils\utils.h(461): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\utils\utils.h(523): warning C4244: '+=': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(8): warning C4005: '_USE_MATH_DEFINES': macro redefinition
+D:\a\nerv\nerv\fastllm\src\models\minicpm3.cpp: note: see previous definition of '_USE_MATH_DEFINES'
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(135): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(175): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(235): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(236): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(237): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(280): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(326): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(329): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(369): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(371): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(278): warning C4244: 'initializing': conversion from 'int' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(278): warning C4244: 'initializing': conversion from 'int' to 'const float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(277): warning C4244: '=': conversion from 'float' to 'uint8_t', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(285): warning C4244: '=': conversion from 'const float' to 'uint8_t', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(840): warning C4996: 'std::codecvt_utf8<wchar_t,1114111,(std::codecvt_mode)0>': warning STL4017: std::wbuffer_convert, std::wstring_convert, and the <codecvt> header (containing std::codecvt_mode, std::codecvt_utf8, std::codecvt_utf16, and std::codecvt_utf8_utf16) are deprecated in C++17. (The std::codecvt class template is NOT deprecated.) The C++ Standard doesn't provide equivalent non-deprecated functionality; consider using MultiByteToWideChar() and WideCharToMultiByte() from <Windows.h> instead. You can define _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING or _SILENCE_ALL_CXX17_DEPRECATION_WARNINGS to acknowledge that you have received this warning.
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\codecvt(33): note: see declaration of 'std::codecvt_utf8'
+D:\a\nerv\nerv\fastllm\include\fastllm.h(840): warning C4996: 'std::wstring_convert<std::codecvt_utf8<wchar_t,1114111,(std::codecvt_mode)0>,wchar_t,std::allocator<wchar_t>,std::allocator<char>>': warning STL4017: std::wbuffer_convert, std::wstring_convert, and the <codecvt> header (containing std::codecvt_mode, std::codecvt_utf8, std::codecvt_utf16, and std::codecvt_utf8_utf16) are deprecated in C++17. (The std::codecvt class template is NOT deprecated.) The C++ Standard doesn't provide equivalent non-deprecated functionality; consider using MultiByteToWideChar() and WideCharToMultiByte() from <Windows.h> instead. You can define _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING or _SILENCE_ALL_CXX17_DEPRECATION_WARNINGS to acknowledge that you have received this warning.
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\xlocbuf(300): note: see declaration of 'std::wstring_convert'
+D:\a\nerv\nerv\fastllm\include\models\basellm.h(525): warning C4305: 'initializing': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\include\models\basellm.h(529): warning C4244: 'initializing': conversion from 'double' to 'const float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\models\llama.h(76): warning C4305: 'initializing': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\include\models\minicpm3.h(55): warning C4244: 'initializing': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\minicpm3.cpp(36): warning C4244: 'argument': conversion from 'double' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=float
+        ]
+D:\a\nerv\nerv\fastllm\src\models\minicpm3.cpp(65): warning C4244: '=': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\minicpm3.cpp(117): warning C4305: 'argument': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\src\models\minicpm3.cpp(128): warning C4305: 'argument': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\src\models\minicpm3.cpp(140): warning C4305: 'argument': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\src\models\minicpm3.cpp(210): warning C4244: 'argument': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\minicpm3.cpp(229): warning C4305: 'argument': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\src\models\minicpm3.cpp(252): warning C4305: 'argument': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\src\models\minicpm3.cpp(296): warning C4305: 'argument': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\src\models\minicpm3.cpp(307): warning C4305: 'argument': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\src\models\minicpm3.cpp(319): warning C4305: 'argument': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\src\models\minicpm3.cpp(412): warning C4244: 'argument': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\minicpm3.cpp(438): warning C4305: 'argument': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\src\models\minicpm3.cpp(449): warning C4305: 'argument': truncation from 'double' to 'float'
 ninja: build stopped: subcommand failed.
 ---- CMake command output (tail) ----
+            _Ty=float
+        ]
+D:\a\nerv\nerv\fastllm\src\models\glm.cpp(245): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\glm.cpp(248): warning C4244: '=': conversion from 'int' to '_Ty', possible loss of data
         with
         [
             _Ty=float
         ]
-D:\a\nerv\nerv\fastllm\src\tokenizer.cpp(506): warning C4267: '=': conversion from 'size_t' to 'int', possible loss of data
-D:\a\nerv\nerv\fastllm\src\tokenizer.cpp(508): warning C4267: '+=': conversion from 'size_t' to 'int', possible loss of data
-D:\a\nerv\nerv\fastllm\src\tokenizer.cpp(577): warning C4244: 'argument': conversion from 'int' to '_Ty', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\glm.cpp(251): warning C4244: '=': conversion from 'int' to '_Ty', possible loss of data
         with
         [
             _Ty=float
         ]
-D:\a\nerv\nerv\fastllm\src\tokenizer.cpp(633): warning C4244: 'argument': conversion from 'int' to '_Ty', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\glm.cpp(252): warning C4244: '=': conversion from 'int' to '_Ty', possible loss of data
         with
         [
             _Ty=float
         ]
-D:\a\nerv\nerv\fastllm\src\tokenizer.cpp(656): warning C4244: 'argument': conversion from 'int' to '_Ty', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\glm.cpp(254): warning C4244: '=': conversion from 'int' to '_Ty', possible loss of data
         with
         [
             _Ty=float
         ]
-D:\a\nerv\nerv\fastllm\src\tokenizer.cpp(692): warning C4309: 'argument': truncation of constant value
-D:\a\nerv\nerv\fastllm\src\tokenizer.cpp(692): warning C4309: 'argument': truncation of constant value
-D:\a\nerv\nerv\fastllm\src\tokenizer.cpp(692): warning C4309: 'argument': truncation of constant value
-D:\a\nerv\nerv\fastllm\src\tokenizer.cpp(710): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
-D:\a\nerv\nerv\fastllm\src\tokenizer.cpp(700): warning C4996: 'std::wstring_convert<std::codecvt_utf8<wchar_t,1114111,(std::codecvt_mode)0>,wchar_t,std::allocator<wchar_t>,std::allocator<char>>::from_bytes': warning STL4017: std::wbuffer_convert, std::wstring_convert, and the <codecvt> header (containing std::codecvt_mode, std::codecvt_utf8, std::codecvt_utf16, and std::codecvt_utf8_utf16) are deprecated in C++17. (The std::codecvt class template is NOT deprecated.) The C++ Standard doesn't provide equivalent non-deprecated functionality; consider using MultiByteToWideChar() and WideCharToMultiByte() from <Windows.h> instead. You can define _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING or _SILENCE_ALL_CXX17_DEPRECATION_WARNINGS to acknowledge that you have received this warning.
-C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\utility(186): warning C4267: 'initializing': conversion from 'size_t' to '_Ty2', possible loss of data
-        with
-        [
-            _Ty2=int
-        ]
-D:\a\nerv\nerv\fastllm\src\tokenizer.cpp(507): note: see reference to function template instantiation 'std::pair<int,int>::pair<int&,unsigned __int64,0>(_Other1,_Other2 &&) noexcept' being compiled
-        with
-        [
-            _Other1=int &,
-            _Other2=unsigned __int64
-        ]
-D:\a\nerv\nerv\fastllm\src\tokenizer.cpp(507): note: see reference to function template instantiation 'std::pair<int,int>::pair<int&,unsigned __int64,0>(_Other1,_Other2 &&) noexcept' being compiled
-        with
-        [
-            _Other1=int &,
-            _Other2=unsigned __int64
-        ]
-C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\utility(186): warning C4267: 'initializing': conversion from 'size_t' to '_Ty1', possible loss of data
-        with
-        [
-            _Ty1=int
-        ]
-D:\a\nerv\nerv\fastllm\src\tokenizer.cpp(511): note: see reference to function template instantiation 'std::pair<int,int>::pair<unsigned __int64,int,0>(_Other1 &&,_Other2 &&) noexcept' being compiled
-        with
-        [
-            _Other1=unsigned __int64,
-            _Other2=int
-        ]
-D:\a\nerv\nerv\fastllm\src\tokenizer.cpp(511): note: see reference to function template instantiation 'std::pair<int,int>::pair<unsigned __int64,int,0>(_Other1 &&,_Other2 &&) noexcept' being compiled
-        with
-        [
-            _Other1=unsigned __int64,
-            _Other2=int
-        ]
-[10/294] Building CXX object CMakeFiles\fastllm.dir\src\models\graphllm.cpp.obj
+D:\a\nerv\nerv\fastllm\src\models\glm.cpp(267): warning C4267: 'initializing': conversion from 'size_t' to 'unsigned long', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\glm.cpp(288): warning C4244: '=': conversion from 'double' to 'float', possible loss of data
+[16/294] Building CXX object CMakeFiles\fastllm.dir\src\models\minicpm.cpp.obj
 D:\a\nerv\nerv\fastllm\include\utils\utils.h(30): warning C4067: unexpected tokens following preprocessor directive - expected a newline
 D:\a\nerv\nerv\fastllm\include\utils\utils.h(113): warning C4244: 'return': conversion from 'double' to 'float', possible loss of data
 D:\a\nerv\nerv\fastllm\include\utils\utils.h(461): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
 D:\a\nerv\nerv\fastllm\include\utils\utils.h(523): warning C4244: '+=': conversion from 'double' to 'float', possible loss of data
 D:\a\nerv\nerv\fastllm\include\fastllm.h(8): warning C4005: '_USE_MATH_DEFINES': macro redefinition
-D:\a\nerv\nerv\fastllm\src\models\graphllm.cpp: note: see previous definition of '_USE_MATH_DEFINES'
+D:\a\nerv\nerv\fastllm\src\models\minicpm.cpp: note: see previous definition of '_USE_MATH_DEFINES'
 D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(135): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
 D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(175): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
 D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(235): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
@@ -806,36 +1450,71 @@ D:\a\nerv\nerv\fastllm\include\fastllm.h(840): warning C4996: 'std::wstring_conv
 C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\xlocbuf(300): note: see declaration of 'std::wstring_convert'
 D:\a\nerv\nerv\fastllm\include\models\basellm.h(525): warning C4305: 'initializing': truncation from 'double' to 'float'
 D:\a\nerv\nerv\fastllm\include\models\basellm.h(529): warning C4244: 'initializing': conversion from 'double' to 'const float', possible loss of data
-D:\a\nerv\nerv\fastllm\include\models\graphllm.h(78): warning C4305: 'initializing': truncation from 'double' to 'float'
-D:\a\nerv\nerv\fastllm\src\models\graphllm.cpp(45): warning C4244: '=': conversion from 'double' to 'float', possible loss of data
-D:\a\nerv\nerv\fastllm\src\models\graphllm.cpp(48): warning C4244: '=': conversion from 'double' to 'float', possible loss of data
-D:\a\nerv\nerv\fastllm\src\models\graphllm.cpp(58): warning C4244: '=': conversion from 'double' to 'float', possible loss of data
-D:\a\nerv\nerv\fastllm\src\models\graphllm.cpp(61): warning C4244: '=': conversion from 'double' to 'float', possible loss of data
-D:\a\nerv\nerv\fastllm\src\models\graphllm.cpp(77): warning C4244: 'argument': conversion from 'double' to '_Ty', possible loss of data
+D:\a\nerv\nerv\fastllm\include\models\llama.h(76): warning C4305: 'initializing': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\include\models\minicpm.h(55): warning C4244: 'initializing': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\minicpm.cpp(36): warning C4244: 'argument': conversion from 'double' to '_Ty', possible loss of data
         with
         [
             _Ty=float
         ]
-D:\a\nerv\nerv\fastllm\src\models\graphllm.cpp(79): warning C4244: 'initializing': conversion from 'double' to 'float', possible loss of data
-D:\a\nerv\nerv\fastllm\src\models\graphllm.cpp(194): warning C4244: '+=': conversion from 'uint64_t' to 'int', possible loss of data
-D:\a\nerv\nerv\fastllm\src\models\graphllm.cpp(330): warning C4244: '=': conversion from 'int' to '_Ty', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\minicpm.cpp(65): warning C4244: '=': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\minicpm.cpp(91): warning C4305: 'argument': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\src\models\minicpm.cpp(169): warning C4244: 'argument': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\minicpm.cpp(186): warning C4305: 'argument': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\src\models\minicpm.cpp(208): warning C4305: 'argument': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\src\models\minicpm.cpp(248): warning C4305: 'argument': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\src\models\minicpm.cpp(327): warning C4244: 'argument': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\minicpm.cpp(344): warning C4305: 'argument': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\src\models\minicpm.cpp(367): warning C4305: 'argument': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\src\models\minicpm.cpp(410): warning C4305: 'argument': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\src\models\minicpm.cpp(507): warning C4244: 'argument': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\minicpm.cpp(531): warning C4305: 'argument': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\src\models\minicpm.cpp(542): warning C4305: 'argument': truncation from 'double' to 'float'
+[17/294] Building CXX object CMakeFiles\fastllm.dir\src\models\minicpm3.cpp.obj
+D:\a\nerv\nerv\fastllm\include\utils\utils.h(30): warning C4067: unexpected tokens following preprocessor directive - expected a newline
+D:\a\nerv\nerv\fastllm\include\utils\utils.h(113): warning C4244: 'return': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\utils\utils.h(461): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\utils\utils.h(523): warning C4244: '+=': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(8): warning C4005: '_USE_MATH_DEFINES': macro redefinition
+D:\a\nerv\nerv\fastllm\src\models\minicpm3.cpp: note: see previous definition of '_USE_MATH_DEFINES'
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(135): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(175): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(235): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(236): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(237): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(280): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(326): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(329): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(369): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(371): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(278): warning C4244: 'initializing': conversion from 'int' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(278): warning C4244: 'initializing': conversion from 'int' to 'const float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(277): warning C4244: '=': conversion from 'float' to 'uint8_t', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(285): warning C4244: '=': conversion from 'const float' to 'uint8_t', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(840): warning C4996: 'std::codecvt_utf8<wchar_t,1114111,(std::codecvt_mode)0>': warning STL4017: std::wbuffer_convert, std::wstring_convert, and the <codecvt> header (containing std::codecvt_mode, std::codecvt_utf8, std::codecvt_utf16, and std::codecvt_utf8_utf16) are deprecated in C++17. (The std::codecvt class template is NOT deprecated.) The C++ Standard doesn't provide equivalent non-deprecated functionality; consider using MultiByteToWideChar() and WideCharToMultiByte() from <Windows.h> instead. You can define _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING or _SILENCE_ALL_CXX17_DEPRECATION_WARNINGS to acknowledge that you have received this warning.
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\codecvt(33): note: see declaration of 'std::codecvt_utf8'
+D:\a\nerv\nerv\fastllm\include\fastllm.h(840): warning C4996: 'std::wstring_convert<std::codecvt_utf8<wchar_t,1114111,(std::codecvt_mode)0>,wchar_t,std::allocator<wchar_t>,std::allocator<char>>': warning STL4017: std::wbuffer_convert, std::wstring_convert, and the <codecvt> header (containing std::codecvt_mode, std::codecvt_utf8, std::codecvt_utf16, and std::codecvt_utf8_utf16) are deprecated in C++17. (The std::codecvt class template is NOT deprecated.) The C++ Standard doesn't provide equivalent non-deprecated functionality; consider using MultiByteToWideChar() and WideCharToMultiByte() from <Windows.h> instead. You can define _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING or _SILENCE_ALL_CXX17_DEPRECATION_WARNINGS to acknowledge that you have received this warning.
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\xlocbuf(300): note: see declaration of 'std::wstring_convert'
+D:\a\nerv\nerv\fastllm\include\models\basellm.h(525): warning C4305: 'initializing': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\include\models\basellm.h(529): warning C4244: 'initializing': conversion from 'double' to 'const float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\models\llama.h(76): warning C4305: 'initializing': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\include\models\minicpm3.h(55): warning C4244: 'initializing': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\minicpm3.cpp(36): warning C4244: 'argument': conversion from 'double' to '_Ty', possible loss of data
         with
         [
             _Ty=float
         ]
-C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\xutility(4484): warning C4244: '=': conversion from 'const _Ty' to '_Ty', possible loss of data
-        with
-        [
-            _Ty=double
-        ]
-        and
-        [
-            _Ty=float
-        ]
-D:\a\nerv\nerv\fastllm\src\models\graphllm.cpp(265): note: see reference to function template instantiation 'void std::fill<_Ty*,double>(const _FwdIt,const _FwdIt,const double &)' being compiled
-        with
-        [
-            _Ty=float,
-            _FwdIt=float *
-        ]
+D:\a\nerv\nerv\fastllm\src\models\minicpm3.cpp(65): warning C4244: '=': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\minicpm3.cpp(117): warning C4305: 'argument': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\src\models\minicpm3.cpp(128): warning C4305: 'argument': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\src\models\minicpm3.cpp(140): warning C4305: 'argument': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\src\models\minicpm3.cpp(210): warning C4244: 'argument': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\minicpm3.cpp(229): warning C4305: 'argument': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\src\models\minicpm3.cpp(252): warning C4305: 'argument': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\src\models\minicpm3.cpp(296): warning C4305: 'argument': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\src\models\minicpm3.cpp(307): warning C4305: 'argument': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\src\models\minicpm3.cpp(319): warning C4305: 'argument': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\src\models\minicpm3.cpp(412): warning C4244: 'argument': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\models\minicpm3.cpp(438): warning C4305: 'argument': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\src\models\minicpm3.cpp(449): warning C4305: 'argument': truncation from 'double' to 'float'
 ninja: build stopped: subcommand failed.
