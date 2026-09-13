@@ -36,16 +36,22 @@ typedef struct __tile_config {
 #include "fastllm.h"
 #include "utils.h"
 // ARCH_REQ_XCOMP_PERM 系统调用
+#ifdef __linux__
 #define ARCH_GET_XCOMP_PERM     0x1022
 #define ARCH_REQ_XCOMP_PERM     0x1023
 #define XFEATURE_XTILECFG       17
 #define XFEATURE_XTILEDATA      18
 #include <sys/syscall.h>
+#endif
 
 namespace fastllm {
     extern CPUInstructInfo cpuInstructInfo;
     extern void AddBiasAVX512(float *outputData, float *biasData, int n, int k, int st, int end);
 
+    // nerv: AMX requires Linux-only XFEATURE syscall plumbing to be usable;
+    // __linux__ guards the Linux-specific portion; elsewhere (e.g. Windows/MSVC,
+    // which lacks syscall.h and the __AMX_TILE__ intrinsics) the #else branches
+    // already degrade to printf + exit, keeping this TU compilable.
     static void AddBiasAMX(float *outputData, float *biasData, int n, int k, int st, int end) {
         if (biasData == nullptr) {
             return;

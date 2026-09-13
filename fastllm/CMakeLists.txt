@@ -231,9 +231,6 @@ if (WIN32)
     # the inert stub so DiskDevice stays linkable where model code touches it.
     list(REMOVE_ITEM FASTLLM_CXX_SOURCES src/devices/disk/diskdevice.cpp)
     list(APPEND FASTLLM_CXX_SOURCES src/devices/disk/diskdevice_win.cpp)
-    # nerv: AMX tile kernels need Linux syscall XFEATURE plumbing; stub them.
-    list(REMOVE_ITEM FASTLLM_CXX_SOURCES src/devices/cpu/amx.cpp)
-    list(APPEND FASTLLM_CXX_SOURCES src/devices/cpu/amx_win.cpp)
 endif()
 
 if (MSVC)
