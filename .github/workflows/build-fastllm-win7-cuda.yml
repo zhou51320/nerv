@@ -1,5 +1,7 @@
 name: Build FastLLM Win7 CUDA (sm_75)
 
+# nerv: build fastllm with MSVC v142 + CUDA 11.7 for the Win7/sm75 target.
+
 on:
   workflow_dispatch:
   push:
