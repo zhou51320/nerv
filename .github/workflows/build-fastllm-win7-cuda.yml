@@ -106,7 +106,14 @@ jobs:
       - name: Build fastllm Win7 CUDA sm_75
         shell: pwsh
         run: |
-          .\build-fastllm-win7-cuda.ps1 -Clean -CudaArch 75 -Generator "Ninja"
+          $log = 'build-fastllm-win7-cuda.log'
+          .\build-fastllm-win7-cuda.ps1 -Clean -CudaArch 75 -Generator "Ninja" *> $log
+          $exit = $LASTEXITCODE
+          if ($exit -ne 0) {
+            Write-Host "Build failed with exit code $exit"
+            if (Test-Path $log) { Get-Content $log -Tail 400 }
+            exit $exit
+          }
 
       - name: Debug CMake logs
         if: always()
@@ -127,6 +134,17 @@ jobs:
           } else {
             Write-Host "No CMakeOutput.log at $out"
           }
+
+      - name: Upload debug logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fastllm-build-logs
+          path: |
+            build-fastllm-win7-cuda.log
+            build-x86_64-win7/fastllm/cuda/CMakeFiles/CMakeError.log
+            build-x86_64-win7/fastllm/cuda/CMakeFiles/CMakeOutput.log
+          if-no-files-found: warn
 
       - name: Bundle runtime DLLs
         shell: pwsh
