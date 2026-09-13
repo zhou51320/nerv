@@ -5,6 +5,7 @@ project(fastllm LANGUAGES CXX)
 # nerv: target Windows 7 in the Win32 API version header
 if(WIN32)
     add_definitions(-D_WIN32_WINNT=0x0601)
+    add_definitions(-D_USE_MATH_DEFINES)
 endif()
 
 option(USE_NUMAS "use numas" ON)
