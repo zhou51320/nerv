@@ -1,0 +1,61 @@
+=== build-fastllm-win7-cuda.log (tail 500) ===
+==> ARCH=x86_64 OUT_OS=win7 DEVICE=cuda PROJECT=fastllm GENERATOR=Ninja CMAKE_CUDA_ARCHITECTURES=75 BUILD_DIR=D:\a\nerv\nerv\build-x86_64-win7\fastllm\cuda
+==> Running: cmake -S D:\a\nerv\nerv\fastllm -B D:\a\nerv\nerv\build-x86_64-win7\fastllm\cuda -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_COMPILER:FILEPATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.7\bin\nvcc.exe -DCMAKE_CUDA_ARCHITECTURES=75 -DUSE_CUDA=ON -DUSE_NUMAS=OFF -DUSE_MMAP=OFF -DUSE_ROCM=OFF -DUSE_TFACC=OFF -DPY_API=OFF -DBUILD_CLI=OFF
+CMake Deprecation Warning at CMakeLists.txt:1 (cmake_minimum_required):
+  Compatibility with CMake < 3.10 will be removed from a future version of
+  CMake.
+
+  Update the VERSION argument <min> value.  Or, use the <min>...<max> syntax
+  to tell CMake that the project requires at least <min> but has been updated
+  to work with policies introduced by <max> or earlier.
+
+
+-- The CXX compiler identification is MSVC 19.29.30159.0
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: C:/Program Files/Microsoft Visual Studio/2022/Enterprise/VC/Tools/MSVC/14.29.30133/bin/HostX64/x64/cl.exe - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- USE_NUMAS: OFF
+-- USE_CUDA: ON
+-- USE_ROCM: OFF
+-- CUDA_ARCH: 75
+-- USE_TFACC: OFF
+-- For legacy CUDA GPUs: OFF
+-- CUDA_MEM_DEBUG: OFF
+-- PYTHON_API: OFF
+-- BUILD_CLI: OFF
+-- USE_SENTENCEPIECE: OFF
+-- USE_IVCOREX: OFF
+-- MAKE_WHL_X86: 
+-- CMAKE_CXX_FLAGS: /DWIN32 /D_WINDOWS /W3 /GR /EHsc -DNOMINMAX /std:c++17 /arch:AVX2 /source-charset:utf-8
+-- The CUDA compiler identification is NVIDIA 11.7.64 with host compiler MSVC 19.29.30159.0
+-- Detecting CUDA compiler ABI info
+-- Detecting CUDA compiler ABI info - done
+-- Check for working CUDA compiler: C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v11.7/bin/nvcc.exe - skipped
+-- Detecting CUDA compile features
+-- Detecting CUDA compile features - done
+-- CUDA20 is unavailable for this CMake/NVCC combination, falling back to CUDA17
+-- Effective CUDA architectures: 75
+-- CUTLASS FP8 kernels: OFF (D:/a/nerv/nerv/fastllm/third_party/cutlass)
+-- DeepSeek-V4 SM120 sparse MLA kernel: OFF
+-- DeepSeek-V4 SM120 DeepGEMM MoE kernel: OFF
+-- DeepSeek-V4 SM120 DeepGEMM WoA kernel: OFF
+-- Configuring done (17.0s)
+-- Generating done (0.2s)
+-- Build files have been written to: D:/a/nerv/nerv/build-x86_64-win7/fastllm/cuda
+==> CMake cache summary
+  CMAKE_GENERATOR:INTERNAL=Ninja
+  CMAKE_BUILD_TYPE:STRING=Release
+  CMAKE_CUDA_ARCHITECTURES:UNINITIALIZED=75
+  USE_CUDA:BOOL=ON
+  USE_NUMAS:BOOL=OFF
+  USE_MMAP:BOOL=OFF
+  PY_API:BOOL=OFF
+  BUILD_CLI:BOOL=OFF
+==> Running: cmake --build D:\a\nerv\nerv\build-x86_64-win7\fastllm\cuda --config Release --parallel 4
+ninja: error: build.ninja:2961: bad $-escape (literal $ must be written as $$)
+
+---- CMake command output (tail) ----
+ninja: error: build.ninja:2961: bad $-escape (literal $ must be written as $$)
+
