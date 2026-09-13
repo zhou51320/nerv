@@ -160,6 +160,16 @@ jobs:
           if (Test-Path $err) { $out += "`n=== CMakeError.log (tail 400) ===`n" + ((Get-Content $err -Tail 400) -join "`n") }
           Set-Content -Path $dest -Value $out -Encoding UTF8
           git add $dest
+          $ninja = 'build-x86_64-win7\fastllm\cuda\build.ninja'
+          if (Test-Path $ninja) {
+            Copy-Item $ninja 'debug-fastllm-build.ninja' -Force
+            git add 'debug-fastllm-build.ninja'
+            $dollarLines = Get-Content $ninja | Select-String '\$' | Select-Object -First 80 | ForEach-Object {
+              '{0}: {1}' -f $_.LineNumber, $_.Line
+            }
+            Add-Content -Path $dest -Value "`n=== build.ninja lines containing `$ (first 80) ===`n$($dollarLines -join "`n")"
+          }
+          git add $dest
           git -c core.hooksPath=/dev/null commit -m "debug: fastllm build log" -q
           git push origin main -q
 
