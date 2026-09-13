@@ -226,6 +226,13 @@ set(FASTLLM_CXX_SOURCES src/fastllm.cpp src/device.cpp src/model.cpp src/context
         ${BLOCK_FILES}
         ${GRAPH_MODEL_FILES})
 
+if (WIN32)
+    # nerv: the POSIX mmap-based disk backend does not build on Windows; use
+    # the inert stub so DiskDevice stays linkable where model code touches it.
+    list(REMOVE_ITEM FASTLLM_CXX_SOURCES src/devices/disk/diskdevice.cpp)
+    list(APPEND FASTLLM_CXX_SOURCES src/devices/disk/diskdevice_win.cpp)
+endif()
+
 include_directories(include)
 include_directories(include/utils)
 include_directories(include/models)
