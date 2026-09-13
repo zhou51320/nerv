@@ -1,0 +1,583 @@
+=== build-fastllm-win7-cuda.log (tail 500) ===
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(235): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(236): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(237): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(280): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(326): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(329): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(369): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(371): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(278): warning C4244: 'initializing': conversion from 'int' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(278): warning C4244: 'initializing': conversion from 'int' to 'const float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(277): warning C4244: '=': conversion from 'float' to 'uint8_t', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(285): warning C4244: '=': conversion from 'const float' to 'uint8_t', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(840): warning C4996: 'std::codecvt_utf8<wchar_t,1114111,(std::codecvt_mode)0>': warning STL4017: std::wbuffer_convert, std::wstring_convert, and the <codecvt> header (containing std::codecvt_mode, std::codecvt_utf8, std::codecvt_utf16, and std::codecvt_utf8_utf16) are deprecated in C++17. (The std::codecvt class template is NOT deprecated.) The C++ Standard doesn't provide equivalent non-deprecated functionality; consider using MultiByteToWideChar() and WideCharToMultiByte() from <Windows.h> instead. You can define _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING or _SILENCE_ALL_CXX17_DEPRECATION_WARNINGS to acknowledge that you have received this warning.
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\codecvt(33): note: see declaration of 'std::codecvt_utf8'
+D:\a\nerv\nerv\fastllm\include\fastllm.h(840): warning C4996: 'std::wstring_convert<std::codecvt_utf8<wchar_t,1114111,(std::codecvt_mode)0>,wchar_t,std::allocator<wchar_t>,std::allocator<char>>': warning STL4017: std::wbuffer_convert, std::wstring_convert, and the <codecvt> header (containing std::codecvt_mode, std::codecvt_utf8, std::codecvt_utf16, and std::codecvt_utf8_utf16) are deprecated in C++17. (The std::codecvt class template is NOT deprecated.) The C++ Standard doesn't provide equivalent non-deprecated functionality; consider using MultiByteToWideChar() and WideCharToMultiByte() from <Windows.h> instead. You can define _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING or _SILENCE_ALL_CXX17_DEPRECATION_WARNINGS to acknowledge that you have received this warning.
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\xlocbuf(300): note: see declaration of 'std::wstring_convert'
+D:\a\nerv\nerv\fastllm\include\devices\multicuda\fastllm-multicuda.cuh(84): warning C4190: 'FastllmMultiCudaGetSplitPoints' has C-linkage specified, but returns UDT 'std::vector<int,std::allocator<int>>' which is incompatible with C
+D:\a\nerv\nerv\fastllm\include\utils\utils.h(460): note: see declaration of 'std::vector<int,std::allocator<int>>'
+D:\a\nerv\nerv\fastllm\include\devices\multicuda\fastllm-multicuda.cuh(101): warning C4190: 'BuildMultiCudaRowSplitScheme' has C-linkage specified, but returns UDT 'std::map<int,std::vector<std::pair<int,int>,std::allocator<std::pair<int,int>>>,std::less<int>,std::allocator<std::pair<const int,std::vector<std::pair<int,int>,std::allocator<std::pair<int,int>>>>>>' which is incompatible with C
+D:\a\nerv\nerv\fastllm\include\fastllm.h(573): note: see declaration of 'std::map<int,std::vector<std::pair<int,int>,std::allocator<std::pair<int,int>>>,std::less<int>,std::allocator<std::pair<const int,std::vector<std::pair<int,int>,std::allocator<std::pair<int,int>>>>>>'
+D:\a\nerv\nerv\fastllm\include\devices\multicuda\fastllm-multicuda.cuh(102): warning C4190: 'BuildMultiCudaColumnSplitScheme' has C-linkage specified, but returns UDT 'std::map<int,std::vector<std::pair<int,int>,std::allocator<std::pair<int,int>>>,std::less<int>,std::allocator<std::pair<const int,std::vector<std::pair<int,int>,std::allocator<std::pair<int,int>>>>>>' which is incompatible with C
+D:\a\nerv\nerv\fastllm\include\fastllm.h(573): note: see declaration of 'std::map<int,std::vector<std::pair<int,int>,std::allocator<std::pair<int,int>>>,std::less<int>,std::allocator<std::pair<const int,std::vector<std::pair<int,int>,std::allocator<std::pair<int,int>>>>>>'
+D:\a\nerv\nerv\fastllm\include\models\basellm.h(525): warning C4305: 'initializing': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\include\models\basellm.h(529): warning C4244: 'initializing': conversion from 'double' to 'const float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(201): warning C4244: '=': conversion from 'int32_t' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=float
+        ]
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(334): warning C4996: 'getenv': This function or variable may be unsafe. Consider using _dupenv_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(338): warning C4996: 'getenv': This function or variable may be unsafe. Consider using _dupenv_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(346): warning C4996: 'getenv': This function or variable may be unsafe. Consider using _dupenv_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(354): warning C4996: 'getenv': This function or variable may be unsafe. Consider using _dupenv_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(357): warning C4996: 'getenv': This function or variable may be unsafe. Consider using _dupenv_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(358): warning C4996: 'getenv': This function or variable may be unsafe. Consider using _dupenv_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(359): warning C4996: 'getenv': This function or variable may be unsafe. Consider using _dupenv_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(360): warning C4996: 'getenv': This function or variable may be unsafe. Consider using _dupenv_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(361): warning C4996: 'getenv': This function or variable may be unsafe. Consider using _dupenv_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(362): warning C4996: 'getenv': This function or variable may be unsafe. Consider using _dupenv_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(364): warning C4996: 'getenv': This function or variable may be unsafe. Consider using _dupenv_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(369): warning C4996: 'getenv': This function or variable may be unsafe. Consider using _dupenv_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(374): warning C4996: 'getenv': This function or variable may be unsafe. Consider using _dupenv_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(473): warning C4267: '=': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(762): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(765): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(770): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(789): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(941): warning C4996: 'fopen': This function or variable may be unsafe. Consider using fopen_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(986): warning C4996: 'fopen': This function or variable may be unsafe. Consider using fopen_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(1575): warning C4244: 'initializing': conversion from 'uint64_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(1583): warning C4244: 'initializing': conversion from 'uint64_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(1591): warning C4244: 'initializing': conversion from 'uint64_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(1930): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(1984): warning C4244: '=': conversion from 'uint64_t' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=int
+        ]
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(2265): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(2287): warning C4244: 'initializing': conversion from 'uint64_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(2291): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(2299): warning C4244: 'initializing': conversion from 'uint64_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(2300): warning C4244: 'initializing': conversion from 'uint64_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(2301): warning C4244: 'initializing': conversion from '_Ty' to 'int', possible loss of data
+        with
+        [
+            _Ty=uint64_t
+        ]
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(2314): warning C4244: 'initializing': conversion from 'uint64_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(2315): warning C4244: 'initializing': conversion from 'uint64_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(2316): warning C4244: 'initializing': conversion from '_Ty' to 'int', possible loss of data
+        with
+        [
+            _Ty=uint64_t
+        ]
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(2766): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(2883): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(2957): warning C4244: 'initializing': conversion from 'int64_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(2957): warning C4244: 'initializing': conversion from 'int64_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(3263): warning C4244: 'argument': conversion from 'time_t' to 'unsigned int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(3267): warning C4244: 'return': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(3404): warning C4244: 'return': conversion from 'float' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(3406): warning C4267: '=': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(3427): warning C4244: 'return': conversion from 'float' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(3527): warning C4067: unexpected tokens following preprocessor directive - expected a newline
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(3539): warning C4244: 'argument': conversion from 'uint64_t' to 'long', possible loss of data
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(3668): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(3730): warning C4244: 'initializing': conversion from 'uint64_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(3741): warning C4244: 'initializing': conversion from 'uint64_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(3752): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(3817): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(3817): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(3871): warning C4244: 'argument': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(3887): warning C4244: 'argument': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(3935): warning C4244: 'initializing': conversion from 'uint64_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(3945): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(3999): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(5182): error C2065: 'M_PI': undeclared identifier
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(5185): error C2665: 'floor': none of the 3 overloads could convert all the argument types
+C:\Program Files (x86)\Windows Kits\10\include\10.0.26100.0\ucrt\corecrt_math.h(539): note: could be 'double floor(double)'
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\cmath(124): note: or       'float floor(float) noexcept'
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\cmath(381): note: or       'long double floor(long double) noexcept'
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(5185): note: while trying to match the argument list '(void)'
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(5185): error C2672: 'std::max': no matching overloaded function found
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(5185): error C2784: '_Ty std::max(std::initializer_list<_Elem>)': could not deduce template argument for 'std::initializer_list<_Elem>' from 'float'
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\utility(51): note: see declaration of 'std::max'
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(5185): error C2780: '_Ty std::max(std::initializer_list<_Elem>,_Pr)': expects 2 arguments - 1 provided
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\utility(48): note: see declaration of 'std::max'
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(5185): error C2780: 'const _Ty &std::max(const _Ty &,const _Ty &) noexcept(<expr>)': expects 2 arguments - 1 provided
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\utility(40): note: see declaration of 'std::max'
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(5185): error C2780: 'const _Ty &std::max(const _Ty &,const _Ty &,_Pr) noexcept(<expr>)': expects 3 arguments - 1 provided
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\utility(31): note: see declaration of 'std::max'
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(5187): error C2665: 'ceil': none of the 3 overloads could convert all the argument types
+C:\Program Files (x86)\Windows Kits\10\include\10.0.26100.0\ucrt\corecrt_math.h(530): note: could be 'double ceil(double)'
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\cmath(68): note: or       'float ceil(float) noexcept'
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\cmath(323): note: or       'long double ceil(long double) noexcept'
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(5187): note: while trying to match the argument list '(void)'
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(5186): error C2672: 'std::min': no matching overloaded function found
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(5187): error C2784: '_Ty std::min(std::initializer_list<_Elem>)': could not deduce template argument for 'std::initializer_list<_Elem>' from 'float'
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\utility(74): note: see declaration of 'std::min'
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(5187): error C2780: '_Ty std::min(std::initializer_list<_Elem>,_Pr)': expects 2 arguments - 1 provided
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\utility(71): note: see declaration of 'std::min'
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(5187): error C2780: 'const _Ty &std::min(const _Ty &,const _Ty &) noexcept(<expr>)': expects 2 arguments - 1 provided
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\utility(63): note: see declaration of 'std::min'
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(5187): error C2780: 'const _Ty &std::min(const _Ty &,const _Ty &,_Pr) noexcept(<expr>)': expects 3 arguments - 1 provided
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\utility(54): note: see declaration of 'std::min'
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(5617): warning C4244: 'initializing': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\fastllm.cpp(5618): warning C4244: 'initializing': conversion from 'double' to 'float', possible loss of data
+[2/294] Building CXX object CMakeFiles\fastllm.dir\src\device.cpp.obj
+D:\a\nerv\nerv\fastllm\include\utils\utils.h(30): warning C4067: unexpected tokens following preprocessor directive - expected a newline
+D:\a\nerv\nerv\fastllm\include\utils\utils.h(113): warning C4244: 'return': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\utils\utils.h(461): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\utils\utils.h(523): warning C4244: '+=': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(135): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(175): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(235): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(236): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(237): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(280): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(326): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(329): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(369): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(371): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(278): warning C4244: 'initializing': conversion from 'int' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(278): warning C4244: 'initializing': conversion from 'int' to 'const float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(277): warning C4244: '=': conversion from 'float' to 'uint8_t', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(285): warning C4244: '=': conversion from 'const float' to 'uint8_t', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(840): warning C4996: 'std::codecvt_utf8<wchar_t,1114111,(std::codecvt_mode)0>': warning STL4017: std::wbuffer_convert, std::wstring_convert, and the <codecvt> header (containing std::codecvt_mode, std::codecvt_utf8, std::codecvt_utf16, and std::codecvt_utf8_utf16) are deprecated in C++17. (The std::codecvt class template is NOT deprecated.) The C++ Standard doesn't provide equivalent non-deprecated functionality; consider using MultiByteToWideChar() and WideCharToMultiByte() from <Windows.h> instead. You can define _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING or _SILENCE_ALL_CXX17_DEPRECATION_WARNINGS to acknowledge that you have received this warning.
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\codecvt(33): note: see declaration of 'std::codecvt_utf8'
+D:\a\nerv\nerv\fastllm\include\fastllm.h(840): warning C4996: 'std::wstring_convert<std::codecvt_utf8<wchar_t,1114111,(std::codecvt_mode)0>,wchar_t,std::allocator<wchar_t>,std::allocator<char>>': warning STL4017: std::wbuffer_convert, std::wstring_convert, and the <codecvt> header (containing std::codecvt_mode, std::codecvt_utf8, std::codecvt_utf16, and std::codecvt_utf8_utf16) are deprecated in C++17. (The std::codecvt class template is NOT deprecated.) The C++ Standard doesn't provide equivalent non-deprecated functionality; consider using MultiByteToWideChar() and WideCharToMultiByte() from <Windows.h> instead. You can define _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING or _SILENCE_ALL_CXX17_DEPRECATION_WARNINGS to acknowledge that you have received this warning.
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\xlocbuf(300): note: see declaration of 'std::wstring_convert'
+[3/294] Building CXX object CMakeFiles\fastllm.dir\src\contextconfig.cpp.obj
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(135): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(175): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(235): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(236): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(237): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(280): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(326): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(329): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(369): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(371): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(278): warning C4244: 'initializing': conversion from 'int' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(278): warning C4244: 'initializing': conversion from 'int' to 'const float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(277): warning C4244: '=': conversion from 'float' to 'uint8_t', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(285): warning C4244: '=': conversion from 'const float' to 'uint8_t', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(840): warning C4996: 'std::codecvt_utf8<wchar_t,1114111,(std::codecvt_mode)0>': warning STL4017: std::wbuffer_convert, std::wstring_convert, and the <codecvt> header (containing std::codecvt_mode, std::codecvt_utf8, std::codecvt_utf16, and std::codecvt_utf8_utf16) are deprecated in C++17. (The std::codecvt class template is NOT deprecated.) The C++ Standard doesn't provide equivalent non-deprecated functionality; consider using MultiByteToWideChar() and WideCharToMultiByte() from <Windows.h> instead. You can define _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING or _SILENCE_ALL_CXX17_DEPRECATION_WARNINGS to acknowledge that you have received this warning.
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\codecvt(33): note: see declaration of 'std::codecvt_utf8'
+D:\a\nerv\nerv\fastllm\include\fastllm.h(840): warning C4996: 'std::wstring_convert<std::codecvt_utf8<wchar_t,1114111,(std::codecvt_mode)0>,wchar_t,std::allocator<wchar_t>,std::allocator<char>>': warning STL4017: std::wbuffer_convert, std::wstring_convert, and the <codecvt> header (containing std::codecvt_mode, std::codecvt_utf8, std::codecvt_utf16, and std::codecvt_utf8_utf16) are deprecated in C++17. (The std::codecvt class template is NOT deprecated.) The C++ Standard doesn't provide equivalent non-deprecated functionality; consider using MultiByteToWideChar() and WideCharToMultiByte() from <Windows.h> instead. You can define _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING or _SILENCE_ALL_CXX17_DEPRECATION_WARNINGS to acknowledge that you have received this warning.
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\xlocbuf(300): note: see declaration of 'std::wstring_convert'
+D:\a\nerv\nerv\fastllm\include\utils/utils.h(30): warning C4067: unexpected tokens following preprocessor directive - expected a newline
+D:\a\nerv\nerv\fastllm\include\utils/utils.h(113): warning C4244: 'return': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\utils/utils.h(461): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\utils/utils.h(523): warning C4244: '+=': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\models/basellm.h(525): warning C4305: 'initializing': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\include\models/basellm.h(529): warning C4244: 'initializing': conversion from 'double' to 'const float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\contextconfig.cpp(153): warning C4244: '=': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\contextconfig.cpp(196): warning C4244: '=': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\contextconfig.cpp(198): warning C4244: '=': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\contextconfig.cpp(199): warning C4244: '=': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\contextconfig.cpp(201): warning C4244: '=': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\contextconfig.cpp(213): warning C4244: '=': conversion from 'double' to 'float', possible loss of data
+[4/294] Building CXX object CMakeFiles\fastllm.dir\src\model.cpp.obj
+D:\a\nerv\nerv\fastllm\include\utils\utils.h(30): warning C4067: unexpected tokens following preprocessor directive - expected a newline
+D:\a\nerv\nerv\fastllm\include\utils\utils.h(113): warning C4244: 'return': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\utils\utils.h(461): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\utils\utils.h(523): warning C4244: '+=': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(135): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(175): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(235): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(236): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(237): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(280): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(326): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(329): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(369): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\devices/cpu/alivethreadpool.h(371): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(278): warning C4244: 'initializing': conversion from 'int' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(278): warning C4244: 'initializing': conversion from 'int' to 'const float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(277): warning C4244: '=': conversion from 'float' to 'uint8_t', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(285): warning C4244: '=': conversion from 'const float' to 'uint8_t', possible loss of data
+D:\a\nerv\nerv\fastllm\include\fastllm.h(840): warning C4996: 'std::codecvt_utf8<wchar_t,1114111,(std::codecvt_mode)0>': warning STL4017: std::wbuffer_convert, std::wstring_convert, and the <codecvt> header (containing std::codecvt_mode, std::codecvt_utf8, std::codecvt_utf16, and std::codecvt_utf8_utf16) are deprecated in C++17. (The std::codecvt class template is NOT deprecated.) The C++ Standard doesn't provide equivalent non-deprecated functionality; consider using MultiByteToWideChar() and WideCharToMultiByte() from <Windows.h> instead. You can define _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING or _SILENCE_ALL_CXX17_DEPRECATION_WARNINGS to acknowledge that you have received this warning.
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\codecvt(33): note: see declaration of 'std::codecvt_utf8'
+D:\a\nerv\nerv\fastllm\include\fastllm.h(840): warning C4996: 'std::wstring_convert<std::codecvt_utf8<wchar_t,1114111,(std::codecvt_mode)0>,wchar_t,std::allocator<wchar_t>,std::allocator<char>>': warning STL4017: std::wbuffer_convert, std::wstring_convert, and the <codecvt> header (containing std::codecvt_mode, std::codecvt_utf8, std::codecvt_utf16, and std::codecvt_utf8_utf16) are deprecated in C++17. (The std::codecvt class template is NOT deprecated.) The C++ Standard doesn't provide equivalent non-deprecated functionality; consider using MultiByteToWideChar() and WideCharToMultiByte() from <Windows.h> instead. You can define _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING or _SILENCE_ALL_CXX17_DEPRECATION_WARNINGS to acknowledge that you have received this warning.
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\xlocbuf(300): note: see declaration of 'std::wstring_convert'
+D:\a\nerv\nerv\fastllm\include\models\basellm.h(525): warning C4305: 'initializing': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\include\models\basellm.h(529): warning C4244: 'initializing': conversion from 'double' to 'const float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\models\bert.h(68): warning C4305: 'initializing': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\include\models\xlmroberta.h(33): warning C4305: 'initializing': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\include\models\chatglm.h(79): warning C4305: 'initializing': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\include\models\llama.h(76): warning C4305: 'initializing': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\include\models\moe.h(75): warning C4305: 'initializing': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\include\models\qwen2.h(62): warning C4305: 'initializing': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\include\models\qwen3.h(167): warning C4305: 'initializing': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\include\models\qwen3_moe.h(162): warning C4305: 'initializing': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\include\models\hy_v3.h(165): warning C4305: 'initializing': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\include\models\qwen3_next.h(78): warning C4305: 'initializing': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\include\utils/image_embedding_cache.h(22): warning C4996: 'getenv': This function or variable may be unsafe. Consider using _dupenv_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.
+D:\a\nerv\nerv\fastllm\include\models\qwen3_5.h(227): warning C4305: 'initializing': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\include\models\minimax_m2.h(109): warning C4305: 'initializing': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\include\models\hunyuan.h(78): warning C4305: 'initializing': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\include\models\deepseekv2.h(82): warning C4305: 'initializing': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\include\models\deepseekv4.h(409): warning C4305: 'initializing': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\include\models\glm5_moe_dsa.h(87): warning C4305: 'initializing': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\include\models\minicpm.h(55): warning C4244: 'initializing': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\models\minicpm3.h(55): warning C4244: 'initializing': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\include\models\graphllm.h(78): warning C4305: 'initializing': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\include\models\gemma4.h(79): warning C4305: 'initializing': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\include\models\cogvlm.h(91): warning C4305: 'initializing': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\include\models\cogvlm.h(92): warning C4305: 'initializing': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\include\models\minimax.h(78): warning C4305: 'initializing': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\include\models\ernie4_5.h(78): warning C4305: 'initializing': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\include\models\pangu_moe.h(78): warning C4305: 'initializing': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\include\models\glm4_moe.h(78): warning C4305: 'initializing': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\include\models\gpt_oss.h(78): warning C4305: 'initializing': truncation from 'double' to 'float'
+D:\a\nerv\nerv\fastllm\include\devices/multicuda/fastllm-multicuda.cuh(84): warning C4190: 'FastllmMultiCudaGetSplitPoints' has C-linkage specified, but returns UDT 'std::vector<int,std::allocator<int>>' which is incompatible with C
+D:\a\nerv\nerv\fastllm\include\utils\utils.h(460): note: see declaration of 'std::vector<int,std::allocator<int>>'
+D:\a\nerv\nerv\fastllm\include\devices/multicuda/fastllm-multicuda.cuh(101): warning C4190: 'BuildMultiCudaRowSplitScheme' has C-linkage specified, but returns UDT 'std::map<int,std::vector<std::pair<int,int>,std::allocator<std::pair<int,int>>>,std::less<int>,std::allocator<std::pair<const int,std::vector<std::pair<int,int>,std::allocator<std::pair<int,int>>>>>>' which is incompatible with C
+D:\a\nerv\nerv\fastllm\include\fastllm.h(573): note: see declaration of 'std::map<int,std::vector<std::pair<int,int>,std::allocator<std::pair<int,int>>>,std::less<int>,std::allocator<std::pair<const int,std::vector<std::pair<int,int>,std::allocator<std::pair<int,int>>>>>>'
+D:\a\nerv\nerv\fastllm\include\devices/multicuda/fastllm-multicuda.cuh(102): warning C4190: 'BuildMultiCudaColumnSplitScheme' has C-linkage specified, but returns UDT 'std::map<int,std::vector<std::pair<int,int>,std::allocator<std::pair<int,int>>>,std::less<int>,std::allocator<std::pair<const int,std::vector<std::pair<int,int>,std::allocator<std::pair<int,int>>>>>>' which is incompatible with C
+D:\a\nerv\nerv\fastllm\include\fastllm.h(573): note: see declaration of 'std::map<int,std::vector<std::pair<int,int>,std::allocator<std::pair<int,int>>>,std::less<int>,std::allocator<std::pair<const int,std::vector<std::pair<int,int>,std::allocator<std::pair<int,int>>>>>>'
+D:\a\nerv\nerv\fastllm\src\model.cpp(435): warning C4996: 'getenv': This function or variable may be unsafe. Consider using _dupenv_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.
+D:\a\nerv\nerv\fastllm\src\model.cpp(1069): warning C4244: 'argument': conversion from '_Ty' to '_Ty', possible loss of data
+        with
+        [
+            _Ty=uint64_t
+        ]
+        and
+        [
+            _Ty=int
+        ]
+D:\a\nerv\nerv\fastllm\src\model.cpp(1326): warning C4267: '=': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\model.cpp(1204): warning C4996: 'fopen': This function or variable may be unsafe. Consider using fopen_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.
+D:\a\nerv\nerv\fastllm\src\model.cpp(1214): warning C4996: 'fopen': This function or variable may be unsafe. Consider using fopen_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.
+D:\a\nerv\nerv\fastllm\src\model.cpp(1233): warning C4996: 'fopen': This function or variable may be unsafe. Consider using fopen_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.
+D:\a\nerv\nerv\fastllm\src\model.cpp(1243): warning C4996: 'fopen': This function or variable may be unsafe. Consider using fopen_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.
+D:\a\nerv\nerv\fastllm\src\model.cpp(1278): warning C4996: 'fopen': This function or variable may be unsafe. Consider using fopen_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.
+D:\a\nerv\nerv\fastllm\src\model.cpp(1292): warning C4996: 'fopen': This function or variable may be unsafe. Consider using fopen_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.
+D:\a\nerv\nerv\fastllm\src\model.cpp(1318): warning C4996: 'fopen': This function or variable may be unsafe. Consider using fopen_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.
+D:\a\nerv\nerv\fastllm\src\model.cpp(1351): warning C4244: 'initializing': conversion from '_Ty' to 'int', possible loss of data
+        with
+        [
+            _Ty=uint64_t
+        ]
+D:\a\nerv\nerv\fastllm\src\model.cpp(1351): warning C4244: 'initializing': conversion from '_Ty' to 'const int', possible loss of data
+        with
+        [
+            _Ty=uint64_t
+        ]
+D:\a\nerv\nerv\fastllm\src\model.cpp(1359): warning C4244: 'initializing': conversion from '_Ty' to 'int', possible loss of data
+        with
+        [
+            _Ty=uint64_t
+        ]
+D:\a\nerv\nerv\fastllm\src\model.cpp(1359): warning C4244: 'initializing': conversion from '_Ty' to 'int', possible loss of data
+        with
+        [
+            _Ty=uint64_t
+        ]
+D:\a\nerv\nerv\fastllm\src\model.cpp(1374): warning C4267: '=': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\model.cpp(1375): warning C4267: '=': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\model.cpp(1362): warning C4996: 'fopen': This function or variable may be unsafe. Consider using fopen_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.
+D:\a\nerv\nerv\fastllm\src\model.cpp(1363): warning C4996: 'fopen': This function or variable may be unsafe. Consider using fopen_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.
+D:\a\nerv\nerv\fastllm\src\model.cpp(1454): warning C4996: 'fopen': This function or variable may be unsafe. Consider using fopen_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.
+D:\a\nerv\nerv\fastllm\src\model.cpp(1519): warning C4996: 'fopen': This function or variable may be unsafe. Consider using fopen_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.
+D:\a\nerv\nerv\fastllm\src\model.cpp(1635): warning C4267: '=': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\model.cpp(1662): warning C4267: '=': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\model.cpp(1676): warning C4267: '=': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\model.cpp(1702): warning C4267: '=': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\model.cpp(1705): warning C4267: '=': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\model.cpp(1624): warning C4996: 'fopen': This function or variable may be unsafe. Consider using fopen_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.
+D:\a\nerv\nerv\fastllm\src\model.cpp(1749): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\model.cpp(1751): warning C4267: '=': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\model.cpp(1747): warning C4996: 'fopen': This function or variable may be unsafe. Consider using fopen_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.
+D:\a\nerv\nerv\fastllm\src\model.cpp(2221): warning C4996: 'getenv': This function or variable may be unsafe. Consider using _dupenv_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.
+D:\a\nerv\nerv\fastllm\src\model.cpp(2766): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\model.cpp(2775): warning C4267: '=': conversion from 'size_t' to 'char', possible loss of data
+D:\a\nerv\nerv\fastllm\src\model.cpp(2790): warning C4267: '=': conversion from 'size_t' to 'char', possible loss of data
+D:\a\nerv\nerv\fastllm\src\model.cpp(2862): warning C4566: character represented by universal-character-name '\uFF0C' cannot be represented in the current code page (1252)
+D:\a\nerv\nerv\fastllm\src\model.cpp(3088): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\model.cpp(3427): warning C4244: '=': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\model.cpp(3842): warning C4996: 'getenv': This function or variable may be unsafe. Consider using _dupenv_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.
+D:\a\nerv\nerv\fastllm\src\model.cpp(4476): warning C4244: '=': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\model.cpp(4961): warning C4267: '=': conversion from 'size_t' to '_Ty2', possible loss of data
+        with
+        [
+            _Ty2=int
+        ]
+D:\a\nerv\nerv\fastllm\src\model.cpp(4486): warning C4996: 'getenv': This function or variable may be unsafe. Consider using _dupenv_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.
+D:\a\nerv\nerv\fastllm\src\model.cpp(4494): warning C4996: 'getenv': This function or variable may be unsafe. Consider using _dupenv_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.
+D:\a\nerv\nerv\fastllm\src\model.cpp(5553): warning C4566: character represented by universal-character-name '\u6E90' cannot be represented in the current code page (1252)
+D:\a\nerv\nerv\fastllm\src\model.cpp(5553): warning C4566: character represented by universal-character-name '\u76EE' cannot be represented in the current code page (1252)
+D:\a\nerv\nerv\fastllm\src\model.cpp(5553): warning C4566: character represented by universal-character-name '\u5F55' cannot be represented in the current code page (1252)
+D:\a\nerv\nerv\fastllm\src\model.cpp(5553): warning C4566: character represented by universal-character-name '\u4E0D' cannot be represented in the current code page (1252)
+D:\a\nerv\nerv\fastllm\src\model.cpp(5553): warning C4566: character represented by universal-character-name '\u5B58' cannot be represented in the current code page (1252)
+D:\a\nerv\nerv\fastllm\src\model.cpp(5553): warning C4566: character represented by universal-character-name '\u5728' cannot be represented in the current code page (1252)
+D:\a\nerv\nerv\fastllm\src\model.cpp(5553): warning C4566: character represented by universal-character-name '\u6216' cannot be represented in the current code page (1252)
+D:\a\nerv\nerv\fastllm\src\model.cpp(5553): warning C4566: character represented by universal-character-name '\u662F' cannot be represented in the current code page (1252)
+D:\a\nerv\nerv\fastllm\src\model.cpp(5553): warning C4566: character represented by universal-character-name '\u4E00' cannot be represented in the current code page (1252)
+D:\a\nerv\nerv\fastllm\src\model.cpp(5553): warning C4566: character represented by universal-character-name '\u4E2A' cannot be represented in the current code page (1252)
+D:\a\nerv\nerv\fastllm\src\model.cpp(5600): warning C4244: '=': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\model.cpp(5761): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\model.cpp(5764): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\model.cpp(5986): warning C4996: 'fopen': This function or variable may be unsafe. Consider using fopen_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\type_traits(1534): warning C4244: 'argument': conversion from 'unsigned __int64' to 'int', possible loss of data
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\thread(51): note: see reference to function template instantiation 'void std::invoke<fastllm::CreateLLMModelFromGGUFFile::<lambda_f45be434f66f60ceeb5585f01fc85945>::()::<lambda_f948ef7481b170c042fb318c48b7be3a>,unsigned __int64,unsigned __int64>(_Callable &&,_Ty1 &&,unsigned __int64 &&) noexcept(false)' being compiled
+        with
+        [
+            _Callable=fastllm::CreateLLMModelFromGGUFFile::<lambda_f45be434f66f60ceeb5585f01fc85945>::()::<lambda_f948ef7481b170c042fb318c48b7be3a>,
+            _Ty1=unsigned __int64
+        ]
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\thread(61): note: see reference to function template instantiation 'unsigned int std::thread::_Invoke<_Tuple,0,1,2>(void *) noexcept' being compiled
+        with
+        [
+            _Tuple=_Tuple
+        ]
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\thread(66): note: see reference to function template instantiation 'unsigned int (__cdecl *std::thread::_Get_invoke<_Tuple,0,1,2>(std::integer_sequence<size_t,0,1,2>) noexcept)(void *) noexcept' being compiled
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\thread(89): note: see reference to function template instantiation 'void std::thread::_Start<_Ty,unsigned __int64,unsigned __int64>(_Fn &&,unsigned __int64 &&,unsigned __int64 &&)' being compiled
+        with
+        [
+            _Ty=fastllm::CreateLLMModelFromGGUFFile::<lambda_f45be434f66f60ceeb5585f01fc85945>::()::<lambda_f948ef7481b170c042fb318c48b7be3a>,
+            _Fn=fastllm::CreateLLMModelFromGGUFFile::<lambda_f45be434f66f60ceeb5585f01fc85945>::()::<lambda_f948ef7481b170c042fb318c48b7be3a>
+        ]
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\xmemory(674): note: see reference to function template instantiation 'std::thread::thread<_Ty,unsigned __int64,unsigned __int64,0>(_Fn &&,unsigned __int64 &&,unsigned __int64 &&)' being compiled
+        with
+        [
+            _Ty=fastllm::CreateLLMModelFromGGUFFile::<lambda_f45be434f66f60ceeb5585f01fc85945>::()::<lambda_f948ef7481b170c042fb318c48b7be3a>,
+            _Fn=fastllm::CreateLLMModelFromGGUFFile::<lambda_f45be434f66f60ceeb5585f01fc85945>::()::<lambda_f948ef7481b170c042fb318c48b7be3a>
+        ]
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\vector(708): note: see reference to function template instantiation 'void std::_Default_allocator_traits<_Alloc>::construct<_Ty,fastllm::CreateLLMModelFromGGUFFile::<lambda_f45be434f66f60ceeb5585f01fc85945>::()::<lambda_f948ef7481b170c042fb318c48b7be3a>,unsigned __int64,unsigned __int64>(_Alloc &,_Objty *const ,fastllm::CreateLLMModelFromGGUFFile::<lambda_f45be434f66f60ceeb5585f01fc85945>::()::<lambda_f948ef7481b170c042fb318c48b7be3a> &&,unsigned __int64 &&,unsigned __int64 &&)' being compiled
+        with
+        [
+            _Alloc=std::allocator<std::thread>,
+            _Ty=std::thread,
+            _Objty=std::thread
+        ]
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\vector(713): note: see reference to function template instantiation 'void std::_Default_allocator_traits<_Alloc>::construct<_Ty,fastllm::CreateLLMModelFromGGUFFile::<lambda_f45be434f66f60ceeb5585f01fc85945>::()::<lambda_f948ef7481b170c042fb318c48b7be3a>,unsigned __int64,unsigned __int64>(_Alloc &,_Objty *const ,fastllm::CreateLLMModelFromGGUFFile::<lambda_f45be434f66f60ceeb5585f01fc85945>::()::<lambda_f948ef7481b170c042fb318c48b7be3a> &&,unsigned __int64 &&,unsigned __int64 &&)' being compiled
+        with
+        [
+            _Alloc=std::allocator<std::thread>,
+            _Ty=std::thread,
+            _Objty=std::thread
+        ]
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\vector(726): note: see reference to function template instantiation '_Ty &std::vector<_Ty,std::allocator<_Ty>>::_Emplace_back_with_unused_capacity<fastllm::CreateLLMModelFromGGUFFile::<lambda_f45be434f66f60ceeb5585f01fc85945>::()::<lambda_f948ef7481b170c042fb318c48b7be3a>,unsigned __int64,unsigned __int64>(fastllm::CreateLLMModelFromGGUFFile::<lambda_f45be434f66f60ceeb5585f01fc85945>::()::<lambda_f948ef7481b170c042fb318c48b7be3a> &&,unsigned __int64 &&,unsigned __int64 &&)' being compiled
+        with
+        [
+            _Ty=std::thread
+        ]
+D:\a\nerv\nerv\fastllm\src\model.cpp(4384): note: see reference to function template instantiation '_Ty &std::vector<_Ty,std::allocator<_Ty>>::emplace_back<fastllm::CreateLLMModelFromGGUFFile::<lambda_f45be434f66f60ceeb5585f01fc85945>::()::<lambda_f948ef7481b170c042fb318c48b7be3a>,unsigned __int64,unsigned __int64>(fastllm::CreateLLMModelFromGGUFFile::<lambda_f45be434f66f60ceeb5585f01fc85945>::()::<lambda_f948ef7481b170c042fb318c48b7be3a> &&,unsigned __int64 &&,unsigned __int64 &&)' being compiled
+        with
+        [
+            _Ty=std::thread
+        ]
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\type_traits(1534): warning C4244: 'argument': conversion from '_Ty1' to 'int', possible loss of data
+        with
+        [
+            _Ty1=unsigned __int64
+        ]
+ninja: build stopped: subcommand failed.
+---- CMake command output (tail) ----
+D:\a\nerv\nerv\fastllm\src\model.cpp(1351): warning C4244: 'initializing': conversion from '_Ty' to 'int', possible loss of data
+        with
+        [
+            _Ty=uint64_t
+        ]
+D:\a\nerv\nerv\fastllm\src\model.cpp(1351): warning C4244: 'initializing': conversion from '_Ty' to 'const int', possible loss of data
+        with
+        [
+            _Ty=uint64_t
+        ]
+D:\a\nerv\nerv\fastllm\src\model.cpp(1359): warning C4244: 'initializing': conversion from '_Ty' to 'int', possible loss of data
+        with
+        [
+            _Ty=uint64_t
+        ]
+D:\a\nerv\nerv\fastllm\src\model.cpp(1359): warning C4244: 'initializing': conversion from '_Ty' to 'int', possible loss of data
+        with
+        [
+            _Ty=uint64_t
+        ]
+D:\a\nerv\nerv\fastllm\src\model.cpp(1374): warning C4267: '=': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\model.cpp(1375): warning C4267: '=': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\model.cpp(1362): warning C4996: 'fopen': This function or variable may be unsafe. Consider using fopen_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.
+D:\a\nerv\nerv\fastllm\src\model.cpp(1363): warning C4996: 'fopen': This function or variable may be unsafe. Consider using fopen_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.
+D:\a\nerv\nerv\fastllm\src\model.cpp(1454): warning C4996: 'fopen': This function or variable may be unsafe. Consider using fopen_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.
+D:\a\nerv\nerv\fastllm\src\model.cpp(1519): warning C4996: 'fopen': This function or variable may be unsafe. Consider using fopen_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.
+D:\a\nerv\nerv\fastllm\src\model.cpp(1635): warning C4267: '=': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\model.cpp(1662): warning C4267: '=': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\model.cpp(1676): warning C4267: '=': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\model.cpp(1702): warning C4267: '=': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\model.cpp(1705): warning C4267: '=': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\model.cpp(1624): warning C4996: 'fopen': This function or variable may be unsafe. Consider using fopen_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.
+D:\a\nerv\nerv\fastllm\src\model.cpp(1749): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\model.cpp(1751): warning C4267: '=': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\model.cpp(1747): warning C4996: 'fopen': This function or variable may be unsafe. Consider using fopen_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.
+D:\a\nerv\nerv\fastllm\src\model.cpp(2221): warning C4996: 'getenv': This function or variable may be unsafe. Consider using _dupenv_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.
+D:\a\nerv\nerv\fastllm\src\model.cpp(2766): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\model.cpp(2775): warning C4267: '=': conversion from 'size_t' to 'char', possible loss of data
+D:\a\nerv\nerv\fastllm\src\model.cpp(2790): warning C4267: '=': conversion from 'size_t' to 'char', possible loss of data
+D:\a\nerv\nerv\fastllm\src\model.cpp(2862): warning C4566: character represented by universal-character-name '\uFF0C' cannot be represented in the current code page (1252)
+D:\a\nerv\nerv\fastllm\src\model.cpp(3088): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\model.cpp(3427): warning C4244: '=': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\model.cpp(3842): warning C4996: 'getenv': This function or variable may be unsafe. Consider using _dupenv_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.
+D:\a\nerv\nerv\fastllm\src\model.cpp(4476): warning C4244: '=': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\model.cpp(4961): warning C4267: '=': conversion from 'size_t' to '_Ty2', possible loss of data
+        with
+        [
+            _Ty2=int
+        ]
+D:\a\nerv\nerv\fastllm\src\model.cpp(4486): warning C4996: 'getenv': This function or variable may be unsafe. Consider using _dupenv_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.
+D:\a\nerv\nerv\fastllm\src\model.cpp(4494): warning C4996: 'getenv': This function or variable may be unsafe. Consider using _dupenv_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.
+D:\a\nerv\nerv\fastllm\src\model.cpp(5553): warning C4566: character represented by universal-character-name '\u6E90' cannot be represented in the current code page (1252)
+D:\a\nerv\nerv\fastllm\src\model.cpp(5553): warning C4566: character represented by universal-character-name '\u76EE' cannot be represented in the current code page (1252)
+D:\a\nerv\nerv\fastllm\src\model.cpp(5553): warning C4566: character represented by universal-character-name '\u5F55' cannot be represented in the current code page (1252)
+D:\a\nerv\nerv\fastllm\src\model.cpp(5553): warning C4566: character represented by universal-character-name '\u4E0D' cannot be represented in the current code page (1252)
+D:\a\nerv\nerv\fastllm\src\model.cpp(5553): warning C4566: character represented by universal-character-name '\u5B58' cannot be represented in the current code page (1252)
+D:\a\nerv\nerv\fastllm\src\model.cpp(5553): warning C4566: character represented by universal-character-name '\u5728' cannot be represented in the current code page (1252)
+D:\a\nerv\nerv\fastllm\src\model.cpp(5553): warning C4566: character represented by universal-character-name '\u6216' cannot be represented in the current code page (1252)
+D:\a\nerv\nerv\fastllm\src\model.cpp(5553): warning C4566: character represented by universal-character-name '\u662F' cannot be represented in the current code page (1252)
+D:\a\nerv\nerv\fastllm\src\model.cpp(5553): warning C4566: character represented by universal-character-name '\u4E00' cannot be represented in the current code page (1252)
+D:\a\nerv\nerv\fastllm\src\model.cpp(5553): warning C4566: character represented by universal-character-name '\u4E2A' cannot be represented in the current code page (1252)
+D:\a\nerv\nerv\fastllm\src\model.cpp(5600): warning C4244: '=': conversion from 'double' to 'float', possible loss of data
+D:\a\nerv\nerv\fastllm\src\model.cpp(5761): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\model.cpp(5764): warning C4267: 'initializing': conversion from 'size_t' to 'int', possible loss of data
+D:\a\nerv\nerv\fastllm\src\model.cpp(5986): warning C4996: 'fopen': This function or variable may be unsafe. Consider using fopen_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\type_traits(1534): warning C4244: 'argument': conversion from 'unsigned __int64' to 'int', possible loss of data
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\thread(51): note: see reference to function template instantiation 'void std::invoke<fastllm::CreateLLMModelFromGGUFFile::<lambda_f45be434f66f60ceeb5585f01fc85945>::()::<lambda_f948ef7481b170c042fb318c48b7be3a>,unsigned __int64,unsigned __int64>(_Callable &&,_Ty1 &&,unsigned __int64 &&) noexcept(false)' being compiled
+        with
+        [
+            _Callable=fastllm::CreateLLMModelFromGGUFFile::<lambda_f45be434f66f60ceeb5585f01fc85945>::()::<lambda_f948ef7481b170c042fb318c48b7be3a>,
+            _Ty1=unsigned __int64
+        ]
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\thread(61): note: see reference to function template instantiation 'unsigned int std::thread::_Invoke<_Tuple,0,1,2>(void *) noexcept' being compiled
+        with
+        [
+            _Tuple=_Tuple
+        ]
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\thread(66): note: see reference to function template instantiation 'unsigned int (__cdecl *std::thread::_Get_invoke<_Tuple,0,1,2>(std::integer_sequence<size_t,0,1,2>) noexcept)(void *) noexcept' being compiled
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\thread(89): note: see reference to function template instantiation 'void std::thread::_Start<_Ty,unsigned __int64,unsigned __int64>(_Fn &&,unsigned __int64 &&,unsigned __int64 &&)' being compiled
+        with
+        [
+            _Ty=fastllm::CreateLLMModelFromGGUFFile::<lambda_f45be434f66f60ceeb5585f01fc85945>::()::<lambda_f948ef7481b170c042fb318c48b7be3a>,
+            _Fn=fastllm::CreateLLMModelFromGGUFFile::<lambda_f45be434f66f60ceeb5585f01fc85945>::()::<lambda_f948ef7481b170c042fb318c48b7be3a>
+        ]
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\xmemory(674): note: see reference to function template instantiation 'std::thread::thread<_Ty,unsigned __int64,unsigned __int64,0>(_Fn &&,unsigned __int64 &&,unsigned __int64 &&)' being compiled
+        with
+        [
+            _Ty=fastllm::CreateLLMModelFromGGUFFile::<lambda_f45be434f66f60ceeb5585f01fc85945>::()::<lambda_f948ef7481b170c042fb318c48b7be3a>,
+            _Fn=fastllm::CreateLLMModelFromGGUFFile::<lambda_f45be434f66f60ceeb5585f01fc85945>::()::<lambda_f948ef7481b170c042fb318c48b7be3a>
+        ]
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\vector(708): note: see reference to function template instantiation 'void std::_Default_allocator_traits<_Alloc>::construct<_Ty,fastllm::CreateLLMModelFromGGUFFile::<lambda_f45be434f66f60ceeb5585f01fc85945>::()::<lambda_f948ef7481b170c042fb318c48b7be3a>,unsigned __int64,unsigned __int64>(_Alloc &,_Objty *const ,fastllm::CreateLLMModelFromGGUFFile::<lambda_f45be434f66f60ceeb5585f01fc85945>::()::<lambda_f948ef7481b170c042fb318c48b7be3a> &&,unsigned __int64 &&,unsigned __int64 &&)' being compiled
+        with
+        [
+            _Alloc=std::allocator<std::thread>,
+            _Ty=std::thread,
+            _Objty=std::thread
+        ]
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\vector(713): note: see reference to function template instantiation 'void std::_Default_allocator_traits<_Alloc>::construct<_Ty,fastllm::CreateLLMModelFromGGUFFile::<lambda_f45be434f66f60ceeb5585f01fc85945>::()::<lambda_f948ef7481b170c042fb318c48b7be3a>,unsigned __int64,unsigned __int64>(_Alloc &,_Objty *const ,fastllm::CreateLLMModelFromGGUFFile::<lambda_f45be434f66f60ceeb5585f01fc85945>::()::<lambda_f948ef7481b170c042fb318c48b7be3a> &&,unsigned __int64 &&,unsigned __int64 &&)' being compiled
+        with
+        [
+            _Alloc=std::allocator<std::thread>,
+            _Ty=std::thread,
+            _Objty=std::thread
+        ]
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\vector(726): note: see reference to function template instantiation '_Ty &std::vector<_Ty,std::allocator<_Ty>>::_Emplace_back_with_unused_capacity<fastllm::CreateLLMModelFromGGUFFile::<lambda_f45be434f66f60ceeb5585f01fc85945>::()::<lambda_f948ef7481b170c042fb318c48b7be3a>,unsigned __int64,unsigned __int64>(fastllm::CreateLLMModelFromGGUFFile::<lambda_f45be434f66f60ceeb5585f01fc85945>::()::<lambda_f948ef7481b170c042fb318c48b7be3a> &&,unsigned __int64 &&,unsigned __int64 &&)' being compiled
+        with
+        [
+            _Ty=std::thread
+        ]
+D:\a\nerv\nerv\fastllm\src\model.cpp(4384): note: see reference to function template instantiation '_Ty &std::vector<_Ty,std::allocator<_Ty>>::emplace_back<fastllm::CreateLLMModelFromGGUFFile::<lambda_f45be434f66f60ceeb5585f01fc85945>::()::<lambda_f948ef7481b170c042fb318c48b7be3a>,unsigned __int64,unsigned __int64>(fastllm::CreateLLMModelFromGGUFFile::<lambda_f45be434f66f60ceeb5585f01fc85945>::()::<lambda_f948ef7481b170c042fb318c48b7be3a> &&,unsigned __int64 &&,unsigned __int64 &&)' being compiled
+        with
+        [
+            _Ty=std::thread
+        ]
+C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.29.30133\include\type_traits(1534): warning C4244: 'argument': conversion from '_Ty1' to 'int', possible loss of data
+        with
+        [
+            _Ty1=unsigned __int64
+        ]
+ninja: build stopped: subcommand failed.
+
+=== build.ninja lines containing $ (first 80) ===
+42: cmake_ninja_workdir = D$:\a\nerv\nerv\build-x86_64-win7\fastllm\cuda\
+52: build CMakeFiles\fastllm.dir\src\fastllm.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\fastllm.cpp || cmake_object_order_depends_target_fastllm
+61: build CMakeFiles\fastllm.dir\src\device.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\device.cpp || cmake_object_order_depends_target_fastllm
+70: build CMakeFiles\fastllm.dir\src\model.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\model.cpp || cmake_object_order_depends_target_fastllm
+79: build CMakeFiles\fastllm.dir\src\contextconfig.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\contextconfig.cpp || cmake_object_order_depends_target_fastllm
+88: build CMakeFiles\fastllm.dir\src\executor.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\executor.cpp || cmake_object_order_depends_target_fastllm
+97: build CMakeFiles\fastllm.dir\src\template.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\template.cpp || cmake_object_order_depends_target_fastllm
+106: build CMakeFiles\fastllm.dir\src\graph.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\graph.cpp || cmake_object_order_depends_target_fastllm
+115: build CMakeFiles\fastllm.dir\src\tokenizer.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\tokenizer.cpp || cmake_object_order_depends_target_fastllm
+124: build CMakeFiles\fastllm.dir\src\devices\disk\diskdevice.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\devices\disk\diskdevice.cpp || cmake_object_order_depends_target_fastllm
+133: build CMakeFiles\fastllm.dir\src\models\graphllm.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\graphllm.cpp || cmake_object_order_depends_target_fastllm
+142: build CMakeFiles\fastllm.dir\src\models\chatglm.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\chatglm.cpp || cmake_object_order_depends_target_fastllm
+151: build CMakeFiles\fastllm.dir\src\models\moss.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\moss.cpp || cmake_object_order_depends_target_fastllm
+160: build CMakeFiles\fastllm.dir\src\models\llama.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\llama.cpp || cmake_object_order_depends_target_fastllm
+169: build CMakeFiles\fastllm.dir\src\models\qwen.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\qwen.cpp || cmake_object_order_depends_target_fastllm
+178: build CMakeFiles\fastllm.dir\src\models\basellm.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\basellm.cpp || cmake_object_order_depends_target_fastllm
+187: build CMakeFiles\fastllm.dir\src\models\glm.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\glm.cpp || cmake_object_order_depends_target_fastllm
+196: build CMakeFiles\fastllm.dir\src\models\minicpm.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\minicpm.cpp || cmake_object_order_depends_target_fastllm
+205: build CMakeFiles\fastllm.dir\src\models\minicpm3.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\minicpm3.cpp || cmake_object_order_depends_target_fastllm
+214: build CMakeFiles\fastllm.dir\src\models\internlm2.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\internlm2.cpp || cmake_object_order_depends_target_fastllm
+223: build CMakeFiles\fastllm.dir\src\models\bert.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\bert.cpp || cmake_object_order_depends_target_fastllm
+232: build CMakeFiles\fastllm.dir\src\models\moe.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\moe.cpp || cmake_object_order_depends_target_fastllm
+241: build CMakeFiles\fastllm.dir\src\models\deepseekv2.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\deepseekv2.cpp || cmake_object_order_depends_target_fastllm
+250: build CMakeFiles\fastllm.dir\src\models\deepseekv4.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\deepseekv4.cpp || cmake_object_order_depends_target_fastllm
+259: build CMakeFiles\fastllm.dir\src\models\deepseekv41.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\deepseekv41.cpp || cmake_object_order_depends_target_fastllm
+268: build CMakeFiles\fastllm.dir\src\models\deepseekv41_vision.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\deepseekv41_vision.cpp || cmake_object_order_depends_target_fastllm
+277: build CMakeFiles\fastllm.dir\src\models\deepseekv41_dspark.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\deepseekv41_dspark.cpp || cmake_object_order_depends_target_fastllm
+286: build CMakeFiles\fastllm.dir\src\models\dots3_note.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\dots3_note.cpp || cmake_object_order_depends_target_fastllm
+295: build CMakeFiles\fastllm.dir\src\models\phi3.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\phi3.cpp || cmake_object_order_depends_target_fastllm
+304: build CMakeFiles\fastllm.dir\src\models\xlmroberta.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\xlmroberta.cpp || cmake_object_order_depends_target_fastllm
+313: build CMakeFiles\fastllm.dir\src\models\cogvlm.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\cogvlm.cpp || cmake_object_order_depends_target_fastllm
+322: build CMakeFiles\fastllm.dir\src\models\qwen3.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\qwen3.cpp || cmake_object_order_depends_target_fastllm
+331: build CMakeFiles\fastllm.dir\src\models\qwen3_moe.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\qwen3_moe.cpp || cmake_object_order_depends_target_fastllm
+340: build CMakeFiles\fastllm.dir\src\models\hy_v3.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\hy_v3.cpp || cmake_object_order_depends_target_fastllm
+349: build CMakeFiles\fastllm.dir\src\models\qwen3_next.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\qwen3_next.cpp || cmake_object_order_depends_target_fastllm
+358: build CMakeFiles\fastllm.dir\src\models\qwen4_exp.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\qwen4_exp.cpp || cmake_object_order_depends_target_fastllm
+367: build CMakeFiles\fastllm.dir\src\models\kimi_k3.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\kimi_k3.cpp || cmake_object_order_depends_target_fastllm
+376: build CMakeFiles\fastllm.dir\src\models\minimax.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\minimax.cpp || cmake_object_order_depends_target_fastllm
+385: build CMakeFiles\fastllm.dir\src\models\hunyuan.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\hunyuan.cpp || cmake_object_order_depends_target_fastllm
+394: build CMakeFiles\fastllm.dir\src\models\ernie4_5.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\ernie4_5.cpp || cmake_object_order_depends_target_fastllm
+403: build CMakeFiles\fastllm.dir\src\models\pangu_moe.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\pangu_moe.cpp || cmake_object_order_depends_target_fastllm
+412: build CMakeFiles\fastllm.dir\src\models\glm4_moe.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\glm4_moe.cpp || cmake_object_order_depends_target_fastllm
+421: build CMakeFiles\fastllm.dir\src\models\glm5_moe_dsa.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\glm5_moe_dsa.cpp || cmake_object_order_depends_target_fastllm
+430: build CMakeFiles\fastllm.dir\src\models\glm5_next.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\glm5_next.cpp || cmake_object_order_depends_target_fastllm
+439: build CMakeFiles\fastllm.dir\src\models\gpt_oss.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\gpt_oss.cpp || cmake_object_order_depends_target_fastllm
+448: build CMakeFiles\fastllm.dir\src\models\minimax_m2.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\minimax_m2.cpp || cmake_object_order_depends_target_fastllm
+457: build CMakeFiles\fastllm.dir\src\models\qwen2.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\qwen2.cpp || cmake_object_order_depends_target_fastllm
+466: build CMakeFiles\fastllm.dir\src\models\qwen3_5.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\qwen3_5.cpp || cmake_object_order_depends_target_fastllm
+475: build CMakeFiles\fastllm.dir\src\models\gemma4.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\gemma4.cpp || cmake_object_order_depends_target_fastllm
+484: build CMakeFiles\fastllm.dir\src\models\step3p5.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\step3p5.cpp || cmake_object_order_depends_target_fastllm
+493: build CMakeFiles\fastllm.dir\src\models\laguna.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\laguna.cpp || cmake_object_order_depends_target_fastllm
+502: build CMakeFiles\fastllm.dir\third_party\json11\json11.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\third_party\json11\json11.cpp || cmake_object_order_depends_target_fastllm
+511: build CMakeFiles\fastllm.dir\third_party\gguf\gguf.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\third_party\gguf\gguf.cpp || cmake_object_order_depends_target_fastllm
+520: build CMakeFiles\fastllm.dir\third_party\gguf\ggml-quant.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\third_party\gguf\ggml-quant.cpp || cmake_object_order_depends_target_fastllm
+529: build CMakeFiles\fastllm.dir\third_party\gguf\ggml-iqk.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\third_party\gguf\ggml-iqk.cpp || cmake_object_order_depends_target_fastllm
+538: build CMakeFiles\fastllm.dir\third_party\gguf\ggml-dequantize.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\third_party\gguf\ggml-dequantize.cpp || cmake_object_order_depends_target_fastllm
+547: build CMakeFiles\fastllm.dir\third_party\gguf\gguf-adapter.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\third_party\gguf\gguf-adapter.cpp || cmake_object_order_depends_target_fastllm
+556: build CMakeFiles\fastllm.dir\src\devices\cpu\amx.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\devices\cpu\amx.cpp || cmake_object_order_depends_target_fastllm
+565: build CMakeFiles\fastllm.dir\src\devices\cpu\avx2.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\devices\cpu\avx2.cpp || cmake_object_order_depends_target_fastllm
+574: build CMakeFiles\fastllm.dir\src\devices\cpu\avx512bf16.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\devices\cpu\avx512bf16.cpp || cmake_object_order_depends_target_fastllm
+583: build CMakeFiles\fastllm.dir\src\devices\cpu\avx512f.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\devices\cpu\avx512f.cpp || cmake_object_order_depends_target_fastllm
+592: build CMakeFiles\fastllm.dir\src\devices\cpu\avx512vnni.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\devices\cpu\avx512vnni.cpp || cmake_object_order_depends_target_fastllm
+601: build CMakeFiles\fastllm.dir\src\devices\cpu\cpudevice.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\devices\cpu\cpudevice.cpp || cmake_object_order_depends_target_fastllm
+610: build CMakeFiles\fastllm.dir\src\devices\cpu\cpudevicebatch.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\devices\cpu\cpudevicebatch.cpp || cmake_object_order_depends_target_fastllm
+619: build CMakeFiles\fastllm.dir\src\devices\cpu\deepseekv41ops.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\devices\cpu\deepseekv41ops.cpp || cmake_object_order_depends_target_fastllm
+628: build CMakeFiles\fastllm.dir\src\devices\cpu\deepseekv4ops.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\devices\cpu\deepseekv4ops.cpp || cmake_object_order_depends_target_fastllm
+637: build CMakeFiles\fastllm.dir\src\devices\cpu\kimi_k3_ops.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\devices\cpu\kimi_k3_ops.cpp || cmake_object_order_depends_target_fastllm
+646: build CMakeFiles\fastllm.dir\src\devices\cpu\linear.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\devices\cpu\linear.cpp || cmake_object_order_depends_target_fastllm
+655: build CMakeFiles\fastllm.dir\src\devices\cpu\qwen4ops.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\devices\cpu\qwen4ops.cpp || cmake_object_order_depends_target_fastllm
+664: build CMakeFiles\fastllm.dir\src\blocks\attentionpagedblock.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\blocks\attentionpagedblock.cpp || cmake_object_order_depends_target_fastllm
+673: build CMakeFiles\fastllm.dir\src\blocks\embeddingblock.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\blocks\embeddingblock.cpp || cmake_object_order_depends_target_fastllm
+682: build CMakeFiles\fastllm.dir\src\blocks\linearaddblock.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\blocks\linearaddblock.cpp || cmake_object_order_depends_target_fastllm
+691: build CMakeFiles\fastllm.dir\src\blocks\linearswiglublock.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\blocks\linearswiglublock.cpp || cmake_object_order_depends_target_fastllm
+700: build CMakeFiles\fastllm.dir\src\blocks\llmsamplingblock.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\blocks\llmsamplingblock.cpp || cmake_object_order_depends_target_fastllm
+709: build CMakeFiles\fastllm.dir\src\blocks\mergemoeblock.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\blocks\mergemoeblock.cpp || cmake_object_order_depends_target_fastllm
+718: build CMakeFiles\fastllm.dir\src\blocks\mlpblock.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\blocks\mlpblock.cpp || cmake_object_order_depends_target_fastllm
+727: build CMakeFiles\fastllm.dir\src\models\graph\fastllmjson.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\graph\fastllmjson.cpp || cmake_object_order_depends_target_fastllm
+736: build CMakeFiles\fastllm.dir\src\models\graph\gemma2.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\graph\gemma2.cpp || cmake_object_order_depends_target_fastllm
+745: build CMakeFiles\fastllm.dir\src\models\graph\minicpm3.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\graph\minicpm3.cpp || cmake_object_order_depends_target_fastllm
+754: build CMakeFiles\fastllm.dir\src\models\graph\phi3.cpp.obj: CXX_COMPILER__fastllm_unscanned_Release D$:\a\nerv\nerv\fastllm\src\models\graph\phi3.cpp || cmake_object_order_depends_target_fastllm
