@@ -233,6 +233,13 @@ if (WIN32)
     list(APPEND FASTLLM_CXX_SOURCES src/devices/disk/diskdevice_win.cpp)
 endif()
 
+if (MSVC)
+    # nerv: gguf.cpp uses C++20 designated initializers while the project
+    # defaults to C++17 on MSVC; bump only this translation unit.
+    set_source_files_properties(third_party/gguf/gguf.cpp
+        PROPERTIES COMPILE_OPTIONS "/std:c++20")
+endif()
+
 include_directories(include)
 include_directories(include/utils)
 include_directories(include/models)
