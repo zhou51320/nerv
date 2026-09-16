@@ -99,9 +99,10 @@ jobs:
           foreach ($name in @('llama-cli.exe', 'llama-server.exe', 'llama-perplexity.exe', 'llama-quantize.exe')) {
             if (-not (Test-Path (Join-Path $bin $name))) { throw "$name missing" }
           }
-          $help = (& (Join-Path $bin 'llama-perplexity.exe') '--help' 2>&1 | Out-String)
-          if ($help -notmatch 'kvarn4') { throw 'llama-perplexity help does not advertise kvarn4' }
-          Write-Host 'KVarN cache type kvarn4 is present in llama-perplexity.'
+          $help = (& (Join-Path $bin 'llama-cli.exe') '--help' 2>&1 | Out-String)
+          Write-Host $help
+          if ($help -notmatch 'kvarn4') { throw 'llama-cli help does not advertise kvarn4' }
+          Write-Host 'KVarN cache type kvarn4 is present in llama-cli.'
 
       - name: Package artifact
         shell: pwsh
