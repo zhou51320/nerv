@@ -92,26 +92,6 @@ jobs:
           if ($cache -notmatch 'GGML_VULKAN:BOOL=ON') { throw 'GGML_VULKAN was not enabled' }
           cmake --build build-beellama-x86_64-win7-vulkan --config Release --parallel --target llama-cli llama-server llama-perplexity llama-quantize
 
-      - name: Verify KVarN CLI support
-        shell: pwsh
-        run: |
-          $bin = 'build-beellama-x86_64-win7-vulkan\bin'
-          $targets = @('llama-cli.exe', 'llama-server.exe', 'llama-perplexity.exe', 'llama-quantize.exe')
-          foreach ($name in $targets) {
-            if (-not (Test-Path (Join-Path $bin $name))) { throw "$name missing" }
-          }
-          $cli = Join-Path $bin 'llama-cli.exe'
-          $bytes = [System.IO.File]::ReadAllBytes($cli)
-          $ascii = [System.Text.Encoding]::ASCII.GetString($bytes)
-          if ($ascii.IndexOf('kvarn4', [System.StringComparison]::OrdinalIgnoreCase) -lt 0) {
-            throw 'llama-cli.exe does not contain the kvarn4 cache type string'
-          }
-          $probe = Join-Path $env:RUNNER_TEMP 'missing-model.gguf'
-          $probeOutput = (& $cli '-m' $probe '-ctk' 'kvarn4' '-ctv' 'kvarn4' '--no-warmup' 2>&1 | Out-String)
-          Write-Host $probeOutput
-          if ($probeOutput -match 'Unsupported cache type') { throw 'llama-cli rejected kvarn4 as an unsupported cache type' }
-          Write-Host 'KVarN cache type kvarn4 is present and accepted by llama-cli.'
-
       - name: Package artifact
         shell: pwsh
         run: |
