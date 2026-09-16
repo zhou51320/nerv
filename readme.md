@@ -19,6 +19,12 @@ else()
     set(GGML_WIN_VER "0x601" CACHE STRING "ggml: Windows version")
 endif()
 ```
+
+## BeeLlama KVarN
+
+`beellama.cpp/` 单独保存 BeeLlama v0.4.6，用于 KVarN KV Cache。它与官方 `llama.cpp/` 并行维护，不替换官方版本。
+
+Win7 Vulkan 构建由 `.github/workflows/build-beellama-win7-vulkan.yml` 完成，产物位于 `EVA_BACKEND/x86_64/win7/vulkan/beellama.cpp/`，支持 `kvarn2`、`kvarn3`、`kvarn4`、`kvarn5`、`kvarn6` 和 `kvarn8`。
 - llama.cpp 为了能在win7下运行
     - 使用mingw编译器 gcc 12版本以上
     - 去掉llama.cpp/vendor/cpp-httplib/httplib.h 中 
