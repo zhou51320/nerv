@@ -1,0 +1,133 @@
+name: Build llama-swap Win7
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/build-llama-swap-win7.yml'
+      - 'llama-swap/**'
+
+permissions:
+  contents: read
+
+jobs:
+  build-llama-swap-win7:
+    name: Build llama-swap (Win7 x64)
+    runs-on: windows-2022
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup Legacy Go for Win7
+        shell: pwsh
+        run: |
+          Write-Host "Fetching latest go-legacy-win7 release..."
+          $headers = @{ "User-Agent" = "GitHub-Actions" }
+          $apiUrl = "https://api.github.com/repos/thongtech/go-legacy-win7/releases/latest"
+          try {
+            $rel = Invoke-RestMethod -Uri $apiUrl -Headers $headers
+          } catch {
+            Write-Warning "Failed to query latest via API: $_. Retrying fallback releases list..."
+            $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/thongtech/go-legacy-win7/releases" -Headers $headers | Select-Object -First 1
+          }
+          $asset = $rel.assets | Where-Object { $_.name -like "*windows_amd64.zip" -and $_.name -notlike "*-race*" } | Select-Object -First 1
+          if (-not $asset) {
+            throw "Could not find windows_amd64.zip asset in release $($rel.tag_name)"
+          }
+          Write-Host "Downloading $($asset.name) from $($asset.browser_download_url)..."
+          $zipPath = Join-Path $env:RUNNER_TEMP "go-legacy-win7.zip"
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zipPath -UseBasicParsing
+          
+          $goInstallDir = Join-Path $env:RUNNER_TEMP "go-win7"
+          Write-Host "Extracting to $goInstallDir..."
+          Expand-Archive -Path $zipPath -DestinationPath $goInstallDir -Force
+          
+          # Locate go/bin directory inside extracted archive
+          $goBin = Join-Path $goInstallDir "bin"
+          if (-not (Test-Path $goBin)) {
+            $goBin = Join-Path $goInstallDir "go\bin"
+          }
+          if (-not (Test-Path $goBin)) {
+            throw "Go bin directory not found in extracted archive"
+          }
+          
+          $goRoot = Split-Path $goBin
+          "GOROOT=$goRoot" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "$goBin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          Write-Host "Configured Go: $goBin (GOROOT=$goRoot)"
+
+      - name: Verify Go toolchain
+        shell: pwsh
+        run: |
+          go version
+          go env
+
+      - name: Build Web UI
+        shell: pwsh
+        working-directory: llama-swap/ui
+        run: |
+          Write-Host "Installing UI dependencies..."
+          npm ci
+          Write-Host "Building Web UI..."
+          npm run build
+          if (-not (Test-Path "../internal/server/ui_dist/index.html")) {
+            throw "UI build failed: ui_dist/index.html not found"
+          }
+          Write-Host "UI build successfully generated internal/server/ui_dist"
+
+      - name: Build llama-swap executable
+        shell: pwsh
+        working-directory: llama-swap
+        run: |
+          $env:GOOS = "windows"
+          $env:GOARCH = "amd64"
+          $env:CGO_ENABLED = "0"
+          
+          $commit = git rev-parse --short HEAD 2>$null
+          if (-not $commit) { $commit = "nerv" }
+          $date = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+          
+          $ldflags = "-s -w -X main.commit=$commit -X main.date=$date"
+          Write-Host "Building llama-swap with flags: $ldflags"
+          
+          go build -tags embed_ui -ldflags $ldflags -o llama-swap.exe .
+          if (-not (Test-Path "llama-swap.exe")) {
+            throw "llama-swap.exe build failed"
+          }
+          Write-Host "Successfully compiled llama-swap.exe"
+
+      - name: Copy binary to EVA_BACKEND
+        shell: pwsh
+        run: |
+          $destDir = "EVA_BACKEND\x86_64\win7\llama-swap"
+          New-Item -ItemType Directory -Force -Path $destDir | Out-Null
+          Copy-Item "llama-swap\llama-swap.exe" -Destination "$destDir\llama-swap.exe" -Force
+          Write-Host "Copied to $destDir\llama-swap.exe"
+
+      - name: Verify binary
+        shell: pwsh
+        run: |
+          $target = "EVA_BACKEND\x86_64\win7\llama-swap\llama-swap.exe"
+          if (-not (Test-Path $target)) { throw "Missing expected binary: $target" }
+          $len = (Get-Item $target).Length
+          Write-Host "Verified $target (Size: $len bytes)"
+
+      - name: Package artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          Compress-Archive -Path "EVA_BACKEND\x86_64\win7\llama-swap\llama-swap.exe" -DestinationPath "artifacts/llama-swap-win7.zip" -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-swap-win7
+          path: artifacts/llama-swap-win7.zip
+          if-no-files-found: error

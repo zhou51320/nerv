@@ -175,3 +175,10 @@ inline bool mmap::open(const char *path) {
   - `third_party/nccl_stub/`：Windows 无 NCCL，提供最小 nccl.h + stub 实现（多卡运行时不可用，单卡无影响）与 `cuda_profiler_api.h` fallback
 - 运行要求：目标机 Win7 + NVIDIA 驱动（支持 Turing/2080Ti）+ 打包目录内附带的 CUDA/VC 运行库 DLL
 - 目标机使用：`main.exe` 交互对话、`quant.exe` 量化、`fastllm-apiserver.exe` OpenAI 兼容 HTTP server（自带 winsock 网络栈，无需外部依赖）
+
+## llama-swap（Win7）
+- 源码：作为普通 vendor 目录存放在 `llama-swap/`
+- 构建：CI 由 `.github/workflows/build-llama-swap-win7.yml` 自动编译
+- 工具链：Node.js 22（构建 Web UI 资源）+ `thongtech/go-legacy-win7` 工具链（针对 Windows 7 回退适配 `RtlGenRandom`，标记 PE 子系统 6.1）
+- 产物：`EVA_BACKEND/x86_64/win7/llama-swap/llama-swap.exe`（单文件内嵌 Web UI，无外部依赖）
+- 运行要求：原生 Windows 7 x64 SP1 无需任何系统补丁即可直接双击运行
