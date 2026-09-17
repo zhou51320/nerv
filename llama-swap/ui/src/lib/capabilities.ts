@@ -3,13 +3,13 @@ import type { Model } from "./types";
 // Canonical capability key -> human label. Shared by the model Details tab
 // and the Models list so labels live in exactly one place.
 export const capabilityLabels: Record<string, string> = {
-  vision: "Vision",
-  audio_transcriptions: "Transcription",
-  audio_speech: "Speech",
-  image_generation: "Image Gen",
-  image_to_image: "Img→Img",
-  function_calling: "Function Calling",
-  reranker: "Reranker",
+  vision: "视觉理解",
+  audio_transcriptions: "语音转录",
+  audio_speech: "语音合成",
+  image_generation: "图像生成",
+  image_to_image: "图生图",
+  function_calling: "函数调用",
+  reranker: "文本重排",
 };
 
 export interface CapabilityBadge {

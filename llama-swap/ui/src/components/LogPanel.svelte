@@ -94,21 +94,21 @@
     <Card.Title class="text-sm font-semibold">{title}</Card.Title>
     <Card.Action>
       <div class="flex items-center gap-1">
-        <Button variant="ghost" size="icon-sm" onclick={toggleFontSize} title="Change font size">
+        <Button variant="ghost" size="icon-sm" onclick={toggleFontSize} title="调整字体大小">
           <Type />
         </Button>
-        <Button variant="ghost" size="icon-sm" onclick={toggleWrapText} title="Toggle text wrap">
+        <Button variant="ghost" size="icon-sm" onclick={toggleWrapText} title="切换自动换行">
           <WrapText class={$wrapTextStore ? "text-primary" : ""} />
         </Button>
-        <Button variant="ghost" size="icon-sm" onclick={toggleFilter} title="Toggle filter">
+        <Button variant="ghost" size="icon-sm" onclick={toggleFilter} title="切换关键词筛选">
           {#if $showFilterStore}<SearchX />{:else}<Search />{/if}
         </Button>
       </div>
     </Card.Action>
     {#if $showFilterStore}
       <div class="flex w-full items-center gap-2 pt-2">
-        <Input type="text" class="h-8" placeholder="Filter logs (regex)..." bind:value={filterRegex} />
-        <Button variant="ghost" size="icon-sm" onclick={() => (filterRegex = "")} aria-label="Clear filter">
+        <Input type="text" class="h-8" placeholder="过滤日志 (支持正则表达式)..." bind:value={filterRegex} />
+        <Button variant="ghost" size="icon-sm" onclick={() => (filterRegex = "")} aria-label="清空筛选">
           <CircleX />
         </Button>
       </div>

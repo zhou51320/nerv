@@ -19,8 +19,8 @@
 <button
   type="button"
   class="text-muted-foreground hover:bg-accent hover:text-accent-foreground flex {btnSize} shrink-0 items-center justify-center disabled:opacity-50"
-  title={model.state === "ready" ? "Unload" : $pendingLoads[model.id] ? "Cancel" : "Load"}
-  aria-label={model.state === "ready" ? "Unload model" : "Load model"}
+  title={model.state === "ready" ? "卸载模型" : $pendingLoads[model.id] ? "取消加载" : "加载模型"}
+  aria-label={model.state === "ready" ? "卸载模型" : "加载模型"}
   disabled={busy}
   onclick={() => onToggleLoad(model)}
 >

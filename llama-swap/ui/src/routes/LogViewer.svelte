@@ -22,29 +22,29 @@
     class="flex flex-1 w-full flex-col gap-2 overflow-hidden"
   >
     <TabsList variant="line">
-      <TabsTrigger value="panels">Both</TabsTrigger>
-      <TabsTrigger value="proxy">Proxy</TabsTrigger>
-      <TabsTrigger value="upstream">Upstream</TabsTrigger>
+      <TabsTrigger value="panels">双侧分栏</TabsTrigger>
+      <TabsTrigger value="proxy">代理日志</TabsTrigger>
+      <TabsTrigger value="upstream">上游日志</TabsTrigger>
     </TabsList>
 
     <div class="flex-1 w-full overflow-hidden">
       <TabsContent value="panels" class="h-full">
         <ResizablePanels {direction} storageKey="logviewer-panel-group">
           {#snippet leftPanel()}
-            <LogPanel id="proxy" title="Proxy Logs" logData={$proxyLogs} />
+            <LogPanel id="proxy" title="代理服务日志" logData={$proxyLogs} />
           {/snippet}
           {#snippet rightPanel()}
-            <LogPanel id="upstream" title="Upstream Logs" logData={$upstreamLogs} />
+            <LogPanel id="upstream" title="上游模型日志" logData={$upstreamLogs} />
           {/snippet}
         </ResizablePanels>
       </TabsContent>
 
       <TabsContent value="proxy" class="h-full">
-        <LogPanel id="proxy" title="Proxy Logs" logData={$proxyLogs} />
+        <LogPanel id="proxy" title="代理服务日志" logData={$proxyLogs} />
       </TabsContent>
 
       <TabsContent value="upstream" class="h-full">
-        <LogPanel id="upstream" title="Upstream Logs" logData={$upstreamLogs} />
+        <LogPanel id="upstream" title="上游模型日志" logData={$upstreamLogs} />
       </TabsContent>
     </div>
   </Tabs>

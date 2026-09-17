@@ -18,11 +18,11 @@
 
 <Card.Root class="shrink-0 gap-0 overflow-hidden py-0">
   <Card.Header class="border-b px-4 py-2">
-    <Card.Title class="text-sm font-semibold">Capabilities</Card.Title>
+    <Card.Title class="text-sm font-semibold">支持能力</Card.Title>
   </Card.Header>
   <Card.Content class="p-3">
     {#if capabilities.length === 0}
-      <span class="text-muted-foreground text-sm">No capabilities reported.</span>
+      <span class="text-muted-foreground text-sm">该模型未声明特殊能力。</span>
     {:else}
       <div class="flex flex-wrap gap-1.5">
         {#each capabilities as [key] (key)}

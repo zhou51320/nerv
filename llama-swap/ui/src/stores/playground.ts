@@ -4,12 +4,12 @@ import { persistentStore } from "./persistent";
 export type PlaygroundTab = "chat" | "images" | "speech" | "audio" | "rerank" | "concurrency";
 
 export const playgroundTabs: { id: PlaygroundTab; label: string }[] = [
-  { id: "chat", label: "Chat" },
-  { id: "images", label: "Images" },
-  { id: "speech", label: "Speech" },
-  { id: "audio", label: "Transcription" },
-  { id: "rerank", label: "Rerank" },
-  { id: "concurrency", label: "Load Test" },
+  { id: "chat", label: "对话交互" },
+  { id: "images", label: "图像生成" },
+  { id: "speech", label: "语音合成" },
+  { id: "audio", label: "语音转录" },
+  { id: "rerank", label: "文本重排" },
+  { id: "concurrency", label: "并发测试" },
 ];
 
 export const selectedPlaygroundTab = persistentStore<PlaygroundTab>("playground-selected-tab", "chat");

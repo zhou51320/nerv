@@ -93,7 +93,7 @@
     onSortChange,
     title,
     compact = false,
-    emptyMessage = "No activity recorded",
+    emptyMessage = "暂无活动记录",
     cardClass = "",
     filters,
     onFiltersChange,
@@ -111,24 +111,24 @@
 
   function buildColumnMeta(withModel: boolean, withSource: boolean): ColMeta[] {
     const cols: ColMeta[] = [
-      { id: "id", label: "ID", defaultVisible: true },
-      { id: "time", label: "Time", defaultVisible: true },
+      { id: "id", label: "编号", defaultVisible: true },
+      { id: "time", label: "时间", defaultVisible: true },
     ];
-    if (withSource) cols.push({ id: "src", label: "Source/Caller", defaultVisible: true });
-    if (withModel) cols.push({ id: "model", label: "Model", defaultVisible: true });
+    if (withSource) cols.push({ id: "src", label: "来源/调用方", defaultVisible: true });
+    if (withModel) cols.push({ id: "model", label: "模型", defaultVisible: true });
     cols.push(
-      { id: "req_path", label: "Path", defaultVisible: false },
-      { id: "resp_status_code", label: "Status", defaultVisible: true },
-      { id: "resp_content_type", label: "Content-Type", defaultVisible: false },
-      { id: "cached", label: "Cached", defaultVisible: true },
-      { id: "prompt", label: "Prompt", defaultVisible: true },
-      { id: "generated", label: "Generated", defaultVisible: true },
-      { id: "drafted", label: "Drafted", defaultVisible: false },
-      { id: "prompt_speed", label: "Prefill", defaultVisible: true },
-      { id: "gen_speed", label: "Decode", defaultVisible: true },
-      { id: "duration", label: "Duration", defaultVisible: true },
-      { id: "capture", label: "Capture", defaultVisible: true },
-      { id: "meta", label: "Meta", defaultVisible: false }
+      { id: "req_path", label: "请求路径", defaultVisible: false },
+      { id: "resp_status_code", label: "状态码", defaultVisible: true },
+      { id: "resp_content_type", label: "响应类型", defaultVisible: false },
+      { id: "cached", label: "缓存", defaultVisible: true },
+      { id: "prompt", label: "输入Tokens", defaultVisible: true },
+      { id: "generated", label: "生成Tokens", defaultVisible: true },
+      { id: "drafted", label: "推测Tokens", defaultVisible: false },
+      { id: "prompt_speed", label: "预填充速度", defaultVisible: true },
+      { id: "gen_speed", label: "解码速度", defaultVisible: true },
+      { id: "duration", label: "耗时", defaultVisible: true },
+      { id: "capture", label: "报文捕获", defaultVisible: true },
+      { id: "meta", label: "元数据", defaultVisible: false }
     );
     return cols;
   }
@@ -188,16 +188,16 @@
 
   function buildInflightColumnMeta(withModel: boolean): ColMeta[] {
     const cols: ColMeta[] = [
-      { id: "cancel", label: "Cancel", defaultVisible: true },
-      { id: "elapsed", label: "Elapsed", defaultVisible: true },
+      { id: "cancel", label: "取消", defaultVisible: true },
+      { id: "elapsed", label: "已耗时", defaultVisible: true },
     ];
-    if (withModel) cols.push({ id: "model", label: "Model", defaultVisible: true });
+    if (withModel) cols.push({ id: "model", label: "模型", defaultVisible: true });
     cols.push(
-      { id: "request", label: "Request", defaultVisible: true },
-      { id: "identity", label: "Address", defaultVisible: true },
-      { id: "user_agent", label: "User Agent", defaultVisible: true },
-      { id: "session_id", label: "Session ID", defaultVisible: true },
-      { id: "bytes_received", label: "Bytes Received", defaultVisible: true }
+      { id: "request", label: "请求内容", defaultVisible: true },
+      { id: "identity", label: "客户端IP", defaultVisible: true },
+      { id: "user_agent", label: "客户端标识", defaultVisible: true },
+      { id: "session_id", label: "会话ID", defaultVisible: true },
+      { id: "bytes_received", label: "已收字节", defaultVisible: true }
     );
     return cols;
   }
@@ -662,9 +662,9 @@
 {#if showInflight}
 <Card.Root class="relative p-3">
   <div class="flex items-center gap-2 pr-16 text-sm">
-    <span class="text-muted-foreground text-xs uppercase tracking-wider">In-flight Requests</span>
+    <span class="text-muted-foreground text-xs uppercase tracking-wider">执行中的请求</span>
     <span>
-      <span class="font-semibold">{inflightRequests.length}</span> active
+      <span class="font-semibold">{inflightRequests.length}</span> 个进行中
     </span>
   </div>
 
@@ -672,13 +672,13 @@
     <DropdownMenu.Root>
       <DropdownMenu.Trigger
         class="text-muted-foreground hover:bg-muted inline-flex size-6 items-center justify-center rounded-full"
-        title="Select in-flight columns"
+        title="自定义显示列"
       >
         <Columns3 class="size-4" />
       </DropdownMenu.Trigger>
       <DropdownMenu.Content align="end" class="min-w-[18rem] max-h-[60vh] overflow-y-auto p-0">
         <DropdownMenu.Label class="text-muted-foreground border-b px-3 py-2 text-xs font-medium uppercase tracking-wider">
-          Columns <span class="text-[10px] normal-case tracking-normal">(drag to reorder)</span>
+          显示列 <span class="text-[10px] normal-case tracking-normal">(拖拽可调整顺序)</span>
         </DropdownMenu.Label>
         {#each inflightColumnOrder as columnId (columnId)}
           <div
@@ -686,7 +686,7 @@
             draggable="true"
             role="button"
             tabindex="-1"
-            aria-label="Drag to reorder {inflightColumnLabelMap[columnId] ?? columnId}"
+            aria-label="拖拽调整 {inflightColumnLabelMap[columnId] ?? columnId}"
             ondragstart={(event) => handleInflightColDragStart(event, columnId)}
             ondragover={(event) => handleInflightColDragOver(event, columnId)}
             ondrop={handleInflightColDrop}
@@ -711,7 +711,7 @@
       size="icon-xs"
       class="text-muted-foreground rounded-full"
       onclick={() => setInflightOpen(!inflightOpen)}
-      title={inflightOpen ? "Hide in-flight requests" : "Show in-flight requests"}
+      title={inflightOpen ? "折叠执行中请求" : "展开执行中请求"}
     >
       {#if inflightOpen}
         <X />
@@ -743,8 +743,8 @@
                       class="text-muted-foreground hover:text-destructive size-6"
                       onclick={() => cancelInflight(request.id)}
                       disabled={cancelingInflightIds.includes(request.id)}
-                      title="Cancel request"
-                      aria-label="Cancel inflight request"
+                      title="取消请求"
+                      aria-label="取消当前执行中的请求"
                     >
                       <CircleX class="size-4" />
                     </Button>
@@ -774,7 +774,7 @@
           {:else}
             <Table.Row>
               <Table.Cell colspan={Math.max(visibleInflightColumns.length, 1)} class="text-muted-foreground py-4 text-center text-sm">
-                No in-flight requests
+                暂无执行中的请求
               </Table.Cell>
             </Table.Row>
           {/each}
@@ -799,7 +799,7 @@
       <button
         type="button"
         class="hover:bg-muted inline-flex size-7 items-center justify-center rounded-[min(var(--radius-md),12px)]"
-        title="Export as markdown"
+        title="导出为 Markdown"
         onclick={openExport}
       >
         <Download class="size-4" />
@@ -810,7 +810,7 @@
           class="hover:bg-muted relative inline-flex size-7 items-center justify-center rounded-[min(var(--radius-md),12px)] {filterOpen
             ? 'bg-muted'
             : ''}"
-          title={filterOpen ? "Hide filters" : "Show filters"}
+          title={filterOpen ? "隐藏筛选器" : "展开筛选器"}
           aria-expanded={filterOpen}
           onclick={() => setFilterOpen(!filterOpen)}
         >
@@ -826,13 +826,13 @@
       <DropdownMenu.Root>
         <DropdownMenu.Trigger
           class="hover:bg-muted inline-flex size-7 items-center justify-center rounded-[min(var(--radius-md),12px)]"
-          title="Select columns"
+          title="自定义显示列"
         >
           <Columns3 class="size-4" />
         </DropdownMenu.Trigger>
         <DropdownMenu.Content align="end" class="min-w-[18rem] max-h-[60vh] overflow-y-auto p-0">
           <DropdownMenu.Label class="text-muted-foreground border-b px-3 py-2 text-xs font-medium uppercase tracking-wider">
-            Columns <span class="text-[10px] normal-case tracking-normal">(drag to reorder)</span>
+            显示列 <span class="text-[10px] normal-case tracking-normal">(拖拽可调整顺序)</span>
           </DropdownMenu.Label>
           {#each menuColumnIds as columnId (columnId)}
             {@const column = table.getColumn(columnId)}
@@ -841,7 +841,7 @@
               draggable="true"
               role="button"
               tabindex="-1"
-              aria-label="Drag to reorder {columnLabelMap[columnId] ?? columnId}"
+              aria-label="拖拽调整 {columnLabelMap[columnId] ?? columnId}"
               ondragstart={(e) => handleColDragStart(e, columnId)}
               ondragover={(e) => handleColDragOver(e, columnId)}
               ondrop={handleColDrop}
@@ -862,6 +862,7 @@
       </DropdownMenu.Root>
     </div>
   </Card.Header>
+
   {#if filtersEnabled && filterOpen && filters && onFiltersChange}
     <FilterDrawer
       {filters}
@@ -933,7 +934,7 @@
     {#if showPagination && total > 0}
       <div class="flex items-center justify-between gap-2 border-t px-4 py-2 text-sm">
         <span class="text-muted-foreground text-xs">
-          Page {page} of {pageCount} · {total} total
+          第 {page} / {pageCount} 页 · 共 {total} 条记录
         </span>
         <div class="flex items-center gap-1">
           <Button
@@ -941,7 +942,7 @@
             size="icon-sm"
             onclick={() => setServerPage(1)}
             disabled={page <= 1}
-            title="First page"
+            title="首页"
           >
             <ChevronsLeft />
           </Button>
@@ -950,7 +951,7 @@
             size="icon-sm"
             onclick={() => setServerPage(page - 1)}
             disabled={page <= 1}
-            title="Previous page"
+            title="上一页"
           >
             <ChevronLeft />
           </Button>
@@ -970,7 +971,7 @@
             size="icon-sm"
             onclick={() => setServerPage(page + 1)}
             disabled={page >= pageCount}
-            title="Next page"
+            title="下一页"
           >
             <ChevronRight />
           </Button>
@@ -979,7 +980,7 @@
             size="icon-sm"
             onclick={() => setServerPage(pageCount)}
             disabled={page >= pageCount}
-            title="Last page"
+            title="末页"
           >
             <ChevronsRight />
           </Button>

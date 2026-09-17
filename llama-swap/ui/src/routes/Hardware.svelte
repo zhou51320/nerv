@@ -105,61 +105,61 @@
 
 <div class="p-2">
   <div class="mt-4 mb-4">
-    <h3 class="text-lg font-semibold">Hardware</h3>
+    <h3 class="text-lg font-semibold">硬件信息</h3>
     <p class="text-sm text-muted-foreground">
-      This is an experimental feature. Please share feedback in <a
+      此功能处于实验阶段。如遇问题可在 <a
         class="underline hover:text-foreground"
         href="https://github.com/mostlygeek/llama-swap/issues/977">issue 977</a
-      >.
+      > 反馈。
     </p>
   </div>
 
   {#if loading}
-    <div class="rounded-lg border p-6 text-sm text-muted-foreground">Loading hardware profile…</div>
+    <div class="rounded-lg border p-6 text-sm text-muted-foreground">正在检测硬件环境…</div>
   {:else if error || !hardware}
     <div class="rounded-lg border border-destructive/50 p-6">
-      <h4 class="font-semibold">Hardware detection unavailable</h4>
-      <p class="mt-1 text-sm text-muted-foreground">{error || "No hardware snapshot was captured at startup."}</p>
+      <h4 class="font-semibold">硬件检测不可用</h4>
+      <p class="mt-1 text-sm text-muted-foreground">{error || "启动时未获取到硬件快照信息。"}</p>
     </div>
   {:else}
     <Tabs value="overview">
       <TabsList variant="line">
-        <TabsTrigger value="overview">Overview</TabsTrigger>
-        <TabsTrigger value="summary">Text</TabsTrigger>
+        <TabsTrigger value="overview">图文概览</TabsTrigger>
+        <TabsTrigger value="summary">纯文本报告</TabsTrigger>
       </TabsList>
 
       <TabsContent value="overview" class="mt-4">
         <div class="grid gap-4 lg:grid-cols-2">
           <section class="rounded-lg border p-4">
-            <h4 class="mb-3 text-sm font-semibold text-muted-foreground">System</h4>
+            <h4 class="mb-3 text-sm font-semibold text-muted-foreground">操作系统与平台</h4>
             <dl class="grid grid-cols-[minmax(8rem,auto)_1fr] gap-x-4 gap-y-2 text-sm">
-              <dt class="text-muted-foreground">Operating System</dt><dd>{osLabel(hardware)}</dd>
-              <dt class="text-muted-foreground">Kernel</dt><dd>{shown(hardware.operating_system.kernel)}</dd>
-              <dt class="text-muted-foreground">Architecture</dt><dd>{hardware.architecture.name}</dd>
-              <dt class="text-muted-foreground">Environment</dt><dd>{environmentLabel(hardware)}</dd>
-              <dt class="text-muted-foreground">System Memory</dt><dd>{formatCapacity(hardware.memory.capacity_bytes)}</dd>
+              <dt class="text-muted-foreground">操作系统</dt><dd>{osLabel(hardware)}</dd>
+              <dt class="text-muted-foreground">内核版本</dt><dd>{shown(hardware.operating_system.kernel)}</dd>
+              <dt class="text-muted-foreground">系统架构</dt><dd>{hardware.architecture.name}</dd>
+              <dt class="text-muted-foreground">运行环境</dt><dd>{environmentLabel(hardware)}</dd>
+              <dt class="text-muted-foreground">系统总物理内存</dt><dd>{formatCapacity(hardware.memory.capacity_bytes)}</dd>
             </dl>
           </section>
 
           <section class="rounded-lg border p-4">
-            <h4 class="mb-3 text-sm font-semibold text-muted-foreground">CPU</h4>
+            <h4 class="mb-3 text-sm font-semibold text-muted-foreground">中央处理器 (CPU)</h4>
             <dl class="grid grid-cols-[minmax(8rem,auto)_1fr] gap-x-4 gap-y-2 text-sm">
-              <dt class="text-muted-foreground">Model</dt><dd>{shown(hardware.cpu.model)}</dd>
-              <dt class="text-muted-foreground">Vendor</dt><dd>{shown(hardware.cpu.vendor)}</dd>
-              <dt class="text-muted-foreground">Sockets</dt><dd>{shown(hardware.cpu.socket_count)}</dd>
-              <dt class="text-muted-foreground">Physical Cores</dt><dd>{shown(hardware.cpu.physical_core_count)}</dd>
-              <dt class="text-muted-foreground">Logical Threads</dt><dd>{shown(hardware.cpu.logical_thread_count)}</dd>
+              <dt class="text-muted-foreground">型号</dt><dd>{shown(hardware.cpu.model)}</dd>
+              <dt class="text-muted-foreground">厂商</dt><dd>{shown(hardware.cpu.vendor)}</dd>
+              <dt class="text-muted-foreground">物理插槽</dt><dd>{shown(hardware.cpu.socket_count)}</dd>
+              <dt class="text-muted-foreground">物理核心数</dt><dd>{shown(hardware.cpu.physical_core_count)}</dd>
+              <dt class="text-muted-foreground">逻辑线程数</dt><dd>{shown(hardware.cpu.logical_thread_count)}</dd>
             </dl>
           </section>
         </div>
 
         <section class="mt-4 rounded-lg border p-4">
           <div class="mb-3 flex items-baseline justify-between gap-4">
-            <h4 class="text-sm font-semibold text-muted-foreground">Accelerators</h4>
-            <span class="text-xs text-muted-foreground">{hardware.accelerators.length} detected</span>
+            <h4 class="text-sm font-semibold text-muted-foreground">硬件加速器 (GPU / NPU)</h4>
+            <span class="text-xs text-muted-foreground">已检测到 {hardware.accelerators.length} 个设备</span>
           </div>
           {#if hardware.accelerators.length === 0}
-            <p class="text-sm text-muted-foreground">No accelerators were detected or exposed to this process.</p>
+            <p class="text-sm text-muted-foreground">未检测到或当前进程未获得硬件加速设备权限。</p>
           {:else}
             <div class="grid gap-3 lg:grid-cols-2 2xl:grid-cols-3">
               {#each hardware.accelerators as accelerator (accelerator.index)}
@@ -169,12 +169,12 @@
                     <p class="text-xs text-muted-foreground">{shown(accelerator.vendor)} · {titleCase(accelerator.kind)}</p>
                   </div>
                   <dl class="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1.5 text-sm">
-                    <dt class="text-muted-foreground">Architecture</dt><dd>{shown(accelerator.architecture)}</dd>
-                    <dt class="text-muted-foreground">Memory</dt>
-                    <dd>{accelerator.memory.capacity_bytes ? formatCapacity(accelerator.memory.capacity_bytes) : "Not detected"} ({titleCase(accelerator.memory.kind)})</dd>
-                    <dt class="text-muted-foreground">Driver</dt><dd>{driverLabel(accelerator)}</dd>
-                    <dt class="text-muted-foreground">Power Limit</dt>
-                    <dd>{accelerator.power_limit_watts === null ? "Not detected" : `${accelerator.power_limit_watts} W`}</dd>
+                    <dt class="text-muted-foreground">计算架构</dt><dd>{shown(accelerator.architecture)}</dd>
+                    <dt class="text-muted-foreground">显存容量</dt>
+                    <dd>{accelerator.memory.capacity_bytes ? formatCapacity(accelerator.memory.capacity_bytes) : "未检测到"} ({titleCase(accelerator.memory.kind)})</dd>
+                    <dt class="text-muted-foreground">驱动版本</dt><dd>{driverLabel(accelerator)}</dd>
+                    <dt class="text-muted-foreground">功耗上限</dt>
+                    <dd>{accelerator.power_limit_watts === null ? "未检测到" : `${accelerator.power_limit_watts} W`}</dd>
                   </dl>
                 </article>
               {/each}
@@ -186,15 +186,16 @@
       <TabsContent value="summary" class="mt-4">
         <section class="rounded-lg border p-4">
           <div class="mb-3 flex items-center justify-between gap-4">
-            <p class="text-sm text-muted-foreground">Plain text formatted for sharing in bug reports and support requests.</p>
-            <Button variant="outline" size="sm" onclick={copySummary} title="Copy hardware summary">
+            <p class="text-sm text-muted-foreground">纯文本格式，便于在问题报告或技术支持中直接复制粘贴。</p>
+            <Button variant="outline" size="sm" onclick={copySummary} title="复制硬件信息">
               {#if copied}
-                <Check /> Copied
+                <Check /> 已复制
               {:else}
-                <Copy /> Copy
+                <Copy /> 复制文本
               {/if}
             </Button>
           </div>
+
           <textarea
             class="min-h-112 w-full resize-y rounded-md border bg-muted/20 p-3 font-mono text-sm leading-5"
             aria-label="Hardware text summary"

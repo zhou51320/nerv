@@ -13,7 +13,15 @@
     }
   });
 
-  let tooltipText = $derived(`Event Stream: ${$connectionState ?? "unknown"}`);
+  let statusZh = $derived.by(() => {
+    switch ($connectionState) {
+      case "connected": return "已连接";
+      case "connecting": return "正在连接...";
+      case "disconnected": return "已断开";
+      default: return "未连接";
+    }
+  });
+  let tooltipText = $derived(`事件流状态: ${statusZh}`);
 </script>
 
 <div class="flex items-center" title={tooltipText}>

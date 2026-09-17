@@ -86,11 +86,11 @@
         </div>
       {/if}
     {/if}
-    <span class="text-muted-foreground text-xs uppercase tracking-wide">
-      {model.state}
+    <span class="text-muted-foreground text-xs font-medium">
+      {model.state === "ready" ? "已就绪" : model.state === "starting" ? "启动中" : model.state === "stopping" ? "停止中" : "已停止"}
     </span>
     {#if model.unlisted}
-      <Tag class="px-1.5 text-[0.625rem] uppercase">unlisted</Tag>
+      <Tag class="px-1.5 text-[0.625rem]">未列出</Tag>
     {/if}
     {#if !model.peerID}
       <a
@@ -98,8 +98,8 @@
         target="_blank"
         rel="noopener noreferrer"
         class="text-muted-foreground hover:text-foreground"
-        title="Open model server"
-        aria-label="Open model server"
+        title="打开模型服务链接"
+        aria-label="打开模型服务链接"
       >
         <ExternalLink class="size-4" />
       </a>
@@ -124,7 +124,7 @@
     <Card.Content class="p-0">
       {#if sectionModels.length === 0}
         <div class="text-muted-foreground px-4 py-6 text-center text-sm">
-          No {title.toLowerCase()} available
+          暂无{title}可用
         </div>
       {:else}
         <div class="divide-y">
@@ -139,7 +139,7 @@
 
 {#snippet unlistedToggle()}
   <Label.Root for="show-unlisted-toggle" class="text-sm">
-    Show unlisted models
+    显示未列出的隐藏模型
   </Label.Root>
   <Switch.Root
     id="show-unlisted-toggle"
@@ -147,7 +147,7 @@
     onCheckedChange={(v) => showUnlisted.set(v)}
   />
   <span class="text-muted-foreground text-xs">
-    {$models.filter((m) => m.unlisted).length} unlisted
+    {$models.filter((m) => m.unlisted).length} 个隐藏
   </span>
 {/snippet}
 
@@ -156,12 +156,12 @@
     <Card.Header class="shrink-0 gap-2 border-b px-4 py-3">
       <div class="flex items-center gap-2">
         <SquareStack class="size-5" />
-        <Card.Title class="text-lg">Models</Card.Title>
+        <Card.Title class="text-lg">模型管理</Card.Title>
         <span class="text-muted-foreground text-sm">
-          ({visibleModels.length} of {$models.length})
+          (已显示 {visibleModels.length} / 共 {$models.length})
         </span>
-        <span class="text-muted-foreground text-xs uppercase tracking-wide">
-          {readyCount} ready
+        <span class="text-muted-foreground text-xs tracking-wide">
+          {readyCount} 个就绪
         </span>
         <div class="ml-auto flex items-center gap-2">
           <Button
@@ -175,7 +175,7 @@
             {:else}
               <PowerOff class="size-3.5" />
             {/if}
-            Unload All
+            全部卸载
           </Button>
         </div>
       </div>
@@ -187,13 +187,13 @@
       <Card.Root class="shrink-0 gap-0 overflow-hidden py-0">
         <Card.Header class="shrink-0 border-b px-4 py-2.5">
           <div class="flex items-center gap-2">
-            <Card.Title class="text-sm">Profiles</Card.Title>
+            <Card.Title class="text-sm">预设配置 (Profiles)</Card.Title>
             {#if selectedProfile}
               <Tag>{$activeProfile}</Tag>
-              <Tag class="bg-success/15 text-success">Active</Tag>
+              <Tag class="bg-success/15 text-success">已激活</Tag>
             {/if}
             <span class="text-muted-foreground ml-auto text-xs">
-              {profileMappings.length} {profileMappings.length === 1 ? "mapping" : "mappings"}
+              {profileMappings.length} 条映射
             </span>
           </div>
           {#if selectedProfile?.description}
@@ -203,7 +203,7 @@
         <Card.Content class="p-0">
           {#if !selectedProfile}
             <div class="text-muted-foreground px-4 py-6 text-center text-sm">
-              No active profile
+              暂无激活的预设配置
             </div>
           {:else}
             <div class="divide-y">
@@ -214,7 +214,7 @@
                   {#if target}
                     <span class="min-w-0 truncate text-sm">{target}</span>
                   {:else}
-                    <Tag class="px-1.5 text-[0.625rem] uppercase">disabled</Tag>
+                    <Tag class="px-1.5 text-[0.625rem]">已禁用</Tag>
                   {/if}
                 </div>
               {/each}
@@ -228,9 +228,9 @@
       <Card.Root class="shrink-0 gap-0 overflow-hidden py-0">
         <Card.Header class="shrink-0 border-b px-4 py-2.5">
           <div class="flex items-center gap-2">
-            <Card.Title class="text-sm">Selectors</Card.Title>
+            <Card.Title class="text-sm">模型选择器 (Selectors)</Card.Title>
             <span class="text-muted-foreground ml-auto text-xs">
-              {$selectorModels.length} {$selectorModels.length === 1 ? "selector" : "selectors"}
+              {$selectorModels.length} 个选择器
             </span>
           </div>
         </Card.Header>
@@ -248,7 +248,7 @@
                     </div>
                   {/if}
                   <div class="text-muted-foreground flex flex-wrap items-center gap-x-1 text-xs">
-                    <span>targets:</span>
+                    <span>路由目标:</span>
                     {#each selector.targets ?? [] as target, i (target)}
                       {#if i > 0}<span>,</span>{/if}
                       <a
@@ -260,7 +260,7 @@
                   </div>
                 </div>
                 {#if selector.strategy === "spillover" && selector.spillover}
-                  <Tag>spillover {selector.spillover}</Tag>
+                  <Tag>溢出 {selector.spillover}</Tag>
                 {/if}
                 <Tag class="px-1.5 text-[0.625rem] uppercase">{selector.strategy}</Tag>
               </div>
@@ -270,7 +270,8 @@
       </Card.Root>
     {/if}
 
-    {@render modelSection("Local models", localModels, unlistedToggle)}
-    {@render modelSection("Peer models", peerModels)}
+    {@render modelSection("本地模型", localModels, unlistedToggle)}
+    {@render modelSection("节点对等模型", peerModels)}
   </div>
 </div>
+

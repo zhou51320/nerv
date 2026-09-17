@@ -95,11 +95,11 @@
       <Sidebar.GroupContent>
         <Sidebar.Menu class="gap-1">
           <Sidebar.MenuItem>
-            <Sidebar.MenuButton isActive={$currentRoute === "/" || isActive("/activity", $currentRoute)} tooltipContent="Activity">
+            <Sidebar.MenuButton isActive={$currentRoute === "/" || isActive("/activity", $currentRoute)} tooltipContent="活动监控">
               {#snippet child({ props })}
                 <a href="/" use:link {...props}>
                   <Activity />
-                  <span>Activity</span>
+                  <span>活动监控</span>
                 </a>
               {/snippet}
             </Sidebar.MenuButton>
@@ -119,11 +119,11 @@
           {/if}
 
           <Sidebar.MenuItem>
-            <Sidebar.MenuButton isActive={isActive("/playground", $currentRoute)} tooltipContent="Playground">
+            <Sidebar.MenuButton isActive={isActive("/playground", $currentRoute)} tooltipContent="演练场">
               {#snippet child({ props })}
                 <a href="/playground" use:link {...props}>
                   <FerrisWheel />
-                  <span class={$playgroundActivity ? "activity-link" : ""}>Playground</span>
+                  <span class={$playgroundActivity ? "activity-link" : ""}>演练场</span>
                 </a>
               {/snippet}
             </Sidebar.MenuButton>
@@ -137,17 +137,17 @@
             >
               <Sidebar.MenuButton
                 isActive={$currentRoute.startsWith("/models")}
-                tooltipContent="Models"
+                tooltipContent="模型管理"
               >
                 {#snippet child({ props })}
                   <a href="/models" use:link {...props}>
                     <Boxes />
-                    <span>Models</span>
+                    <span>模型管理</span>
                     <span
                       class="ml-auto transition-transform duration-200 {$modelsMenuOpen ? 'rotate-90' : ''}"
                       role="button"
                       tabindex="0"
-                      aria-label="Toggle models section"
+                      aria-label="折叠/展开模型列表"
                       onclick={(e) => {
                         e.preventDefault();
                         e.stopPropagation();
@@ -173,7 +173,7 @@
                   {/each}
                   {#if visiblePeerModels.length > 0}
                     <li class="text-sidebar-foreground/70 px-2 pt-2 pb-1 text-xs font-medium">
-                      Peers
+                      节点设备
                     </li>
                     {#each visiblePeerModels as model (model.id)}
                       {@render modelMenuItem(model)}
@@ -185,11 +185,11 @@
           </Sidebar.MenuItem>
 
           <Sidebar.MenuItem>
-            <Sidebar.MenuButton isActive={isActive("/logs", $currentRoute)} tooltipContent="Logs">
+            <Sidebar.MenuButton isActive={isActive("/logs", $currentRoute)} tooltipContent="运行日志">
               {#snippet child({ props })}
                 <a href="/logs" use:link {...props}>
                   <ScrollText />
-                  <span>Logs</span>
+                  <span>运行日志</span>
                 </a>
               {/snippet}
             </Sidebar.MenuButton>
@@ -197,11 +197,11 @@
 
           {#if $performanceEnabled}
             <Sidebar.MenuItem>
-              <Sidebar.MenuButton isActive={isActive("/performance", $currentRoute)} tooltipContent="Performance">
+              <Sidebar.MenuButton isActive={isActive("/performance", $currentRoute)} tooltipContent="性能监控">
                 {#snippet child({ props })}
                   <a href="/performance" use:link {...props}>
                     <Gauge />
-                    <span>Performance</span>
+                    <span>性能监控</span>
                   </a>
                 {/snippet}
               </Sidebar.MenuButton>
@@ -209,11 +209,11 @@
           {/if}
 
           <Sidebar.MenuItem>
-            <Sidebar.MenuButton isActive={isActive("/hardware", $currentRoute)} tooltipContent="Hardware">
+            <Sidebar.MenuButton isActive={isActive("/hardware", $currentRoute)} tooltipContent="硬件信息">
               {#snippet child({ props })}
                 <a href="/hardware" use:link {...props}>
                   <Cpu />
-                  <span>Hardware</span>
+                  <span>硬件信息</span>
                 </a>
               {/snippet}
             </Sidebar.MenuButton>
@@ -226,11 +226,11 @@
   <Sidebar.Footer>
     <Sidebar.Menu>
       <Sidebar.MenuItem>
-        <Sidebar.MenuButton isActive={isActive("/help", $currentRoute)} tooltipContent="Help">
+        <Sidebar.MenuButton isActive={isActive("/help", $currentRoute)} tooltipContent="使用帮助">
           {#snippet child({ props })}
             <a href="/help" use:link {...props}>
               <CircleQuestionMark />
-              <span class={$docsAgentStreaming ? "activity-link" : ""}>Help</span>
+              <span class={$docsAgentStreaming ? "activity-link" : ""}>使用帮助</span>
             </a>
           {/snippet}
         </Sidebar.MenuButton>
@@ -242,12 +242,12 @@
     >
       <Sidebar.MenuButton
         isActive={isActive("/settings", $currentRoute)}
-        tooltipContent="Settings"
+        tooltipContent="系统设置"
       >
         {#snippet child({ props })}
           <a href="/settings" use:link {...props}>
             <Settings />
-            <span>Settings</span>
+            <span>系统设置</span>
           </a>
         {/snippet}
       </Sidebar.MenuButton>
@@ -255,7 +255,7 @@
         variant="ghost"
         size="icon"
         onclick={toggleTheme}
-        title="Toggle theme (current: {$themeMode})"
+        title="切换主题 (当前: {$themeMode})"
       >
         {#if $themeMode === "system"}
           <Monitor />
@@ -264,7 +264,7 @@
         {:else}
           <Moon />
         {/if}
-        <span class="sr-only">Toggle theme</span>
+        <span class="sr-only">切换主题</span>
       </Button>
     </div>
   </Sidebar.Footer>

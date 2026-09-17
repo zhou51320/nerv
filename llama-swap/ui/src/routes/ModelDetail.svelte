@@ -26,8 +26,8 @@
 <div class="flex h-full flex-col gap-4 overflow-y-auto p-2">
   {#if !model}
     <Card.Root class="shrink-0 p-6">
-      <p class="text-muted-foreground">Model “{modelId}” not found.</p>
-      <a href="/" class="text-primary hover:underline">Back to Playground</a>
+      <p class="text-muted-foreground">未找到模型 “{modelId}”。</p>
+      <a href="/" class="text-primary hover:underline">返回首页</a>
     </Card.Root>
   {:else}
     <Card.Root class="shrink-0 gap-0 overflow-hidden py-0">
@@ -36,7 +36,9 @@
           <span class={`size-2.5 shrink-0 rounded-full ${statusDotColor(model)}`}></span>
           <Card.Title class="text-lg">{model.name || model.id}</Card.Title>
           <span class="text-muted-foreground text-sm">({model.id})</span>
-          <span class="text-muted-foreground text-xs uppercase tracking-wide">{model.state}</span>
+          <span class="text-muted-foreground text-xs font-medium">
+            {model.state === "ready" ? "已就绪" : model.state === "starting" ? "启动中" : model.state === "stopping" ? "停止中" : "已停止"}
+          </span>
           <div class="ml-auto flex items-center gap-2">
             {#if !model.peerID}
               <a
@@ -44,8 +46,8 @@
                 target="_blank"
                 rel="noopener noreferrer"
                 class="text-muted-foreground hover:text-foreground"
-                title="Open model server"
-                aria-label="Open model server"
+                title="打开模型服务链接"
+                aria-label="打开模型服务链接"
               >
                 <ExternalLink class="size-4" />
               </a>
@@ -57,16 +59,16 @@
           <p class="text-muted-foreground text-sm"><em>{model.description}</em></p>
         {/if}
         {#if model.aliases && model.aliases.length > 0}
-          <p class="text-muted-foreground text-xs">Aliases: {model.aliases.join(", ")}</p>
+          <p class="text-muted-foreground text-xs">别名: {model.aliases.join(", ")}</p>
         {/if}
       </Card.Header>
     </Card.Root>
 
     <Tabs value="activity" class="min-h-0 flex-1">
       <TabsList variant="line">
-        <TabsTrigger value="activity">Activity</TabsTrigger>
-        <TabsTrigger value="logs">Logs</TabsTrigger>
-        <TabsTrigger value="details">Details</TabsTrigger>
+        <TabsTrigger value="activity">活动记录</TabsTrigger>
+        <TabsTrigger value="logs">运行日志</TabsTrigger>
+        <TabsTrigger value="details">配置详情</TabsTrigger>
       </TabsList>
 
       <!-- Activity -->

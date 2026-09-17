@@ -419,14 +419,14 @@
 <div class="flex flex-col h-full">
   <!-- Model selector and controls -->
   <div class="mb-3 flex shrink-0 gap-2">
-    <ModelSelector bind:value={$selectedModelStore} placeholder="Select a model..." disabled={isStreaming} />
+    <ModelSelector bind:value={$selectedModelStore} placeholder="选择模型..." disabled={isStreaming} />
     <div class="flex shrink-0 gap-2">
-      <Button variant="outline" size="icon" onclick={() => (showSettings = true)} title="Chat settings">
+      <Button variant="outline" size="icon" onclick={() => (showSettings = true)} title="对话参数设置">
         <Settings />
       </Button>
-      <Button variant="outline" onclick={newChat} disabled={messages.length === 0 && !isStreaming} title="New chat">
+      <Button variant="outline" onclick={newChat} disabled={messages.length === 0 && !isStreaming} title="新建对话">
         <SquarePen />
-        <span class="hidden sm:inline">New Chat</span>
+        <span class="hidden sm:inline">新建对话</span>
       </Button>
     </div>
   </div>
@@ -438,7 +438,7 @@
       style={settingsStyle}
     >
       <Dialog.Header>
-        <Dialog.Title>Chat Settings</Dialog.Title>
+        <Dialog.Title>对话参数设置</Dialog.Title>
       </Dialog.Header>
 
       <!-- Stacking every setting in one scroll left the system prompt textarea
@@ -446,16 +446,16 @@
          tabs now and only one shows at a time. -->
       <Tabs value="prompt" class="flex flex-col gap-2">
         <TabsList variant="line" class="justify-start">
-          <TabsTrigger value="prompt">Prompt</TabsTrigger>
-          <TabsTrigger value="params">Parameters</TabsTrigger>
+          <TabsTrigger value="prompt">系统提示词</TabsTrigger>
+          <TabsTrigger value="params">生成参数</TabsTrigger>
         </TabsList>
 
         <TabsContent value="prompt">
-          <Label class="sr-only" for="system-prompt">System Prompt</Label>
+          <Label class="sr-only" for="system-prompt">系统提示词</Label>
           <Textarea
             id="system-prompt"
             class="resize-y min-h-24 max-h-[50dvh]"
-            placeholder="You are a helpful assistant..."
+            placeholder="你是一个乐于助人、博学多才的 AI 助手..."
             rows={5}
             bind:value={$systemPromptStore}
             disabled={isStreaming}
@@ -464,7 +464,7 @@
 
         <TabsContent value="params" class="space-y-4">
           <div>
-            <Label class="mb-1" for="endpoint">Endpoint</Label>
+            <Label class="mb-1" for="endpoint">接口端点 (Endpoint)</Label>
             <Select.Root
               type="single"
               value={$endpointStore}
@@ -480,7 +480,7 @@
           </div>
           <div>
             <Label class="mb-1" for="temperature">
-              Temperature: {$temperatureStore.toFixed(2)}
+              采样温度 (Temperature): {$temperatureStore.toFixed(2)}
             </Label>
             <input
               id="temperature"
@@ -493,13 +493,13 @@
               disabled={isStreaming}
             />
             <div class="text-muted-foreground mt-1 flex justify-between text-xs">
-              <span>Precise (0)</span>
-              <span>Creative (2)</span>
+              <span>严谨精确 (0)</span>
+              <span>发散发想 (2)</span>
             </div>
           </div>
           <div>
             <Label class="mb-1" for="top-p">
-              Top P (nucleus): {$topPStore.toFixed(2)}
+              核心采样 (Top P): {$topPStore.toFixed(2)}
             </Label>
             <input
               id="top-p"
@@ -512,13 +512,13 @@
               disabled={isStreaming}
             />
             <div class="text-muted-foreground mt-1 flex justify-between text-xs">
-              <span>Narrow (0.01)</span>
-              <span>Off (1)</span>
+              <span>收敛聚焦 (0.01)</span>
+              <span>关闭 (1)</span>
             </div>
           </div>
           <div>
             <Label class="mb-1" for="min-p">
-              Min P: {$minPStore.toFixed(2)}
+              最小概率截断 (Min P): {$minPStore.toFixed(2)}
             </Label>
             <input
               id="min-p"
@@ -530,10 +530,10 @@
               bind:value={$minPStore}
               disabled={isStreaming}
             />
-            <p class="text-muted-foreground mt-1 text-xs">Off at 0. Only sent on /v1/chat/completions.</p>
+            <p class="text-muted-foreground mt-1 text-xs">设为 0 关闭。仅在 /v1/chat/completions 生效。</p>
           </div>
           <div>
-            <Label class="mb-1" for="top-k">Top K</Label>
+            <Label class="mb-1" for="top-k">候选词元数 (Top K)</Label>
             <Input
               id="top-k"
               type="number"
@@ -543,25 +543,25 @@
               bind:value={$topKStore}
               disabled={isStreaming}
             />
-            <p class="text-muted-foreground mt-1 text-xs">0 disables it. Not sent on /v1/responses.</p>
+            <p class="text-muted-foreground mt-1 text-xs">设为 0 关闭。不对 /v1/responses 接口生效。</p>
           </div>
           <div>
-            <Label class="mb-1" for="max-tokens">Max Tokens</Label>
+            <Label class="mb-1" for="max-tokens">最大输出词元数 (Max Tokens)</Label>
             <Input id="max-tokens" type="number" min="1" bind:value={$maxTokensStore} disabled={isStreaming} />
-            <p class="text-muted-foreground mt-1 text-xs">Required for /v1/messages.</p>
+            <p class="text-muted-foreground mt-1 text-xs">使用 /v1/messages 接口时为必填项。</p>
           </div>
         </TabsContent>
       </Tabs>
 
       <Dialog.Footer>
-        <Button variant="outline" onclick={() => (showSettings = false)}>Done</Button>
+        <Button variant="outline" onclick={() => (showSettings = false)}>完成</Button>
       </Dialog.Footer>
     </Dialog.Content>
   </Dialog.Root>
 
   <!-- Empty state for no models configured -->
   {#if !$hasListedModels}
-    <EmptyState message="No models configured. Add models to your configuration to start chatting." />
+    <EmptyState message="未配置任何模型。请在配置文件中添加模型后开始测试对话。" />
   {:else}
     <!-- Messages area. The conversation is one centered column, the same
          width as the composer below it, so lines stay readable on a wide
@@ -572,8 +572,9 @@
       onscroll={handleMessagesScroll}
     >
       {#if messages.length === 0}
-        <EmptyState full message="Start a conversation by typing a message below." />
+        <EmptyState full message="在下方输入消息开始对话。" />
       {:else}
+
         <div class="mx-auto w-full max-w-3xl py-2">
         {#each messages as message, idx (idx)}
           <ChatMessageComponent
@@ -610,7 +611,7 @@
       <ChatComposer
         bind:ref={inputRef}
         bind:value={userInput}
-        placeholder="Type a message..."
+        placeholder="输入消息 (Enter 发送，Shift+Enter 换行)..."
         onkeydown={handleKeyDown}
         disabled={isStreaming || !$selectedModelStore}
         streaming={isStreaming}
@@ -633,7 +634,7 @@
                     size="icon-xs"
                     class="absolute -top-1.5 -right-1.5 rounded-full shadow-sm"
                     onclick={() => removeImage(idx)}
-                    title="Remove image"
+                    title="移除图片"
                   >
                     <X class="size-3" />
                   </Button>
@@ -654,8 +655,8 @@
             class="text-muted-foreground shrink-0 rounded-full"
             onclick={() => fileInput?.click()}
             disabled={isStreaming || !$selectedModelStore}
-            title="Attach image"
-            aria-label="Attach image"
+            title="添加附件图片"
+            aria-label="添加附件图片"
           >
             <Paperclip />
           </Button>

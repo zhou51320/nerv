@@ -29,17 +29,17 @@
   ];
 
   const WINDOWS = [
-    { label: "5 min", ms: 5 * 60 * 1000 },
-    { label: "15 min", ms: 15 * 60 * 1000 },
-    { label: "1 hr", ms: 60 * 60 * 1000 },
+    { label: "5分钟", ms: 5 * 60 * 1000 },
+    { label: "15分钟", ms: 15 * 60 * 1000 },
+    { label: "1小时", ms: 60 * 60 * 1000 },
   ] as const;
 
   const INTERVALS = [
-    { label: "Off", ms: 0 },
-    { label: "5s", ms: 5000 },
-    { label: "10s", ms: 10000 },
-    { label: "30s", ms: 30000 },
-    { label: "60s", ms: 60000 },
+    { label: "关闭", ms: 0 },
+    { label: "5秒", ms: 5000 },
+    { label: "10秒", ms: 10000 },
+    { label: "30秒", ms: 30000 },
+    { label: "60秒", ms: 60000 },
   ] as const;
 
   let selectedWindow = persistentStore("perf-window", 0);
@@ -356,40 +356,40 @@
 
 <div class="space-y-6">
   <div class="flex items-center justify-between">
-    <h2 class="text-xl font-semibold text-foreground">Performance (Experimental)</h2>
+    <h2 class="text-xl font-semibold text-foreground">性能监控 (实验功能)</h2>
     <div class="flex items-center gap-4">
       <SegmentedControl items={WINDOWS} selected={$selectedWindow} onSelect={(i) => ($selectedWindow = i)} />
       <SegmentedControl
         items={INTERVALS}
         selected={$selectedInterval}
         onSelect={handleIntervalChange}
-        label="Refresh:"
+        label="自动刷新:"
       />
-      <Button variant="outline" size="icon-sm" title="Refresh" onclick={manualRefresh} disabled={refreshing}>
+      <Button variant="outline" size="icon-sm" title="立即刷新" onclick={manualRefresh} disabled={refreshing}>
         <RefreshCw class={refreshing ? "animate-spin" : ""} />
       </Button>
     </div>
   </div>
   <p class="text-sm text-muted-foreground">
-    This is an experimental feature. Please use <a
+    此功能处于实验阶段。如需查看指南或反馈建议，请访问 <a
       class="underline hover:text-foreground"
-      href="https://github.com/mostlygeek/llama-swap/discussions/771">discussion #771</a
-    > for instructions and to share feedback.
+      href="https://github.com/mostlygeek/llama-swap/discussions/771">社区讨论 #771</a
+    >。
   </p>
 
   <!-- GPU Section -->
   <section class="space-y-4">
-    <h3 class="text-lg font-medium text-foreground">GPU</h3>
+    <h3 class="text-lg font-medium text-foreground">显卡设备 (GPU)</h3>
     {#if !hasGpuData}
       <Card.Root class="py-0">
         <Card.Content class="p-4">
-          <p class="text-muted-foreground">No GPU data available</p>
+          <p class="text-muted-foreground">暂无 GPU 监控数据</p>
         </Card.Content>
       </Card.Root>
     {:else}
       <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <PerformanceChart
-          title="GPU Utilization (%)"
+          title="GPU 核心使用率 (%)"
           labels={gpuLabels}
           datasets={gpuUtilDatasets}
           yMin={0}
@@ -397,7 +397,7 @@
           yLabel="%"
         />
         <PerformanceChart
-          title="GPU Memory Utilization (%)"
+          title="GPU 显存使用率 (%)"
           labels={gpuLabels}
           datasets={gpuMemDatasets}
           yMin={0}
@@ -405,7 +405,7 @@
           yLabel="%"
         />
         <PerformanceChart
-          title="GPU Temperature (°C)"
+          title="GPU 核心温度 (°C)"
           labels={gpuLabels}
           datasets={gpuTempDatasets}
           yMin={0}
@@ -413,7 +413,7 @@
         />
         {#if hasVramTemp}
           <PerformanceChart
-            title="GPU VRAM Temperature (°C)"
+            title="GPU 显存温度 (°C)"
             labels={gpuLabels}
             datasets={gpuVramTempDatasets}
             yMin={0}
@@ -421,7 +421,7 @@
           />
         {/if}
         <PerformanceChart
-          title="GPU Power Draw (W)"
+          title="GPU 运行功耗 (W)"
           labels={gpuLabels}
           datasets={gpuPowerDatasets}
           yMin={0}
@@ -433,10 +433,10 @@
 
   <!-- System Section -->
   <section class="space-y-4">
-    <h3 class="text-lg font-medium text-foreground">System</h3>
+    <h3 class="text-lg font-medium text-foreground">系统资源 (System)</h3>
     <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
       <PerformanceChart
-        title="CPU Utilization (%)"
+        title="CPU 使用率 (%)"
         labels={sysLabels}
         datasets={cpuDatasets}
         yMin={0}
@@ -446,7 +446,7 @@
       />
       <div>
         <PerformanceChart
-          title="Memory & Swap Usage (%)"
+          title="物理内存与交换空间占用 (%)"
           labels={sysLabels}
           datasets={memSwapDatasets}
           yMin={0}
@@ -456,13 +456,13 @@
         {#if latestMemSwap}
           <div class="flex items-center justify-center gap-4 text-xs text-muted-foreground mt-1 px-4">
             <span
-              >Mem: <span class="text-foreground font-medium"
+              >内存: <span class="text-foreground font-medium"
                 >{latestMemSwap.mem_used_mb.toLocaleString()} / {latestMemSwap.mem_total_mb.toLocaleString()} MB ({latestMemSwap.mem_used_pct}%)</span
               ></span
             >
             {#if latestMemSwap.swap_used_pct !== null}
               <span
-                >Swap: <span class="text-foreground font-medium"
+                >交换空间: <span class="text-foreground font-medium"
                   >{latestMemSwap.swap_used_mb.toLocaleString()} / {latestMemSwap.swap_total_mb.toLocaleString()} MB ({latestMemSwap.swap_used_pct}%)</span
                 ></span
               >
@@ -470,10 +470,10 @@
           </div>
         {/if}
       </div>
-      <PerformanceChart title="Load Average" labels={sysLabels} datasets={loadDatasets} yMin={0} />
+      <PerformanceChart title="系统平均负载 (Load Average)" labels={sysLabels} datasets={loadDatasets} yMin={0} />
       {#if netBandwidthDatasets.length > 0}
         <PerformanceChart
-          title="Network Bandwidth (Mbit/s)"
+          title="网络带宽 (Mbit/s)"
           labels={netBandwidthLabels}
           datasets={netBandwidthDatasets}
           yMin={0}

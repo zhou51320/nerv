@@ -22,18 +22,18 @@ export type ThemeName =
 
 export const themes: { value: ThemeName; label: string }[] = [
   // modern
-  { value: "default", label: "Default" },
-  { value: "ocean", label: "Ocean" },
-  { value: "violet", label: "Violet" },
-  { value: "emerald", label: "Emerald" },
-  { value: "rose", label: "Rose" },
-  { value: "amber", label: "Amber" },
-  { value: "slate", label: "Slate" },
-  { value: "sunset", label: "Sunset" },
+  { value: "default", label: "默认灰" },
+  { value: "ocean", label: "海洋蓝" },
+  { value: "violet", label: "丁香紫" },
+  { value: "emerald", label: "翡翠绿" },
+  { value: "rose", label: "玫瑰红" },
+  { value: "amber", label: "琥珀金" },
+  { value: "slate", label: "石板灰" },
+  { value: "sunset", label: "晚霞落日" },
   // classic
-  { value: "terminal", label: "Green Terminal" },
-  { value: "mc", label: "Midnight Commander" },
-  { value: "solarized", label: "Solarized" },
+  { value: "terminal", label: "复古绿色终端" },
+  { value: "mc", label: "午夜指挥官" },
+  { value: "solarized", label: "日光暖色" },
 ];
 
 function getInitialThemeMode(): ThemeMode {
