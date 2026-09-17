@@ -25,6 +25,17 @@ endif()
 `beellama.cpp/` 单独保存 BeeLlama v0.4.6，用于 KVarN KV Cache。它与官方 `llama.cpp/` 并行维护，不替换官方版本。
 
 Win7 Vulkan 构建由 `.github/workflows/build-beellama-win7-vulkan.yml` 完成，产物位于 `EVA_BACKEND/x86_64/win7/vulkan/beellama.cpp/`，支持 `kvarn2`、`kvarn3`、`kvarn4`、`kvarn5`、`kvarn6` 和 `kvarn8`。
+
+## ik_llama.cpp
+
+`ik_llama.cpp/` 保存 Iwan Kawrakow 的 llama.cpp 分支（支持各种专用 IQ 量化与推理优化）。作为普通 vendor 目录由父仓库管理。
+
+修改与适配（兼容 Win7）：
+- 主 `CMakeLists.txt` 顶部设置 `GGML_WIN_VER "0x601"`
+- `vendor/cpp-httplib/httplib.h` 移除 `_WIN32_WINNT < 0x0A00` 的 `#error` 报错
+- `vendor/cpp-httplib/httplib.cpp` 中 `mmap::open` 替换为兼容 Windows 7 的 Win32 API（`CreateFileW`、`CreateFileMappingW`、`MapViewOfFile`）
+
+Win7 Vulkan 构建由 `.github/workflows/build-ik-llama-win7-vulkan.yml` 完成，产物位于 `EVA_BACKEND/x86_64/win7/vulkan/ik_llama.cpp/`。
 - llama.cpp 为了能在win7下运行
     - 使用mingw编译器 gcc 12版本以上
     - 去掉llama.cpp/vendor/cpp-httplib/httplib.h 中 

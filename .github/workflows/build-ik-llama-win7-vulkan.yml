@@ -1,0 +1,117 @@
+name: Build ik_llama Win7 Vulkan
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/build-ik-llama-win7-vulkan.yml'
+      - 'ik_llama.cpp/**'
+
+permissions:
+  contents: read
+
+env:
+  VULKAN_SDK_VERSION: '1.3.290.0'
+
+jobs:
+  build-ik-llama-win7-vulkan:
+    name: Build ik_llama.cpp (Win7 + Vulkan)
+    runs-on: windows-2022
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Vulkan SDK
+        shell: pwsh
+        run: |
+          $version = "${{ env.VULKAN_SDK_VERSION }}"
+          $sdkRoot = "C:\VulkanSDK\$version"
+          if (-not (Test-Path $sdkRoot)) {
+            $installer = Join-Path $env:RUNNER_TEMP "VulkanSDK-$version.exe"
+            $uri = "https://sdk.lunarg.com/sdk/download/$version/windows/VulkanSDK-$version-Installer.exe"
+            Invoke-WebRequest -Uri $uri -OutFile $installer -UseBasicParsing
+            $args = '--accept-licenses', '--default-answer', '--confirm-command', 'install'
+            $proc = Start-Process -FilePath $installer -ArgumentList $args -PassThru -Wait
+            if ($proc.ExitCode -ne 0) { throw "Vulkan SDK installer failed with exit code $($proc.ExitCode)" }
+          }
+          if (-not (Test-Path $sdkRoot)) { throw "Failed to install Vulkan SDK $version" }
+          "VULKAN_SDK=$sdkRoot" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$sdkRoot\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          $spirvDir = Get-ChildItem -Path $sdkRoot -Recurse -Filter "SPIRV-HeadersConfig.cmake" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($spirvDir) {
+            "SPIRV-Headers_DIR=$(Split-Path $spirvDir.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          }
+
+      - name: Setup MSYS2 toolchain
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            base-devel
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+
+      - name: Add MinGW to PATH
+        shell: pwsh
+        run: |
+          "C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Configure ik_llama
+        shell: pwsh
+        run: |
+          cmake -S ik_llama.cpp -B build-ik-llama-x86_64-win7-vulkan -G "MinGW Makefiles" `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_OBJECT_PATH_MAX=196 `
+            -DCMAKE_C_FLAGS="-D_WIN32_WINNT=0x0601 -fopenmp -mthreads" `
+            -DCMAKE_CXX_FLAGS="-D_WIN32_WINNT=0x0601 -fopenmp -mthreads" `
+            -DCMAKE_EXE_LINKER_FLAGS="-static -static-libgcc -static-libstdc++ -fopenmp -Wl,-s -Wl,--gc-sections -mthreads -lpthread" `
+            -DCMAKE_SHARED_LINKER_FLAGS="-static -static-libgcc -static-libstdc++ -fopenmp -Wl,-s -Wl,--gc-sections -mthreads -lpthread" `
+            -DBUILD_SHARED_LIBS=OFF `
+            -DLLAMA_CURL=OFF `
+            -DLLAMA_OPENSSL=OFF `
+            -DLLAMA_BUILD_TESTS=OFF `
+            -DLLAMA_BUILD_EXAMPLES=ON `
+            -DLLAMA_BUILD_SERVER=ON `
+            -DGGML_NATIVE=OFF `
+            -DGGML_AVX512=OFF `
+            -DGGML_VULKAN=ON `
+            -DGGML_CUDA=OFF `
+            -DGGML_OPENCL=OFF `
+            -DGGML_WIN_VER=0x601
+
+      - name: Build ik_llama targets
+        shell: pwsh
+        run: |
+          $cache = Get-Content 'build-ik-llama-x86_64-win7-vulkan\CMakeCache.txt' -Raw
+          if ($cache -notmatch 'GGML_VULKAN:BOOL=ON') { throw 'GGML_VULKAN was not enabled' }
+          cmake --build build-ik-llama-x86_64-win7-vulkan --config Release --parallel --target llama-cli llama-server llama-perplexity llama-quantize
+
+      - name: Verify built binaries
+        shell: pwsh
+        run: |
+          $bin = 'build-ik-llama-x86_64-win7-vulkan\bin'
+          foreach ($name in @('llama-cli.exe', 'llama-server.exe', 'llama-perplexity.exe', 'llama-quantize.exe')) {
+            if (-not (Test-Path (Join-Path $bin $name))) { throw "$name missing" }
+          }
+          Write-Host 'Required binaries verified successfully.'
+
+      - name: Package artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path 'EVA_BACKEND\x86_64\win7\vulkan\ik_llama.cpp' | Out-Null
+          Copy-Item 'build-ik-llama-x86_64-win7-vulkan\bin\*.exe' 'EVA_BACKEND\x86_64\win7\vulkan\ik_llama.cpp' -Force
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          Compress-Archive -Path 'EVA_BACKEND\x86_64\win7\vulkan\ik_llama.cpp' -DestinationPath 'artifacts/ik-llama-win7-vulkan.zip' -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ik-llama-win7-vulkan
+          path: artifacts/ik-llama-win7-vulkan.zip
+          if-no-files-found: error
