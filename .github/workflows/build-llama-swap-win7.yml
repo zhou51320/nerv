@@ -49,14 +49,16 @@ jobs:
           Write-Host "Extracting to $goInstallDir..."
           Expand-Archive -Path $zipPath -DestinationPath $goInstallDir -Force
           
-          # Locate go.exe inside extracted archive recursively
-          $goExe = Get-ChildItem -Path $goInstallDir -Recurse -File -Filter "go.exe" | Select-Object -First 1
-          if (-not $goExe) {
-            Write-Host "Contents of $goInstallDir:"
-            Get-ChildItem -Path $goInstallDir -Recurse | Select-Object -First 30 | ForEach-Object { Write-Host $_.FullName }
-            throw "go.exe not found in extracted archive"
+          # The zip package contains root folder 'go-legacy-win7'
+          $goBin = Join-Path $goInstallDir "go-legacy-win7\bin"
+          if (-not (Test-Path (Join-Path $goBin "go.exe"))) {
+            $candidate = Get-ChildItem -Path $goInstallDir -Recurse -Include "go.exe" -File -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($candidate) {
+              $goBin = $candidate.DirectoryName
+            } else {
+              throw "go.exe not found under $goInstallDir"
+            }
           }
-          $goBin = $goExe.DirectoryName
           $goRoot = Split-Path $goBin
           "GOROOT=$goRoot" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "$goBin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
