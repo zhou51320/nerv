@@ -369,7 +369,7 @@ if (-not $okCli) {
   $okCli = Copy-BinaryByAliases $bdir @('llama-cli','main') 'llama-cli' $outDir
 }
 
-if (-not $okServer -or -not $okQuant) {
+if (-not $okServer -or -not $okQuant -or -not $okCli) {
   Write-Warning "Built exe files found under ${bdir}:"
   Get-ChildItem -Recurse -File -Path $bdir -Filter *.exe -ErrorAction SilentlyContinue | ForEach-Object {
     Write-Warning "  $($_.FullName)"
@@ -385,8 +385,19 @@ $requiredProjectDlls = @(
   'ggml-cuda.dll'
 )
 $optionalProjectDlls = @(
-  'mtmd.dll'
+  'mtmd.dll',
+  'llama-common.dll',
+  'llama-server-impl.dll',
+  'llama-cli-impl.dll'
 )
 Copy-RequiredDlls $bdir $outDir $requiredProjectDlls $optionalProjectDlls
+
+# Also copy any other dlls built in the build tree
+Get-ChildItem -Recurse -File -Path $bdir -Filter *.dll -ErrorAction SilentlyContinue | ForEach-Object {
+  if (-not (Test-Path (Join-Path $outDir $_.Name))) {
+    Copy-Item $_.FullName -Destination $outDir -Force
+    Write-Host "Copied additional build DLL $($_.Name) -> $outDir"
+  }
+}
 
 Write-Host "Done. Artifacts under: $outDir"
