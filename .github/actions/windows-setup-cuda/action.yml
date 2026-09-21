@@ -451,191 +451,67 @@ runs:
       shell: pwsh
       run: |
         $root = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.4"
-        $installer = Join-Path $env:RUNNER_TEMP "cuda_11.4.4_472.50_windows.exe"
-        $extractDir = Join-Path $env:RUNNER_TEMP "cuda-11.4-extract"
-        $stageDir = Join-Path $env:RUNNER_TEMP "cuda-11.4-stage"
-        $url = "https://developer.download.nvidia.com/compute/cuda/11.4.4/local_installers/cuda_11.4.4_472.50_windows.exe"
-
-        if (Test-Path $extractDir) { Remove-Item -Recurse -Force $extractDir }
-        if (Test-Path $stageDir) { Remove-Item -Recurse -Force $stageDir }
-        New-Item -ItemType Directory -Force -Path $extractDir | Out-Null
-        New-Item -ItemType Directory -Force -Path $stageDir | Out-Null
-
-        Write-Host "Downloading $url"
-        curl.exe -L $url -o $installer
-
-        # Pass 1: unpack the self-extracting installer container.
-        & 7z x -y "-o$extractDir" $installer | Out-Null
-
-        # Seed stage with everything from pass 1, then expand nested payloads on top.
-        Copy-Item -Path "$extractDir\*" -Destination $stageDir -Recurse -Force
-
-        # Pass 2: unpack all nested .7z payload archives found in pass 1.
-        $payloads = Get-ChildItem -Path $extractDir -Recurse -File -Filter *.7z -ErrorAction SilentlyContinue
-        if (-not $payloads -or $payloads.Count -eq 0) {
-          Write-Host "No nested .7z payloads found in CUDA 11.4 installer tree"
-        } else {
-          foreach ($pkg in $payloads) {
-            Write-Host "Extracting payload $($pkg.FullName)"
-            & 7z x -y "-o$stageDir" $pkg.FullName | Out-Null
-          }
-        }
-
-        # Pass 3: extract common component containers that often hold dev/import libs and headers.
-        $componentArchives = Get-ChildItem -Path $extractDir -Recurse -File -ErrorAction SilentlyContinue |
-          Where-Object {
-            $_.Extension -in @('.cab', '.zip', '.msi') -and
-            $_.Name -match '(?i)(nvcc|cudart|cublas|cublaslt|nvrtc|nvvm|crt|curand|cufft|cusolver|cusparse|npp|toolkit)'
-          } |
-          Sort-Object -Property FullName -Unique
-        foreach ($archive in $componentArchives) {
-          Write-Host "Extracting component archive $($archive.FullName)"
-          & 7z x -y "-o$stageDir" $archive.FullName | Out-Null
-        }
-
-        # Locate nvcc from the staged tree and infer toolkit root (<toolkit>\bin\nvcc.exe).
-        $nvccInStage = Get-ChildItem -Path $stageDir -Recurse -File -Filter nvcc.exe -ErrorAction SilentlyContinue |
-          Where-Object { $_.FullName -match '\\bin\\nvcc\.exe$' } |
-          Sort-Object -Property FullName |
-          Select-Object -First 1
-
-        if (-not $nvccInStage) {
-          Write-Host "nvcc.exe not found after initial extraction; trying targeted archive fallback"
-          $fallbackArchives = Get-ChildItem -Path $extractDir -Recurse -File -ErrorAction SilentlyContinue |
-            Where-Object {
-              $_.Extension -in @('.cab', '.zip', '.7z') -and
-              $_.Name -match '(?i)(nvcc|cudart|cublas|cufft|curand|cusolver|cusparse|npp|toolkit)'
-            } |
-            Sort-Object -Property FullName -Unique
-
-          foreach ($archive in $fallbackArchives) {
-            Write-Host "Fallback extracting $($archive.FullName)"
-            & 7z x -y "-o$stageDir" $archive.FullName | Out-Null
-          }
-          $nvccInStage = Get-ChildItem -Path $stageDir -Recurse -File -Filter nvcc.exe -ErrorAction SilentlyContinue |
-            Where-Object { $_.FullName -match '\\bin\\nvcc\.exe$' } |
-            Sort-Object -Property FullName |
-            Select-Object -First 1
-        }
-        if (-not $nvccInStage) {
-          throw "nvcc.exe not found in staged CUDA 11.4 payload under $stageDir"
-        }
-
-        $toolkitRoots = Get-ChildItem -Path $stageDir -Recurse -File -Filter nvcc.exe -ErrorAction SilentlyContinue |
-          Where-Object { $_.FullName -match '\\bin\\nvcc\.exe$' } |
-          ForEach-Object { Split-Path -Parent (Split-Path -Parent $_.FullName) } |
-          Sort-Object -Unique
-        $toolkitRoot = $toolkitRoots |
-          Where-Object {
-            (Test-Path (Join-Path $_ 'lib\x64\cudart.lib')) -or
-            (Test-Path (Join-Path $_ 'lib\x64\cublas.lib'))
-          } |
-          Select-Object -First 1
-        if (-not $toolkitRoot) {
-          $toolkitRoot = Split-Path -Parent (Split-Path -Parent $nvccInStage.FullName)
-        }
-        Write-Host "Detected CUDA toolkit root in stage: $toolkitRoot"
-
-        Copy-Item -Path "$toolkitRoot\*" -Destination $root -Recurse -Force
-
-        # Normalize key CUDA libraries from full staged tree into canonical toolkit paths.
-        $libDir = Join-Path $root 'lib\x64'
-        $binDir = Join-Path $root 'bin'
-        $includeDir = Join-Path $root 'include'
-        New-Item -ItemType Directory -Force -Path $libDir | Out-Null
-        New-Item -ItemType Directory -Force -Path $binDir | Out-Null
-        New-Item -ItemType Directory -Force -Path $includeDir | Out-Null
-
-        $requiredImportLibs = @('cudart.lib', 'cublas.lib', 'cublasLt.lib')
-        $optionalImportLibs = @('cudadevrt.lib', 'cudart_static.lib', 'cublas_static.lib', 'cublasLt_static.lib')
-        foreach ($libName in ($requiredImportLibs + $optionalImportLibs)) {
-          $libHit = Get-ChildItem -Path $stageDir -Recurse -File -Filter $libName -ErrorAction SilentlyContinue |
-            Where-Object { $_.FullName -match '(?i)\\lib\\x64\\' } |
-            Sort-Object -Property FullName |
-            Select-Object -First 1
-          if (-not $libHit) {
-            $libHit = Get-ChildItem -Path $stageDir -Recurse -File -Filter $libName -ErrorAction SilentlyContinue |
-              Sort-Object -Property FullName |
-              Select-Object -First 1
-          }
-          if ($libHit) {
-            Copy-Item -Path $libHit.FullName -Destination (Join-Path $libDir $libName) -Force
-            Write-Host "Staged import lib $libName from $($libHit.FullName)"
-          }
-        }
-
-        $runtimeDllPatterns = @('cudart64_*.dll', 'cublas64_*.dll', 'cublasLt64_*.dll')
-        foreach ($pattern in $runtimeDllPatterns) {
-          $dllHit = Get-ChildItem -Path $stageDir -Recurse -File -Filter $pattern -ErrorAction SilentlyContinue |
-            Sort-Object -Property FullName |
-            Select-Object -First 1
-          if ($dllHit) {
-            Copy-Item -Path $dllHit.FullName -Destination (Join-Path $binDir $dllHit.Name) -Force
-            Write-Host "Staged runtime DLL $($dllHit.Name) from $($dllHit.FullName)"
-          }
-        }
-
-        # Ensure cublas and cuda runtime headers exist under canonical include path.
-        $headerNameHints = @('cublas_v2.h', 'cublas_api.h', 'cuda_runtime.h', 'cuda_runtime_api.h', 'cuda_fp16.h', 'cuda_bf16.h')
-        $includeSourceDirs = @()
-        foreach ($hint in $headerNameHints) {
-          $hit = Get-ChildItem -Path $stageDir -Recurse -File -Filter $hint -ErrorAction SilentlyContinue |
-            Sort-Object -Property FullName |
-            Select-Object -First 1
-          if ($hit) {
-            $includeSourceDirs += (Split-Path -Parent $hit.FullName)
-          }
-        }
-        $includeSourceDirs = $includeSourceDirs | Sort-Object -Unique
-        foreach ($srcIncludeDir in $includeSourceDirs) {
-          Write-Host "Merging include tree from $srcIncludeDir into $includeDir"
-          Copy-Item -Path (Join-Path $srcIncludeDir '*') -Destination $includeDir -Recurse -Force
-        }
-
-        $headerNames = @(
-          'cublas_v2.h',
-          'cublas_api.h',
-          'cublasLt.h',
-          'cuda_runtime.h',
-          'cuda_runtime_api.h',
-          'cuda_fp16.h',
-          'cuda_bf16.h',
-          'driver_types.h',
-          'vector_types.h'
+        $packages = @(
+          @{ folder = "cuda_cudart"; file = "cuda_cudart-windows-x86_64-11.4.148-archive.zip" },
+          @{ folder = "cuda_nvcc";   file = "cuda_nvcc-windows-x86_64-11.4.152-archive.zip" },
+          @{ folder = "libcublas";   file = "libcublas-windows-x86_64-11.6.5.2-archive.zip" },
+          @{ folder = "cuda_cccl";   file = "cuda_cccl-windows-x86_64-11.4.122-archive.zip" }
         )
-        foreach ($headerName in $headerNames) {
-          $headerHit = Get-ChildItem -Path $stageDir -Recurse -File -Filter $headerName -ErrorAction SilentlyContinue |
-            Sort-Object -Property FullName |
-            Select-Object -First 1
-          if ($headerHit) {
-            Copy-Item -Path $headerHit.FullName -Destination (Join-Path $includeDir $headerName) -Force
-            Write-Host "Staged header $headerName from $($headerHit.FullName)"
+        New-Item -ItemType Directory -Force -Path $root | Out-Null
+        Push-Location $env:RUNNER_TEMP
+        try {
+          foreach ($pkg in $packages) {
+            $url = "https://developer.download.nvidia.com/compute/cuda/redist/$($pkg.folder)/windows-x86_64/$($pkg.file)"
+            Write-Host "Downloading $url"
+            curl.exe -L -O $url
           }
+          Get-ChildItem -Filter *.zip | ForEach-Object {
+            Write-Host "Extracting $($_.Name)..."
+            Expand-Archive -Path $_.FullName -DestinationPath $root -Force
+          }
+        } finally {
+          Remove-Item *.zip -Force -ErrorAction SilentlyContinue
+          Pop-Location
+        }
+        Get-ChildItem -Path $root -Directory | Where-Object { $_.Name -like '*-archive' } | ForEach-Object {
+          $src = $_.FullName
+          Copy-Item -Path "$src\*" -Destination $root -Recurse -Force
+          Remove-Item $src -Recurse -Force
         }
 
-        $nvcc = Get-ChildItem -Path $root -Recurse -File -Filter nvcc.exe -ErrorAction SilentlyContinue | Select-Object -First 1
-        if (-not $nvcc) {
-          throw "nvcc.exe not found after staging/copy under $root"
+        # Normalize layout: ensure lib\x64 and bin exist and have libraries / dlls
+        $libX64 = Join-Path $root 'lib\x64'
+        New-Item -ItemType Directory -Force -Path $libX64 | Out-Null
+        $binDir = Join-Path $root 'bin'
+        New-Item -ItemType Directory -Force -Path $binDir | Out-Null
+
+        # Copy any .lib from lib/ directly into lib/x64/
+        Get-ChildItem -Path (Join-Path $root 'lib') -File -Filter *.lib -ErrorAction SilentlyContinue | ForEach-Object {
+          Copy-Item $_.FullName -Destination $libX64 -Force
         }
-        foreach ($mustHave in @('lib\x64\cudart.lib', 'lib\x64\cublas.lib')) {
+        # Copy any .dll from lib/ into bin/
+        Get-ChildItem -Path (Join-Path $root 'lib') -File -Filter *.dll -ErrorAction SilentlyContinue | ForEach-Object {
+          Copy-Item $_.FullName -Destination $binDir -Force
+        }
+
+        $nvcc = Join-Path $binDir 'nvcc.exe'
+        if (-not (Test-Path $nvcc)) {
+          throw "nvcc.exe not found under $binDir"
+        }
+        foreach ($mustHave in @('lib\x64\cudart.lib', 'lib\x64\cublas.lib', 'lib\x64\cublasLt.lib')) {
           $mustPath = Join-Path $root $mustHave
           if (-not (Test-Path $mustPath)) {
-            throw "Required CUDA dev library missing after extraction: $mustHave"
+            throw "Required CUDA dev library missing: $mustPath"
           }
         }
         foreach ($mustHeader in @('include\cublas_v2.h', 'include\cublas_api.h', 'include\cuda_runtime.h')) {
           $mustHeaderPath = Join-Path $root $mustHeader
           if (-not (Test-Path $mustHeaderPath)) {
-            throw "Required CUDA header missing after extraction: $mustHeader"
+            throw "Required CUDA header missing: $mustHeaderPath"
           }
         }
-        $nvccDir = Split-Path $nvcc.FullName -Parent
-        echo "$nvccDir" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
-        $cudaBin = Join-Path $root 'bin'
-        if (Test-Path $cudaBin) {
-          echo "$cudaBin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-        }
+        echo "$binDir" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
         echo "CUDA_PATH=$root" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
         echo "CUDA_PATH_V11_4=$root" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 

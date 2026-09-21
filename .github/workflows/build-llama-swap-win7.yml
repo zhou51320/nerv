@@ -2,12 +2,6 @@ name: Build llama-swap Win7
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
-    paths:
-      - '.github/workflows/build-llama-swap-win7.yml'
-      - 'llama-swap/**'
 
 permissions:
   contents: read

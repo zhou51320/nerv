@@ -2,12 +2,6 @@ name: Build ik_llama Win7 Vulkan
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
-    paths:
-      - '.github/workflows/build-ik-llama-win7-vulkan.yml'
-      - 'ik_llama.cpp/**'
 
 permissions:
   contents: read
