@@ -1,13 +1,19 @@
-name: Build Llama Win7 CUDA (sm_61)
+name: Build Llama Win7 CUDA
 
 on:
   workflow_dispatch:
+    inputs:
+      cuda_arch:
+        description: 'CUDA Compute Capability (e.g. 75 for RTX 2080Ti, 61 for GTX 1080)'
+        required: true
+        default: '75'
   push:
     branches:
       - main
     paths:
       - '.github/workflows/build-llama-win7-cuda.yml'
       - '.github/actions/windows-setup-cuda/**'
+      - 'build-llama-win7-cuda.ps1'
       - 'build-win7-cuda-sm61.ps1'
       - 'llama.cpp/**'
 
@@ -16,7 +22,7 @@ permissions:
 
 jobs:
   build-llama-win7-cuda:
-    name: Build llama.cpp (Win7 + CUDA sm_61)
+    name: Build llama.cpp (Win7 + CUDA sm_${{ inputs.cuda_arch || '75' }})
     runs-on: windows-2022
     steps:
       - name: Checkout
@@ -27,7 +33,7 @@ jobs:
       - name: Setup CUDA Toolkit
         uses: ./.github/actions/windows-setup-cuda
         with:
-          cuda_version: '10.2'
+          cuda_version: '11.4'
 
       - name: Configure CUDA environment
         shell: pwsh
@@ -35,7 +41,7 @@ jobs:
           $cudaPath = $env:CUDA_PATH
           if (-not $cudaPath) { throw "CUDA_PATH not set after CUDA installation." }
           if (-not (Test-Path $cudaPath)) { throw "CUDA path '$cudaPath' not found." }
-          "CUDAToolkit_ROOT=$cudaPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CUDAToolkit_ROOT=$cudaPath" | Out-File -FilePath $env:GITHUB_ENV -Append
           if (Test-Path (Join-Path $cudaPath 'bin')) {
             (Join-Path $cudaPath 'bin') | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           }
@@ -86,7 +92,7 @@ jobs:
           $clBanner = (& cl.exe 2>&1 | Select-Object -First 3) -join "`n"
           Write-Host $clBanner
           if (-not $env:VCToolsVersion -or $env:VCToolsVersion -notlike '14.29*') {
-            throw "CUDA 10.2 requires MSVC v142 (14.29.x). Current VCToolsVersion=$env:VCToolsVersion"
+            throw "CUDA 11.4 requires MSVC v142 (14.29.x). Current VCToolsVersion=$env:VCToolsVersion"
           }
 
       - name: Install Ninja
@@ -106,7 +112,7 @@ jobs:
           } else {
             Write-Host "CUDA_PATH is missing or invalid before toolchain check"
           }
-          foreach ($mustHave in @('lib\\x64\\cudart.lib', 'lib\\x64\\cublas.lib', 'include\\cublas_v2.h', 'include\\cublas_api.h', 'include\\cuda_runtime.h')) {
+          foreach ($mustHave in @('lib\\x64\\cudart.lib', 'lib\\x64\\cublas.lib', 'include\\cublas_v2.h', 'include\\cublas_api.h', 'include\\cuda_runtime.h', 'include\\cuda_fp16.h', 'include\\cuda_bf16.h')) {
             $p = Join-Path $env:CUDA_PATH $mustHave
             if (-not (Test-Path $p)) { throw "Missing required CUDA toolkit file: $p" }
             Write-Host "Found $p"
@@ -119,10 +125,12 @@ jobs:
           where.exe nvcc
           nvcc --version
 
-      - name: Build llama.cpp Win7 CUDA sm_61
+      - name: Build llama.cpp Win7 CUDA
         shell: pwsh
         run: |
-          .\build-win7-cuda-sm61.ps1 -Clean -CudaArch 61 -Generator "Ninja"
+          $arch = "${{ inputs.cuda_arch }}"
+          if (-not $arch) { $arch = "75" }
+          .\build-llama-win7-cuda.ps1 -Clean -CudaArch $arch -Generator "Ninja"
 
       - name: Debug build outputs
         if: always()
@@ -203,7 +211,6 @@ jobs:
           if (-not (Test-Path $out)) { throw "Output directory missing: $out" }
           if (-not (Test-Path (Join-Path $out 'llama-server.exe'))) { throw 'llama-server.exe missing' }
           if (-not (Test-Path (Join-Path $out 'llama-quantize.exe'))) { throw 'llama-quantize.exe missing' }
-          if (-not (Test-Path (Join-Path $out 'mtmd.dll'))) { throw 'mtmd.dll missing' }
           if (-not (Test-Path (Join-Path $out 'llama.dll'))) { throw 'llama.dll missing' }
           if (-not (Test-Path (Join-Path $out 'ggml.dll'))) { throw 'ggml.dll missing' }
           if (-not (Test-Path (Join-Path $out 'ggml-base.dll'))) { throw 'ggml-base.dll missing' }
@@ -216,12 +223,14 @@ jobs:
       - name: Package artifact
         shell: pwsh
         run: |
+          $arch = "${{ inputs.cuda_arch }}"
+          if (-not $arch) { $arch = "75" }
           New-Item -ItemType Directory -Force -Path artifacts | Out-Null
-          Compress-Archive -Path 'EVA_BACKEND\x86_64\win7\cuda\llama.cpp' -DestinationPath 'artifacts/llama-win7-cuda-sm61.zip' -Force
+          Compress-Archive -Path 'EVA_BACKEND\x86_64\win7\cuda\llama.cpp' -DestinationPath "artifacts/llama-win7-cuda-sm${arch}.zip" -Force
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: llama-win7-cuda-sm61
-          path: artifacts/llama-win7-cuda-sm61.zip
+          name: llama-win7-cuda-sm${{ inputs.cuda_arch || '75' }}
+          path: artifacts/llama-win7-cuda-sm*.zip
           if-no-files-found: error

@@ -1,7 +1,11 @@
-if (MSVC)
-    unset(GGML_WIN_VER CACHE)
-else()
-    set(GGML_WIN_VER "0x601" CACHE STRING "ggml: Windows version")
+if (NOT DEFINED GGML_WIN_VER)
+    if (NOT MSVC)
+        set(GGML_WIN_VER "0x601" CACHE STRING "ggml: Windows version")
+    endif()
+endif()
+
+if (DEFINED GGML_WIN_VER AND NOT "${GGML_WIN_VER}" STREQUAL "")
+    add_compile_definitions(_WIN32_WINNT=${GGML_WIN_VER} WINVER=${GGML_WIN_VER})
 endif()
 
 cmake_minimum_required(VERSION 3.14...3.28) # for add_link_options and implicit target directories.
