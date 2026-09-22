@@ -8,6 +8,20 @@ if (DEFINED GGML_WIN_VER AND NOT "${GGML_WIN_VER}" STREQUAL "")
     add_compile_definitions(_WIN32_WINNT=${GGML_WIN_VER} WINVER=${GGML_WIN_VER})
 endif()
 
+# YY-Thunks: Windows 7 API compatibility hook for MSVC
+if (MSVC AND WIN32)
+    if (NOT DEFINED YY_THUNKS_OBJ AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/YY-Thunks/objs/x64/YY_Thunks_for_Win7.obj")
+        set(YY_THUNKS_OBJ "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/YY-Thunks/objs/x64/YY_Thunks_for_Win7.obj")
+    endif()
+    if (DEFINED YY_THUNKS_OBJ AND EXISTS "${YY_THUNKS_OBJ}")
+        message(STATUS "Integrating YY-Thunks for Windows 7: ${YY_THUNKS_OBJ}")
+        file(TO_CMAKE_PATH "${YY_THUNKS_OBJ}" YY_THUNKS_OBJ_NORM)
+        set(CMAKE_C_STANDARD_LIBRARIES "\"${YY_THUNKS_OBJ_NORM}\" ${CMAKE_C_STANDARD_LIBRARIES}" CACHE STRING "" FORCE)
+        set(CMAKE_CXX_STANDARD_LIBRARIES "\"${YY_THUNKS_OBJ_NORM}\" ${CMAKE_CXX_STANDARD_LIBRARIES}" CACHE STRING "" FORCE)
+        set(CMAKE_CUDA_STANDARD_LIBRARIES "\"${YY_THUNKS_OBJ_NORM}\" ${CMAKE_CUDA_STANDARD_LIBRARIES}" CACHE STRING "" FORCE)
+    endif()
+endif()
+
 cmake_minimum_required(VERSION 3.14...3.28) # for add_link_options and implicit target directories.
 project("llama.cpp" C CXX)
 include(CheckIncludeFileCXX)

@@ -187,24 +187,6 @@ jobs:
             Write-Host "Bundled $destName from $src"
           }
 
-          $optionalVcDlls = @(
-            'vcruntime140.dll',
-            'vcruntime140_1.dll',
-            'msvcp140.dll',
-            'concrt140.dll',
-            'vcomp140.dll'
-          )
-
-          foreach ($dll in $optionalVcDlls) {
-            $sysPath = Join-Path "$env:WINDIR\System32" $dll
-            if (Test-Path $sysPath) {
-              Copy-Item $sysPath -Destination $out -Force
-              Write-Host "Bundled optional $dll"
-            } else {
-              Write-Host "Optional runtime DLL not found: $dll"
-            }
-          }
-
       - name: Verify binaries
         shell: pwsh
         run: |

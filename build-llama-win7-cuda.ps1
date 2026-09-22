@@ -312,6 +312,13 @@ $defs = @(
   '-DLLAMA_OPENSSL=OFF'
 )
 
+$yyThunksDir = Join-Path (Join-Path $ROOT 'third_party') 'YY-Thunks'
+$yyThunksObj = Join-Path (Join-Path (Join-Path $yyThunksDir 'objs') 'x64') 'YY_Thunks_for_Win7.obj'
+if (Test-Path $yyThunksObj) {
+  $defs += "-DYY_THUNKS_OBJ:FILEPATH=$yyThunksObj"
+  Write-Host "Configured YY-Thunks for Win7: $yyThunksObj"
+}
+
 if ($isVsGen) {
   $vsCudaProps = @(
     'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\MSBuild\Microsoft\VC\v170\BuildCustomizations\CUDA 11.4.props',

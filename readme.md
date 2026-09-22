@@ -194,10 +194,12 @@ inline bool mmap::open(const char *path) {
 - CI：`.github/workflows/build-llama-win7-cuda.yml`（windows-2022 + windows-setup-cuda 11.4 + MSVC v142 14.29）
 - 产物：`EVA_BACKEND/x86_64/win7/cuda/llama.cpp/` 下包含 `llama-server.exe`, `llama-quantize.exe`, `llama-cli.exe`, `llama.dll`, `ggml-cuda.dll` 等，及打包好的 CUDA 运行时（`cudart64_110.dll`、`cublas64_11.dll`、`cublasLt64_11.dll`）和 VC 运行时
 - Win7 兼容适配：
-  - 保持各后端独立性：外部传入 `-DGGML_WIN_VER=0x601` 时通过宏注入 `/D_WIN32_WINNT=0x0601 /DWINVER=0x0601`，自动隔绝 Win8+ API（如 `PrefetchVirtualMemory`、`SetThreadInformation`）；未指定时不影响默认构建
+  - 保持各后端独立性：外部传入 `-DGGML_WIN_VER=0x601` 时通过宏注入 `/D_WIN32_WINNT=0x0601 /DWINVER=0x0601`，自动隔离 Win8+ API（如 `PrefetchVirtualMemory`、`SetThreadInformation`）；未指定时不影响默认构建
+  - 集成 YY-Thunks（`YY_Thunks_for_Win7.obj`）：链接阶段自动挂钩缺失的 Win8+ 系统调用（如 `GetSystemTimePreciseAsFileTime`、`CreateFile2`、`SetThreadDescription` 等），在 Win7 下无缝降级到兼容 API
+  - 避免打包 CI 容器内 Windows Server 2022 的不兼容 VC 运行时 DLL，由目标机上的 VC++ 2015-2022 运行库或 YY-Thunks 提供干净运行时环境
   - 开启 `-DGGML_CUDA_NO_VMM=ON`，避免依赖老驱动层的 CUDA VMM 造成不稳定
   - 关闭 `-DGGML_CUDA_FA=OFF` 与 `-DGGML_CUDA_GRAPHS=OFF`，使用成熟稳定的 cuBLAS / MMQ 矩阵乘法路径
-- 运行要求：目标机安装 Windows 7 最终官方驱动（NVIDIA 472.12 或 474.xx），安装 KB2999226（Universal C Runtime）。直接解压运行即可使用 CUDA 11.4 进行 2080Ti 硬件加速推理。
+- 运行要求：目标机安装 Windows 7 最终官方驱动（NVIDIA 472.12 或 474.xx），安装 KB2999226（Universal C Runtime）及 Visual C++ 2015-2022 x64 运行库。直接解压运行即可使用 CUDA 11.4 进行 2080Ti 硬件加速推理。
 
 ## llama-swap（Win7）
 - 源码：作为普通 vendor 目录存放在 `llama-swap/`
