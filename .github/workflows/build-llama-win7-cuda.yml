@@ -184,8 +184,8 @@ jobs:
           if (-not (Test-Path $out)) { throw "Output directory missing: $out" }
           if (-not (Test-Path $env:CUDA_PATH)) { throw "CUDA_PATH missing: $env:CUDA_PATH" }
 
+          # cudart is linked statically (GGML_STATIC=ON), only cuBLAS DLLs are needed
           $requiredCudaDllPatterns = @(
-            'cudart64_*.dll',
             'cublas64_*.dll',
             'cublasLt64_*.dll'
           )
@@ -212,9 +212,24 @@ jobs:
           if (-not (Test-Path (Join-Path $out 'ggml-base.dll'))) { throw 'ggml-base.dll missing' }
           if (-not (Test-Path (Join-Path $out 'ggml-cpu.dll'))) { throw 'ggml-cpu.dll missing' }
           if (-not (Test-Path (Join-Path $out 'ggml-cuda.dll'))) { throw 'ggml-cuda.dll missing' }
-          if (-not (Get-ChildItem -Path $out -Filter 'cudart64_*.dll' -ErrorAction SilentlyContinue)) { throw 'cudart64_*.dll missing' }
           if (-not (Get-ChildItem -Path $out -Filter 'cublas64_*.dll' -ErrorAction SilentlyContinue)) { throw 'cublas64_*.dll missing' }
           if (-not (Get-ChildItem -Path $out -Filter 'cublasLt64_*.dll' -ErrorAction SilentlyContinue)) { throw 'cublasLt64_*.dll missing' }
+
+      - name: Check Win7 import compatibility
+        shell: pwsh
+        run: |
+          # Win7 lacks most api-ms-win-core-* api-sets (api-ms-win-crt-* is provided by KB2999226 UCRT)
+          $out = 'EVA_BACKEND\x86_64\win7\cuda\llama.cpp'
+          $bad = @()
+          Get-ChildItem -Path $out -File | Where-Object { $_.Extension -in '.exe', '.dll' } | ForEach-Object {
+            $deps = & dumpbin /nologo /dependents $_.FullName | Where-Object { $_ -match '^\s+(api-ms-win-core-\S+\.dll)' } | ForEach-Object { $Matches[1] }
+            foreach ($d in $deps) { $bad += "$($_.Name) -> $d" }
+          }
+          if ($bad.Count -gt 0) {
+            $bad | ForEach-Object { Write-Warning $_ }
+            throw 'Found Win8+ api-set imports that are missing on Windows 7'
+          }
+          Write-Host 'No api-ms-win-core-* imports found.'
 
       - name: Package artifact
         shell: pwsh

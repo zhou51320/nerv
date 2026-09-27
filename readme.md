@@ -188,21 +188,39 @@ inline bool mmap::open(const char *path) {
 - 目标机使用：`main.exe` 交互对话、`quant.exe` 量化、`fastllm-apiserver.exe` OpenAI 兼容 HTTP server（自带 winsock 网络栈，无需外部依赖）
 
 ## llama.cpp（Win7 CUDA / sm_75 / 2080Ti）
-- 目标环境：Windows 7 x64 SP1 + NVIDIA 官方 472.xx / 474.xx 驱动 + RTX 2080 Ti (sm_75) + CUDA 11.4
+2080Ti 在 Win7 上的主力后端（prefill 约为 Vulkan 的 3 倍，decode 持平或更快），Vulkan 作为备选持续关注。
+- 目标环境：Windows 7 x64 SP1 + NVIDIA 官方 472.xx / 474.xx 驱动（R470，最高支持 CUDA 11.x，**无法使用 CUDA 12**）+ RTX 2080 Ti (sm_75)
 - 构建脚本：`build-llama-win7-cuda.ps1 -Clean -CudaArch 75 -Generator Ninja`（亦可通过 `-CudaArch 61` 兼容 Pascal 卡）
 - 兼容旧脚本：`build-win7-cuda-sm61.ps1` 转发调用该统一脚本
-- CI：`.github/workflows/build-llama-win7-cuda.yml`（windows-2022 + windows-setup-cuda 11.4 + MSVC v142 14.29）
-- 产物：`EVA_BACKEND/x86_64/win7/cuda/llama.cpp/` 下包含 `llama-server.exe`, `llama-quantize.exe`, `llama-cli.exe`, `llama.dll`, `ggml-cuda.dll` 等，及打包好的 CUDA 运行时（`cudart64_110.dll`、`cublas64_11.dll`、`cublasLt64_11.dll`）和 VC 运行时
-- Win7 兼容适配：
-  - 保持各后端独立性：外部传入 `-DGGML_WIN_VER=0x601` 时通过宏注入 `/D_WIN32_WINNT=0x0601 /DWINVER=0x0601`，自动隔离 Win8+ API（如 `PrefetchVirtualMemory`、`SetThreadInformation`）；未指定时不影响默认构建
-  - 集成 YY-Thunks（`YY_Thunks_for_Win7.obj`）：链接阶段自动挂钩缺失的 Win8+ 系统调用（如 `GetSystemTimePreciseAsFileTime`、`CreateFile2`、`SetThreadDescription` 等），在 Win7 下无缝降级到兼容 API
-  - 避免打包 CI 容器内 Windows Server 2022 的不兼容 VC 运行时 DLL，由目标机上的 VC++ 2015-2022 运行库或 YY-Thunks 提供干净运行时环境
-  - 开启 `-DGGML_CUDA_NO_VMM=ON`，避免依赖老驱动层的 CUDA VMM 造成不稳定
-  - 开启 `-DGGML_CUDA_FA=ON` + `-DGGML_CUDA_FA_QUANTS=all`（Turing 走 mma-f16 Tensor Core 路径，支持任意 KV cache 量化组合）
-  - 开启 `-DGGML_CUDA_GRAPHS=ON`（CUDA 11.4 走 `cudaGraphExecUpdate` 旧签名分支）；如遇显存随对话增长或异常，运行时设 `GGML_CUDA_DISABLE_GRAPHS=1` 关闭
-  - CI 可选 `cuda_version=11.7`：启用 CUB（ne0>1024 的 ARGSORT/TOP_K 可在 GPU 执行），Win7 下运行未验证，默认仍为 11.4
-  - 运行建议：`-fa on`，KV cache `-ctk q8_0 -ctv q8_0`；Win7 驱动无显存回落，爆显存直接 OOM，需预留余量或减小 `-ub`
-- 运行要求：目标机安装 Windows 7 最终官方驱动（NVIDIA 472.12 或 474.xx），安装 KB2999226（Universal C Runtime）及 Visual C++ 2015-2022 x64 运行库。直接解压运行即可使用 CUDA 11.4 进行 2080Ti 硬件加速推理。
+- CI：`.github/workflows/build-llama-win7-cuda.yml`（windows-2022 + windows-setup-cuda + MSVC v142 14.29），push 时同时编译 CUDA 11.4 与 11.7，手动触发可指定单个版本；构建后检查所有 exe/dll 不含 `api-ms-win-core-*` 导入
+- 产物：`EVA_BACKEND/x86_64/win7/cuda/llama.cpp/` 下包含 `llama-server.exe`, `llama-quantize.exe`, `llama-cli.exe`, `llama.dll`, `ggml-cuda.dll` 等，及 `cublas64_11.dll`、`cublasLt64_11.dll`（cudart 已静态链接进 `ggml-cuda.dll`）
+- 运行要求：目标机安装 NVIDIA 472.12 或 474.xx 驱动、KB2999226（Universal C Runtime）及 Visual C++ 2015-2022 x64 运行库；**不需要安装 CUDA Toolkit**（反而可能因 PATH 中的 cudart/cublas 版本冲突导致加载错误）
+
+### Win7 兼容适配
+- 外部传入 `-DGGML_WIN_VER=0x601` 时通过宏注入 `/D_WIN32_WINNT=0x0601 /DWINVER=0x0601`，自动隔离 Win8+ API（如 `PrefetchVirtualMemory`、`SetThreadInformation`）；未指定时不影响默认构建
+- 集成 YY-Thunks（`YY_Thunks_for_Win7.obj`）：链接阶段挂钩缺失的 Win8+ 系统调用（如 `GetSystemTimePreciseAsFileTime`、`CreateFile2`、`SetThreadDescription`）
+- 不打包 CI 容器内 Windows Server 2022 的 VC 运行时 DLL，由目标机 VC++ 2015-2022 运行库提供
+- `-DGGML_STATIC=ON`：MSVC 下只作用于 cudart（改为 `cudart_static`）。CUDA 11.7 的 `cudart64_110.dll` 通过 `api-ms-win-core-libraryloader-l1-2-0.dll` 等 Win8+ api-set 导入 `LoadLibraryExW` 等函数，Win7 启动报 DLL 缺失；静态链接后直接从 KERNEL32 导入，不再需要 VxKex
+- `-DGGML_CUDA_NO_VMM=ON`：不依赖老驱动的 CUDA VMM
+
+### 编译期优化
+- `-DGGML_CUDA_GRAPHS=ON`：整图一次提交，大幅降低 Win7 WDDM 下的 kernel 发射开销，MoE decode 从约 40-45 t/s 提升到与 Vulkan 持平（70+ t/s），也让 MTP 可以用更大的 draft。CUDA 11.x 走 `cudaGraphExecUpdate` 旧签名分支。已知问题：显存可能随对话轮数上涨（上游 #25835），遇到时运行前设 `GGML_CUDA_DISABLE_GRAPHS=1`
+- `-DGGML_CUDA_FA=ON` + `-DGGML_CUDA_FA_QUANTS=all`：Turing 走 mma-f16 Tensor Core 路径，K/V 可用任意量化组合（如 K=q8_0、V=q4_0）
+- **优先使用 CUDA 11.7 产物**：11.7 起启用 CUB，词表级（ne0>1024）的 TOP_K/ARGSORT 可在 GPU 执行。11.4 下 MTP 默认的 draft backend sampling 会因 TOP_K 不支持而回落 CPU 并拆图（Qwen3.x 27B Q3 仅 3-4 t/s），11.4 只能加 `--no-spec-draft-backend-sampling` 规避
+- 不开 `GGML_CUDA_FORCE_MMQ`（Turing 默认已走 MMQ）与 `GGML_CUDA_FORCE_CUBLAS`（显存更高且有 fp16 溢出风险）
+- CUDA 11.8 相比 11.7 只多 `movmatrix`（FA/MMA 略快），收益很小；PDL 在 MSVC 下需 CUDA ≥ 12.3，Win7 不可用
+
+### 运行期优化（2080Ti 22G 实测参考：Qwen3.5-35B MoE 11.7 prefill ~1620 t/s、decode ~77 t/s；27B 稠密 UD-Q4 + MTP decode 32-34 t/s）
+- 全量放显存：`-ngl 99`；放不下时用 `-ncmoe N` 或 `-ot "exps=CPU"` 只把部分 MoE 专家放 CPU，不要让 llama.cpp 自动减层
+- Flash Attention + KV 量化：`-fa on -ctk q8_0 -ctv q4_0`（或 `-ctv q8_0` 换精度）
+- MTP 投机解码：`--spec-type draft-mtp --spec-draft-n-max 2`。开 graphs 后 CUDA 上 2 最快（接受率约 63%）；Vulkan / 不开 graphs 时 1 最快（Win7 每次提交开销大，draft 越多越慢）
+- 长 prompt prefill：MoE 可试 `-b 2048 -ub 1024`（或 2048）提高 MMQ 批量，代价是计算缓冲显存增加；爆显存时减小 `-ub`
+- 多轮对话复用：`--cache-reuse 256`；Qwen3.5 这类混合（线性注意力）模型保留默认 `--ctx-checkpoints`，避免每轮重算整段 prompt
+- 单用户使用时 `-np 1`，把 KV 和计算缓冲留给单个会话
+- 可选实验：`GGML_CUDA_GRAPH_OPT=1`（graph 内可并行分支走多 stream，MoE 可能再有少量提升，异常就关）
+- 功耗：140W 限功耗主要影响 prefill 和稠密模型 decode；默认 250-260W 下稠密模型 decode 更高
+- Win7 驱动没有"系统内存回落"，显存不够直接 OOM，需给 KV 和计算缓冲预留余量
+- Turing 无 bf16 Tensor Core：bf16 权重的模型请转 f16 或量化
 
 ## llama.cpp（Win7 Vulkan / 2080Ti）
 - CI：`.github/workflows/build-llama-win7-vulkan.yml`（MinGW 静态链接 + Vulkan SDK 1.3.290，push `llama.cpp/**` 或手动触发）

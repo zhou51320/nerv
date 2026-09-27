@@ -296,6 +296,8 @@ $defs = @(
   '-DCMAKE_CUDA_HOST_COMPILER:FILEPATH=cl.exe',
   "-DCMAKE_CUDA_ARCHITECTURES=$CudaArch",
   '-DGGML_CUDA=ON',
+  # MSVC 下 GGML_STATIC 只把 cudart 改为静态链接：CUDA 11.7+ 的 cudart64_110.dll 导入 Win8+ api-set（api-ms-win-core-libraryloader-l1-2-0 等），Win7 缺失
+  '-DGGML_STATIC=ON',
   '-DGGML_CUDA_NO_VMM=ON',
   '-DGGML_CUDA_FA=ON',
   '-DGGML_CUDA_FA_ALL_QUANTS=ON',
