@@ -9,6 +9,12 @@
 #include "devices/cpu/cpudevice.h"
 
 namespace fastllm {
+    // Plan local CPU sets for CUDA submission, excluding expert-worker cores
+    // and respecting the caller's affinity. Empty sets preserve OS placement.
+    std::vector<std::vector<int>> GetNumasCudaWorkerCpuSets(
+        const std::vector<int> &devices);
+    bool BindNumasWorkerCpuSet(const std::vector<int> &cpus);
+
     class NumasDevice : BaseDevice {
     public:
         NumasDevice();
@@ -60,7 +66,22 @@ namespace fastllm {
     bool CanRunNumasMoeDecodeExperts(Data *const *weights, int weightsBatch);
     void NumasMoeDecodeExperts(const float *input, float *output,
         Data **weights, const int32_t *indices, const int32_t *gpuIndices,
-        int topk, int layer);
+        int topk, int layer, const float *routeScores = nullptr,
+        float swigluLimit = 0.0f);
+
+    // FP32 verifier subset, returning unweighted [row, route, hidden] values.
+    // An expert must have the same CPU/GPU ownership in every input row.
+    void NumasMoeDecodeExpertsBatch(const float *input, float *output, int rows,
+        Data **weights, int weightsBatch, const int32_t *indices,
+        const int32_t *gpuIndices, const float *scores, int topk, int layer);
+
+    // V4.1 verifier: keep all rows for a CPU expert in one grouped GEMM.
+    // perRoute returns BF16-rounded FP32 expert outputs at [row, route, hidden];
+    // otherwise all routes must be on CPU and output is the usual BF16 sum.
+    void NumasMoeVerifyExperts(const uint16_t *input, void *output, int rows,
+        Data **weights, int weightsBatch, const int32_t *indices,
+        const int32_t *gpuIndices, const float *scores, int topk, int layer,
+        float swigluLimit, bool perRoute);
 
     // NUMA MoE keeps reusable host/CUDA staging buffers outside the model.
     // Release them explicitly while the CUDA allocator is still alive.
@@ -69,6 +90,7 @@ namespace fastllm {
     // Keep this bound aligned with the NUMA grouped-decode path.  It is an
     // algorithmic limit rather than a device-specific tuning parameter.
     constexpr int kNumasMoePrefetchMaxRows = 8;
+    constexpr int kNumasMoeGpuPrefillMinRows = 32;
 
     // Whether the active CPU kernels can preserve one-token decode arithmetic
     // for a grouped MoE batch of this size.

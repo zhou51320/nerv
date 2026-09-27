@@ -4,6 +4,7 @@
 
 #include "basellm.h"
 #include "utils.h"
+#include "utils/cuda_cache_budget.h"
 #include <sstream>
 #include <cstring>
 #include <cstdlib>
@@ -184,6 +185,8 @@ namespace fastllm {
 
             static const std::vector<std::string> dsmlParameterCloseTags = {
                     "</｜DSML｜parameter>",
+                    "</｜DSML｜ parameter>",
+                    "</\\DSML\\ parameter>",
                     "</\\DSML\\parameter>",
             };
             auto closePos = FindLastNeedleBefore(
@@ -251,6 +254,8 @@ namespace fastllm {
             }
             static const std::vector<std::string> dsmlInvokeCloseTags = {
                 "</｜DSML｜invoke>",
+                "</｜DSML｜ invoke>",
+                "</\\DSML\\ invoke>",
                 "</\\DSML\\invoke>",
             };
             auto closePos = FindLastNeedleBefore(
@@ -508,7 +513,9 @@ namespace fastllm {
     }
 
     void basellm::TryRecordResponseContext(ResponseContext *context) {
-        if (context == nullptr) {
+        // These caches are keyed only by token IDs. Media placeholders do not
+        // identify their pixels, embeddings, or multimodal position state.
+        if (context == nullptr || !context->multimodalInput.empty()) {
             return;
         }
         this->TryRecordHistoryCache(context->allTokens);
@@ -518,21 +525,25 @@ namespace fastllm {
     }
 
     void basellm::PrepareToolCallConstraint(ResponseContext *context, GenerationConfig &generationConfig) {
+        generationConfig.tool_call_generated_text = context ? context->toolCallConstraintGeneratedText : "";
+        PrepareToolCallConstraint(generationConfig);
+    }
+
+    void basellm::PrepareToolCallConstraint(GenerationConfig &generationConfig) {
         generationConfig.tool_call_allowed_token_ids.clear();
-        if (context == nullptr ||
-            (!generationConfig.tool_call_name_constraint_enabled &&
-             !generationConfig.tool_call_parameter_name_constraint_enabled)) {
+        if (!generationConfig.tool_call_name_constraint_enabled &&
+            !generationConfig.tool_call_parameter_name_constraint_enabled) {
             return;
         }
         std::string partial;
         std::vector<std::string> allowedValues;
         if (!FindActiveToolCallParameterNamePartial(
-                    context->toolCallConstraintGeneratedText,
+                    generationConfig.tool_call_generated_text,
                     generationConfig,
                     partial,
                     allowedValues)) {
             if (!FindActiveToolCallNamePartial(
-                        context->toolCallConstraintGeneratedText,
+                        generationConfig.tool_call_generated_text,
                         generationConfig,
                         partial)) {
                 return;
@@ -568,12 +579,14 @@ namespace fastllm {
             tokenId < 0) {
             return;
         }
-        context->toolCallConstraintGeneratedText += this->weight.tokenizer.DecodeTokens(std::vector<int>{tokenId});
+        AdvanceToolCallConstraintText(context->toolCallConstraintGeneratedText, tokenId);
+    }
+
+    void basellm::AdvanceToolCallConstraintText(std::string &text, int tokenId) {
+        if (tokenId < 0) return;
+        text += this->weight.tokenizer.DecodeTokens(std::vector<int>{tokenId});
         const size_t maxTrackedBytes = 8192;
-        if (context->toolCallConstraintGeneratedText.size() > maxTrackedBytes) {
-            context->toolCallConstraintGeneratedText.erase(
-                    0, context->toolCallConstraintGeneratedText.size() - maxTrackedBytes);
-        }
+        if (text.size() > maxTrackedBytes) text.erase(0, text.size() - maxTrackedBytes);
     }
 
     void basellm::RemoveResponseContext(int handleId) {
@@ -585,6 +598,9 @@ namespace fastllm {
     }
 
     void ResponseContext::TryRecordPagedCache(basellm *model) {
+        if (!this->multimodalInput.empty()) {
+            return;
+        }
         bool hasLinearAttentionCache = false;
         bool hasBoundedAttentionCache = false;
         for (int i = 0; i < (int)this->pastKeyValues.size(); i++) {
@@ -1891,7 +1907,7 @@ namespace fastllm {
                     }
 
                     if (isPrompt) {
-                        if (ctx->cacheLen == 0 &&
+                        if (!isMultimodal && ctx->cacheLen == 0 &&
                             ctx->intParams.find("paged_prefix_restore_disabled") ==
                                 ctx->intParams.end()) {
                             PagedCacheManager *probeManager = nullptr;
@@ -2803,6 +2819,7 @@ namespace fastllm {
                         std::vector <std::pair <Data*, Data*> > pastKeyValues;
                         std::vector <float> ids;
                         std::vector <int> seqLens;
+                        int prefillTokens = 0;
                         std::vector <int> handles;
                         std::vector <GenerationConfig> generationConfigs;
                         LastTokensManager tokensManager;
@@ -2969,6 +2986,9 @@ namespace fastllm {
                                 ToDataType(attentionMask, model->dataType);
 
                                 seqLens.push_back(inputIds.Count(0));
+                                if (isPrompt) {
+                                    prefillTokens += seqLens.back();
+                                }
                                 for (int i = 0; i < inputIds.Count(0); i++) {
                                     ids.push_back(((float *) inputIds.cpuData)[i]);
                                 }
@@ -3012,7 +3032,11 @@ namespace fastllm {
                             dictLocker.unlock();
                             forwardLocker.lock();
 #ifdef USE_CUDA
-                            FastllmCudaClearBigBuffer();
+                            if (model->RetainCudaWorkspace()) {
+                                FastllmCudaTrimBigBuffer();
+                            } else {
+                                FastllmCudaClearBigBuffer();
+                            }
 #endif
                             Data inputIds = Data(DataType::FLOAT32, {1, (int) ids.size()}, ids);
                             std::vector<int> ret;
@@ -3021,6 +3045,7 @@ namespace fastllm {
                                 profileStartTime = std::chrono::system_clock::now();
                                 ClearProfiler();
                             }
+                            auto prefillStartTime = std::chrono::steady_clock::now();
                             if (seqLens.size() > 1) {
                                 if (!model->canDoBatchForward) {
                                     dictLocker.lock();
@@ -3046,15 +3071,7 @@ namespace fastllm {
                                 if (seqLens[0] > first) {
                                     int len = seqLens[0];
                                     for (int st = 0; st < len; ) {
-                                        if (model->verbose) {
-                                            genTokens += seqLens.size();
-                                            auto nowTime = std::chrono::system_clock::now();
-                                            float spend = GetSpan(lastRecordTime, nowTime);
-                                            if (spend > 1) {
-                                                printf("Long Prefill ... (%d%%)\n", st * 100 / len);
-                                                lastRecordTime = nowTime;
-                                            }
-                                        }
+                                        auto chunkStartTime = std::chrono::steady_clock::now();
                                         int curLen = std::min(st == 0 ? first : part, len - st);
                                         Data curInput, curPositionIds;
                                         Split(inputIds, 1, st, st + curLen, curInput);
@@ -3063,6 +3080,13 @@ namespace fastllm {
                                         ret = std::vector <int> {model->Forward(curInput, Data(), curPositionIds,
                                             *pastKeyValue1, generationConfigs[0], tokensManager, logits[0])};
                                         st += curLen;
+                                        if (model->verbose) {
+                                            double spend = std::chrono::duration<double>(
+                                                std::chrono::steady_clock::now() - chunkStartTime).count();
+                                            printf("[Prompt] Long Prefill ... (%d/%d, %d%%). Speed: %.2f tokens / s.\n",
+                                                   st, len, st * 100 / len, spend > 0 ? curLen / spend : 0);
+                                            fflush(stdout);
+                                        }
                                     }
                                 } else {
                                     auto context = model->responseContextDict.dicts.begin()->second;
@@ -3079,6 +3103,13 @@ namespace fastllm {
                                     }
                                 }
                             }
+                            if (model->verbose && prefillTokens > 0) {
+                                double spend = std::chrono::duration<double>(
+                                    std::chrono::steady_clock::now() - prefillStartTime).count();
+                                printf("[Prompt] %d Tokens. Time: %.3f s. Speed: %.2f tokens / s.\n",
+                                       prefillTokens, spend, spend > 0 ? prefillTokens / spend : 0);
+                                fflush(stdout);
+                            }
                             if (printProfile) {
                                 PrintLoopProfile("old", seqLens, (int)ret.size(), profileStartTime);
                             }
@@ -3086,8 +3117,13 @@ namespace fastllm {
                             dictLocker.lock();
 
                             if (model->verbose) {
-                                genTokens += seqLens.size();
                                 auto nowTime = std::chrono::system_clock::now();
+                                if (prefillTokens > 0) {
+                                    lastRecordTime = nowTime;
+                                    genTokens = 0;
+                                } else {
+                                    genTokens += seqLens.size();
+                                }
                                 float spend = GetSpan(lastRecordTime, nowTime);
                                 if (spend > 1) {
                                     int total = 0, alive = 0, aliveLen = 0, pending = 0;
@@ -3187,9 +3223,15 @@ namespace fastllm {
         context->multimodalInput = multimodalInput;
         context->tokens = LastTokensUnit(generationConfig.last_n);
 
-        bool restoredNativeHistory = this->TryRestoreHistoryCache(context->currentTokens, context->cacheLen);
+        // A restored text prefix can bypass the multimodal prefill path, while
+        // a restored media prefix may belong to different images with the same
+        // placeholder tokens. Keep request-local KV reuse, but do not restore
+        // cross-request token-only caches for multimodal prompts.
+        bool allowHistoryCache = context->multimodalInput.empty();
+        bool restoredNativeHistory = allowHistoryCache &&
+            this->TryRestoreHistoryCache(context->currentTokens, context->cacheLen);
 
-        auto cache = restoredNativeHistory || !this->UseGenericHistoryCache() ?
+        auto cache = !allowHistoryCache || restoredNativeHistory || !this->UseGenericHistoryCache() ?
                      std::make_pair((PastKVCacheMemory*)nullptr, 0) :
                      pastKVCacheManager.Get(inputTokens);
         if (cache.first != nullptr && cache.second > 0) {
@@ -4643,14 +4685,14 @@ namespace fastllm {
                 int budgetPercent = std::max(
                     1, std::min(100,
                                 this->GetAutoWarmupLinearAttentionBatchBudgetPercent()));
-                FASTLLM_I128 budget = (FASTLLM_I128)avail * budgetPercent / 100;
+                __int128 budget = (__int128)avail * budgetPercent / 100;
                 int low = 0, high = getBaseBatchLimit();
                 while (low < high) {
                     int mid = low + (high - low + 1) / 2;
                     long long runtimeReserve = std::max(
                         0LL, this->GetAutoWarmupCudaRuntimeReserveBytes(id, mid));
-                    FASTLLM_I128 fixedNeed = (FASTLLM_I128)mid * linearBytesOnDevice +
-                                         (FASTLLM_I128)runtimeReserve;
+                    __int128 fixedNeed = (__int128)mid * linearBytesOnDevice +
+                                         (__int128)runtimeReserve;
                     if (fixedNeed <= budget) {
                         low = mid;
                     } else {
@@ -4704,17 +4746,8 @@ namespace fastllm {
             auto freeSizes = FastllmCudaGetFreeSizes();
             auto totalSizes = FastllmCudaGetTotalSizes();
             auto getCudaRuntimeHeadroom = [&](int id, long long avail) -> long long {
-                if (avail <= 0) {
-                    return 0;
-                }
-
-                long long headroom = 512LL * 1024LL * 1024LL;
-                if (id >= 0 && id < (int)totalSizes.size()) {
-                    headroom = std::max(headroom, totalSizes[id] / 100);
-                }
-                headroom = std::min(headroom, 2LL * 1024LL * 1024LL * 1024LL);
-                headroom = std::min(headroom, avail / 4);
-                return std::max(0LL, headroom);
+                return CudaCacheRuntimeHeadroom(
+                    id >= 0 && id < (int)totalSizes.size() ? totalSizes[id] : 0, avail);
             };
             auto fitPagesWithLinearReserve = [&](int id, long long avail, long long kvBytesPerPage) -> int {
                 if (avail <= 0 || kvBytesPerPage <= 0) {
@@ -4748,10 +4781,10 @@ namespace fastllm {
                 while (low < high) {
                     long long mid = (low + high + 1) / 2;
                     long long activeBatch = std::min<long long>(batchLimit, mid);
-                    FASTLLM_I128 need = (FASTLLM_I128)mid * kvBytesPerPage +
-                                    (FASTLLM_I128)mid * delayedCacheBytesPerPage +
-                                    (FASTLLM_I128)activeBatch * linearBytesOnDevice +
-                                    (FASTLLM_I128)runtimeReserveBytes(activeBatch);
+                    __int128 need = (__int128)mid * kvBytesPerPage +
+                                    (__int128)mid * delayedCacheBytesPerPage +
+                                    (__int128)activeBatch * linearBytesOnDevice +
+                                    (__int128)runtimeReserveBytes(activeBatch);
                     if (need <= avail) {
                         low = mid;
                     } else {
@@ -5104,15 +5137,43 @@ namespace fastllm {
                         }
                         long long delayedReservePerPage =
                             deviceDelayedCacheBytesPerPage.count(id) ? deviceDelayedCacheBytesPerPage[id] : 0;
+                        if (servingFootprintMaterialized) {
+                            // The provisional estimate allows one late KV layer.
+                            // Release it only after verifying every local K/V
+                            // manager has the full calibrated allocation. Extra
+                            // model-specific caches (e.g. MTP) keep their reserve.
+                            int allocatedLayers = 0;
+                            for (int layer = 0; layer < block_cnt; ++layer) {
+                                if (layerElementsPerToken[layer] <= 0) continue;
+                                bool keyReady = false, valueReady = false;
+                                for (bool isKey : {true, false}) {
+                                    auto managers = this->GetPagedKVCacheManagers(layer, isKey);
+                                    for (auto &entry : managers) {
+                                        auto *manager = entry.second;
+                                        if (entry.first == id && manager != nullptr &&
+                                            manager->cudaData != nullptr &&
+                                            manager->maxPages >= currentPages) {
+                                            (isKey ? keyReady : valueReady) = true;
+                                        }
+                                    }
+                                }
+                                if (keyReady && valueReady) ++allocatedLayers;
+                            }
+                            if (allocatedLayers > 0 &&
+                                allocatedLayers == deviceLayerCount[id]) {
+                                delayedReservePerPage = std::max(0LL,
+                                    this->GetAutoWarmupCudaAdditionalCacheBytesPerToken(id)) * pageLen;
+                            }
+                        }
                         delayedReservePerPage = std::max(0LL, delayedReservePerPage);
                         long long bytesPerFinalPage = bytesPerPageOnDevice + delayedReservePerPage;
                         if (bytesPerFinalPage <= 0) {
                             continue;
                         }
-                        FASTLLM_I128 freedCurrentCacheBytes =
-                            (FASTLLM_I128)currentPages * bytesPerPageOnDevice;
-                        FASTLLM_I128 finalPageBudget =
-                            (FASTLLM_I128)freeAfterWarmup[id] + freedCurrentCacheBytes - targetFree;
+                        __int128 freedCurrentCacheBytes =
+                            (__int128)currentPages * bytesPerPageOnDevice;
+                        __int128 finalPageBudget =
+                            (__int128)freeAfterWarmup[id] + freedCurrentCacheBytes - targetFree;
                         long long pages = finalPageBudget > 0 ?
                             (long long)(finalPageBudget / bytesPerFinalPage) : 0;
                         pages = std::min<long long>(

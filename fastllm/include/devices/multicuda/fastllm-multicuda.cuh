@@ -64,6 +64,8 @@ void FastllmNcclAllReduce(void* data, void* dest, int count, int dataType, int d
 // Runs NCCL directly, bypassing the graph-safe custom all-reduce. Large TP
 // prefill tensors can be bandwidth-bound on the direct-peer implementation
 // even though it is faster for decode tensors.
+// Multi-rank eager calls rendezvous before and after NCCL host submission;
+// callers do not need another pair of host barriers. Capture bypasses both.
 void FastllmNcclAllReduceNoCustom(void* data, void* dest, int count, int dataType, int deviceId);
 // Requires an initialized TP communicator and matching submissions on every rank.
 bool FastllmNcclAllGather(const void* data, void* dest, int count, int dataType, int deviceId);
@@ -166,4 +168,15 @@ namespace fastllm {
     // can be captured by a multi-device CUDA Graph.
     bool MultiCudaRepeatToReplicated(Data &input, int axis, int repeatTimes,
                                      Data &output);
+    bool MultiCudaDeepSeekV41SharedSwiglu(Data &input, float limit, Data &output);
+    // Copy a dense activation replica directly to owned CPU storage. Returns
+    // false without changing either tensor when the layout requires CopyFrom.
+    bool MultiCudaCopyReplicaToCpu(Data &dst, const Data &src,
+                                    const std::vector<int> &devices);
+    // Run the original AddTo and HcPost kernels in one rank-local dispatch.
+    // Retains the intermediate dtype rounding; false means no add was executed.
+    // A compact CPU input is copied on each worker's stream;
+    // the synchronous copy stages its source before the callback returns.
+    bool MultiCudaDeepSeekV41AddHcPost(Data &input, Data &shared, Data &residual,
+                                      Data &post, Data &comb, Data &output);
 }

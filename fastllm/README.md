@@ -264,7 +264,7 @@ CLI 会持续演进，`ftllm <command> --help` 是当前安装版本的最终依
 | --- | --- |
 | `model` / `-p, --path` | Hugging Face 仓库 ID、本地 HF 目录、FastLLM 模型文件或配置文件 |
 | `--device` | 主计算设备，常用值为 `cpu`、`cuda`、`numa` |
-| `--vision_device` | Qwen3.5 视觉编码器设备：`auto`（默认，首个前向 GPU）、`cpu`、`cuda`、`cuda:N`；`cpu` 时视觉塔权重常驻内存，省显存但编码变慢 |
+| `--vision_device` | Qwen3.5 视觉编码器设备：`auto`（默认）、`cpu`、`cuda`、`cuda:N`；多卡 CUDA 跟随普通 TP，`cuda:N` 不单独覆盖；`cpu` 时视觉塔权重常驻内存，省显存但编码变慢 |
 | `--tp` | CUDA 张量并行设备；支持 `0,1`、`2` 或 `auto` |
 | `--moe_device` | MoE 专家层设备，可使用 `cpu`、`cuda`、`numa`、`disk` 或按比例组合 |
 | `--moe_device_layers` | 仅让最后 N 个 MoE 层使用 `--moe_device`；`-1` 表示全部 |
@@ -281,7 +281,8 @@ CLI 会持续演进，`ftllm <command> --help` 是当前安装版本的最终依
 | 参数 | 默认值 | 说明 |
 | --- | ---: | --- |
 | `--gpu_mem_ratio` | `0.9` | 可用于模型与缓存的 GPU 显存比例 |
-| `--moe_cuda_cache` / `--moe-cuda-cache` | `0` | GPU 专家权重缓存预算，例如 `3g`（3 GiB）；`0` 关闭。配合 CUDA 主计算与 CPU/NUMA 专家使用，KV Cache、普通权重及工作区另算；见[专家缓存说明](docs/cuda-expert-cache.md) |
+| `--moe_cuda_cache` / `--moe-cuda-cache` | `0` | GPU 专家权重缓存预算，例如 `3g`（3 GiB）；`0` 关闭。配合 CUDA 主计算与 CPU/NUMA/disk 专家使用，KV Cache、普通权重及工作区另算；见[专家缓存说明](docs/cuda-expert-cache.md) |
+| `--moe_cpu_cache` / `--moe-cpu-cache` | `0` | `--moe_device disk` 的专家内存缓存总预算，例如 `32g`；可与显存专家缓存同时使用，见[磁盘多级缓存](docs/cuda-expert-cache.md#disk-backed-multilevel-cache) |
 | `--kv_cache_limit` | `auto` | KV Cache 最大使用量 |
 | `--tokens` | 自动 | 用于计算 Paged KV Cache 容量的总 token 数 |
 | `--page_size` | 后端决定 | Paged KV Cache 每页 token 数；多卡默认通常为 16 |
@@ -301,6 +302,7 @@ CLI 会持续演进，`ftllm <command> --help` 是当前安装版本的最终依
 | --- | --- |
 | `--enable_thinking` | 控制模型的思考模板开关，需要模型支持 |
 | `--mtp` | 支持 MTP 的模型每轮生成的 draft token 数，`0` 关闭，当前最大为 8 |
+| `--mtp_fp8_draft_head` / `--mtp-fp8-draft-head` | Qwen3.5 系列多卡 MTP 的 FP8 draft 输出头开关：`1` 开启，`0` 复用原输出头以节省显存，可能降低生成速度；不改变 MTP draft 数。显式参数优先于 `FASTLLM_MTP_FP8_DRAFT_HEAD`，未指定时沿用环境变量，默认开启 |
 | `--dspark` | 启用模型内置 DSpark，并设置每轮 draft token 数 |
 | `--draft` / `--draft_model_path` | 外部 MTP/DSpark/DFlash draft checkpoint；根据配置自动识别算法，MTP 可直接指定 `mtp.safetensors` |
 | `--draft_tokens` | 每轮最多使用的 draft token 数；未指定时读取 draft 配置 |
@@ -309,6 +311,28 @@ CLI 会持续演进，`ftllm <command> --help` 是当前安装版本的最终依
 | `--cache_dir` | 在线模型的本地缓存目录 |
 | `--ori` | 读取部分 GGUF 时指定原模型配置和 tokenizer 目录 |
 | `--mmproj` | Qwen3.5 架构族 GGUF 的配套视觉模块文件；配置要求与示例见 [GGUF 多模态](docs/qwen3.md#gguf-multimodal) |
+
+Qwen3.5 系列的 MTP 和 DFlash 草稿支持以下设置。启用相应的草稿算法后，兼容路径默认使用 NVFP4；环境变量可在启动前覆盖默认值：
+
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `FASTLLM_DRAFT_QUANT` | `nvfp4` | `off` 关闭 NVFP4 转换；`nvfp4_head` 只转换独立草稿输出头；`nvfp4` 转换草稿主干和输出头。目标模型输出头保持原权重，不支持的设备、类型或形状保留原路径 |
+| `FASTLLM_CUDA_NVFP4_SWIGLU_MULTIROW` | `1` | 允许多行 NVFP4 Linear + SwiGLU 融合，`0` 关闭。当前多行内核仅支持 SM75、FP16 输入、M=2～8，并检查形状、布局和临时空间；其他情况回退 |
+| `FASTLLM_TP_NVFP4_MLP_SWIGLU` | `1` | TP MLP 尝试 NVFP4 Linear + SwiGLU 融合，`0` 关闭；由底层能力检查选择内核，不支持时执行原 Linear + SwiGLU |
+| `FASTLLM_TP_NATIVE_GREEDY` | `1` | Qwen3.5 TP 贪心采样支持原生类型 logits；eager 推测验证省去 FP16→FP32 转换，`0` 关闭。随机采样、返回 logits、Graph 和 GPU token handoff 仍保持 FP32 路径 |
+| `FASTLLM_DFLASH_BATCH_PREFIX_SNAPSHOTS` | `1` | DFlash2 CUDA 批量验证按各请求接受长度恢复线性状态，避免拒绝后的主模型重算。max_batch≤4 使用逐位置状态快照；更大配置保存紧凑激活、批量恢复卷积/GDN 状态，实际 batch 缩小时仍沿用该路径，无 16 路上限。自动预留恢复缓冲与草稿滑窗 KV 显存，相应减少主模型 KV 容量。`0` 回退到完整前缀重算；单请求路径不变。不限定 SM；状态算子已在 SM75 验证到 32 路 |
+| `FASTLLM_MTP_BATCH_SAMPLING` | `1` | Qwen3.5 CUDA MTP 将多请求的草稿采样和主模型拒绝采样合批，直接读取各请求独立的草稿缓存，合并结果回读。混合贪心/采样或不兼容验证长度保留原路径；`0` 恢复逐请求采样。保持采样分布，不保证与逐请求路径随机输出逐 token 相同 |
+| `FASTLLM_MTP_FP8_MARLIN` | `1` | Qwen3.5 TP MTP 在初始化时为符合已有 Marlin 条件的 FP8 草稿分片准备计算布局，避免多行草稿首次调用错过布局转换。不改变权重量化格式，保留现有架构/后端选择；`0` 恢复延迟准备。已在 SM75/TP2 验证 |
+| `FASTLLM_CUDA_GDN_SEQUENCE_PREPARE` | `1` | 批量短序列 GDN 在 K/V 维度均为 128、batch≥4 的 eager 路径预计算 Q/K 归一化与门控系数，避免各状态分块重复计算。保留逐 token FP16 状态舍入及前缀快照；小批量、其他 V 维度和 Graph 保留旧路径。`0` 关闭；已在 SM75/TP2 验证 |
+| `FASTLLM_MTP_DRAFT_TOKEN_IDS` | 未设置 | 可选的单卡或多卡 MTP 草稿词表 token ID 文件，仅在启用 NVFP4 转换时使用；未设置或为 `0` 时使用完整词表。多卡按原词表分片筛选并映射回全局 token ID，对齐填充只重复已有候选。筛选词表只用于贪心草稿，随机采样使用完整输出头，目标模型仍使用完整词表验证 |
+| `FASTLLM_DFLASH_DRAFT_TOKEN_IDS` | 未设置 | 多卡 DFlash2 的可选 NVFP4 草稿词表清单，仅用于贪心请求；要求每个连续词表分片至少有 selector top-k 个候选。top-k 前移除对齐填充，选择后恢复原 token ID。随机采样使用完整原始头；非法或不支持的清单回退完整词表 |
+| `FASTLLM_DFLASH_ATTENTION` | 未设置：SM75 开，其余关 | DFlash FP16 融合滑窗 attention 的统一开关：`0` 关闭，`1` 在支持的设备上开启。要求 head_dim=128、query 数 1～16、query 数×GQA 分组数≤64、query 数≤窗口≤4096，且 FlashInfer 可用；不匹配时回退原路径。SM80 及以上的 Q64 路径尚无实机正确性或速度验证；SM70 及以下始终保持原路径 |
+
+DFlash2 的动态卷积、QKV 和 Gateup 准备会根据设备、类型和形状自动选择融合实现，不支持时回退到常规算子；TP selector 投影固定在 rank 0 输出头工作流中提前提交。旧开关 `FASTLLM_CUDA_DFLASH_FUSED_CONV`、`FASTLLM_CUDA_DFLASH_FUSED_QKV_PREPARE`、`FASTLLM_CUDA_DFLASH_FUSED_GATEUP_PREPARE` 和 `FASTLLM_DFLASH_TP_EARLY_SELECTOR` 已移除，设置它们不再影响执行路径。
+
+未覆盖的设置使用表中默认值；内核本身的能力限制仍然有效。单卡和多卡均可使用草稿 NVFP4；多卡在切分后转换符合条件的分片。MTP 限于稠密模型、FP16 计算；DFlash 的量化 Linear 通过 FP16 适配后恢复原激活类型。量化会影响草稿接受率，独立输出头和视图副本也会改变显存占用，不保证所有模型提速；目标模型权重与完整词表验证保持原样。可用 `FASTLLM_DRAFT_QUANT=off` 保留原草稿精度，既有多卡 FP8 草稿输出头开关仍有效。
+
+NVFP4 小矩阵解码默认在 SM75、68 个 SM 的设备（如 RTX 2080 Ti）上启用已验证的调优，覆盖 M=1～8、N×K 为 17408×5120 的融合 SwiGLU，以及 5120×8704、5120×3072 的 Linear。运行时还需满足线程块驻留条件；其他架构、形状和原始 M>8 的 prefill 保持原路径。可用 `FASTLLM_CUDA_NVFP4_SM75_DECODE_TUNE=0` 关闭，`1` 显式开启全部，或用 `linear` / `swiglu` 仅开启对应部分。多行 SwiGLU 的融合入口仍由 `FASTLLM_CUDA_NVFP4_SWIGLU_MULTIROW` 单独控制。
 
 ### API Server
 

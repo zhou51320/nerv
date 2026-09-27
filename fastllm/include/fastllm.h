@@ -25,14 +25,6 @@
 #include "devices/cpu/alivethreadpool.h"
 #include "json11.hpp"
 
-// nerv: MSVC does not implement the GCC __int128 extension. These
-// computations hold device-memory byte budgets, comfortably within 64 bits.
-#if defined(_MSC_VER) && !defined(FASTLLM_I128)
-#define FASTLLM_I128 long long
-#elif !defined(FASTLLM_I128)
-#define FASTLLM_I128 __int128
-#endif
-
 #ifdef USE_SENTENCEPIECE
 #include <sentencepiece_processor.h>
 #endif
@@ -57,7 +49,6 @@ namespace fastllm {
         bool cudaTriton = false;
         bool useFusedTransferAttn = true;
         bool useFusedGdnPrefill = true;
-        std::string debugTokenId;
     };
 
     const FastllmEnv &GetFastllmEnv();
@@ -110,6 +101,8 @@ namespace fastllm {
     int GetCudaSlabMB();
     void SetMoeCudaCacheBytes(uint64_t bytes);
     uint64_t GetMoeCudaCacheBytes();
+    void SetMoeCpuCacheBytes(uint64_t bytes);
+    uint64_t GetMoeCpuCacheBytes();
     int GetThreads();
     bool GetKVCacheInCPU();
     bool GetHistoryCacheInCPU();
@@ -185,6 +178,8 @@ namespace fastllm {
         std::map <std::string, std::vector <std::string> > tool_call_allowed_parameter_names;
         std::vector <std::string> tool_call_parameter_name_prefixes;
         std::vector <int> tool_call_allowed_token_ids;
+        // Emitted prefix snapshot; speculative branches advance a private copy.
+        std::string tool_call_generated_text;
         bool tool_call_content_sampling_enabled = false;
         // Set on the per-step config after Kimi-K3 has drained DSpark's
         // scheduler-ahead queue. DSpark then samples from its batched target
@@ -352,6 +347,9 @@ namespace fastllm {
         // Internal NUMA layout: each 32-row tile stores packed block-16
         // weights, then FP32 scales, retaining gate/up row interleaving.
         NVFP4_BLOCK_16_PLANAR = 1011,
+        // Internal CPU row layout: one FP32 global multiplier followed by
+        // [8 packed E2M1 bytes, 1 raw E4M3 scale byte] per block of 16.
+        NVFP4_BLOCK_16_E4M3_PACKED = 1012,
         INF_INT8_PERCHANNEL = 2000, // 推理用的int8, per channel量化
         INF_INT8_GROUP128 = 2001, // 推理用的int8, per group量化，group = 128
         INF_INT8_GROUP32 = 2002, // 推理用的int8, per group量化，group = 32
@@ -418,7 +416,7 @@ namespace fastllm {
         const std::vector<float> &globalScales,
         int blockK, int blockM, uint8_t *destination,
         int destinationRowStart, int destinationRows,
-        bool crossSwiglu = false, bool planar = false);
+        bool crossSwiglu = false, bool planar = false, bool compactScales = false);
     void ConvertCompactE4M3NVFP4ToBlock16(
         Data &data, bool crossSwiglu = false);
 
@@ -593,6 +591,8 @@ namespace fastllm {
         void *ggmlTensor = nullptr;
         int ggmlType = -1;
         bool IsRepacked = false;
+        // CUDA-only in-place NVFP4 row-major codes + tiled E4M3 scales.
+        bool cudaNativeNvfp4Layout = false;
         bool disableGGUFRepack = false;
         bool forceGGUFFp32Dequant = false;
 
@@ -1379,7 +1379,8 @@ namespace fastllm {
 
     void LlamaRotatePosition2DPart(Data &input, const Data &positionIds, Data &sinData, Data &cosData, int rotaryDim, int part); // 2D position embedding for llama，前后各一半的维度旋转
 
-    void RopeEncoding(Data &input, const Data &positionIds, int rotaryDim, float ropeTheta, float ropeScale); // RoPE encoding，直接用rope_theta和rope_scale计算，无需sin/cos缓存
+    // preciseFreq matches the inverse-frequency rounding of the former text RoPE tables.
+    void RopeEncoding(Data &input, const Data &positionIds, int rotaryDim, float ropeTheta, float ropeScale, bool preciseFreq = false); // RoPE encoding，直接用rope_theta和rope_scale计算，无需sin/cos缓存
 
     void Llama3RopeEncoding(Data &input, const Data &positionIds, int rotaryDim, float ropeTheta,
                             float factor, float originalMaxPosition,

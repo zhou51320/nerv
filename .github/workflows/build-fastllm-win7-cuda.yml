@@ -1,12 +1,22 @@
 name: Build FastLLM Win7 CUDA (sm_75)
 
-# nerv: build fastllm with MSVC v142 + CUDA 11.7 for the Win7/sm75 target.
+# nerv: build fastllm with MSVC v142 + CUDA 11.8 (cuda_fp8.h needs >= 11.8) for the Win7/sm75 target.
+# Same Win7 approach as build-llama-win7-cuda.yml; Windows compat lives in third_party/fastllm-win7.
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/build-fastllm-win7-cuda.yml'
+      - '.github/actions/windows-setup-cuda/**'
+      - 'build-fastllm-win7-cuda.ps1'
+      - 'third_party/fastllm-win7/**'
+      - 'fastllm/**'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build-fastllm-win7-cuda:
@@ -22,7 +32,7 @@ jobs:
       - name: Setup CUDA Toolkit
         uses: ./.github/actions/windows-setup-cuda
         with:
-          cuda_version: '11.7'
+          cuda_version: '11.8'
 
       - name: Configure CUDA environment
         shell: pwsh
@@ -78,7 +88,7 @@ jobs:
           $clBanner = (& cl.exe 2>&1 | Select-Object -First 3) -join "`n"
           Write-Host $clBanner
           if (-not $env:VCToolsVersion -or $env:VCToolsVersion -notlike '14.29*') {
-            throw "CUDA 11.7 expects MSVC v142 (14.29.x). Current VCToolsVersion=$env:VCToolsVersion"
+            throw "CUDA 11.8 expects MSVC v142 (14.29.x). Current VCToolsVersion=$env:VCToolsVersion"
           }
 
       - name: Install Ninja
@@ -89,7 +99,7 @@ jobs:
         shell: pwsh
         run: |
           Write-Host "CUDA_PATH=$env:CUDA_PATH"
-          foreach ($mustHave in @('lib\\x64\\cudart.lib', 'lib\\x64\\cublas.lib', 'lib\\x64\\cublasLt.lib', 'include\\cublas_v2.h', 'include\\cuda_runtime.h')) {
+          foreach ($mustHave in @('lib\\x64\\cudart_static.lib', 'lib\\x64\\cuda.lib', 'lib\\x64\\cublas.lib', 'lib\\x64\\cublasLt.lib', 'include\\cublas_v2.h', 'include\\cuda_runtime.h', 'include\\cuda_fp8.h', 'include\\curand_kernel.h', 'include\\cuda_profiler_api.h')) {
             $p = Join-Path $env:CUDA_PATH $mustHave
             if (-not (Test-Path $p)) { throw "Missing required CUDA toolkit file: $p" }
             Write-Host "Found $p"
@@ -101,11 +111,21 @@ jobs:
         shell: pwsh
         run: |
           $log = 'build-fastllm-win7-cuda.log'
-          .\build-fastllm-win7-cuda.ps1 -Clean -CudaArch 75 -Generator "Ninja" *> $log
-          $exit = $LASTEXITCODE
+          $exit = 0
+          try {
+            .\build-fastllm-win7-cuda.ps1 -Clean -CudaArch 75 -Generator "Ninja" *> $log
+          } catch {
+            $_ | Out-File -FilePath $log -Append
+            $exit = 1
+          }
           if ($exit -ne 0) {
             Write-Host "Build failed with exit code $exit"
-            if (Test-Path $log) { Get-Content $log -Tail 400 }
+            if (Test-Path $log) {
+              Write-Host '---- all compile errors ----'
+              Select-String -Path $log -Pattern ': (fatal )?error|FAILED:|LINK : fatal|unresolved external' | ForEach-Object { $_.Line } | Select-Object -Unique -First 400
+              Write-Host '---- log tail ----'
+              Get-Content $log -Tail 150
+            }
             exit $exit
           }
 
@@ -145,39 +165,13 @@ jobs:
         run: |
           $out = 'EVA_BACKEND\x86_64\win7\cuda\fastllm'
           if (-not (Test-Path $out)) { throw "Output directory missing: $out" }
-          if (-not (Test-Path $env:CUDA_PATH)) { throw "CUDA_PATH missing: $env:CUDA_PATH" }
-
-          $requiredCudaDllPatterns = @(
-            'cudart64_*.dll',
-            'cublas64_*.dll',
-            'cublasLt64_*.dll'
-          )
-
-          foreach ($pattern in $requiredCudaDllPatterns) {
+          # cudart is linked statically; VC runtime comes from the target machine
+          # (the Server 2022 runner's msvcp140/vcruntime140 no longer support Win7)
+          foreach ($pattern in @('cublas64_*.dll', 'cublasLt64_*.dll')) {
             $src = Get-ChildItem -Path $env:CUDA_PATH -Recurse -File -Filter $pattern -ErrorAction SilentlyContinue | Sort-Object FullName | Select-Object -First 1
             if (-not $src) { throw "Required CUDA runtime DLL missing under CUDA_PATH pattern: $pattern" }
-            $src = $src.FullName
-            $destName = Split-Path $src -Leaf
-            Copy-Item $src -Destination (Join-Path $out $destName) -Force
-            Write-Host "Bundled $destName from $src"
-          }
-
-          $optionalVcDlls = @(
-            'vcruntime140.dll',
-            'vcruntime140_1.dll',
-            'msvcp140.dll',
-            'concrt140.dll',
-            'vcomp140.dll'
-          )
-
-          foreach ($dll in $optionalVcDlls) {
-            $sysPath = Join-Path "$env:WINDIR\System32" $dll
-            if (Test-Path $sysPath) {
-              Copy-Item $sysPath -Destination $out -Force
-              Write-Host "Bundled optional $dll"
-            } else {
-              Write-Host "Optional runtime DLL not found: $dll"
-            }
+            Copy-Item $src.FullName -Destination (Join-Path $out $src.Name) -Force
+            Write-Host "Bundled $($src.Name) from $($src.FullName)"
           }
 
       - name: Verify binaries
@@ -188,9 +182,24 @@ jobs:
           foreach ($exe in @('main.exe', 'quant.exe', 'fastllm-apiserver.exe')) {
             if (-not (Test-Path (Join-Path $out $exe))) { throw "$exe missing" }
           }
-          if (-not (Get-ChildItem -Path $out -Filter 'cudart64_*.dll' -ErrorAction SilentlyContinue)) { throw 'cudart64_*.dll missing' }
           if (-not (Get-ChildItem -Path $out -Filter 'cublas64_*.dll' -ErrorAction SilentlyContinue)) { throw 'cublas64_*.dll missing' }
           if (-not (Get-ChildItem -Path $out -Filter 'cublasLt64_*.dll' -ErrorAction SilentlyContinue)) { throw 'cublasLt64_*.dll missing' }
+
+      - name: Check Win7 import compatibility
+        shell: pwsh
+        run: |
+          # Win7 lacks most api-ms-win-core-* api-sets (api-ms-win-crt-* is provided by KB2999226 UCRT)
+          $out = 'EVA_BACKEND\x86_64\win7\cuda\fastllm'
+          $bad = @()
+          Get-ChildItem -Path $out -File | Where-Object { $_.Extension -in '.exe', '.dll' } | ForEach-Object {
+            $deps = & dumpbin /nologo /dependents $_.FullName | Where-Object { $_ -match '^\s+(api-ms-win-core-\S+\.dll)' } | ForEach-Object { $Matches[1] }
+            foreach ($d in $deps) { $bad += "$($_.Name) -> $d" }
+          }
+          if ($bad.Count -gt 0) {
+            $bad | ForEach-Object { Write-Warning $_ }
+            throw 'Found Win8+ api-set imports that are missing on Windows 7'
+          }
+          Write-Host 'No api-ms-win-core-* imports found.'
 
       - name: Package artifact
         shell: pwsh

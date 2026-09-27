@@ -1,16 +1,19 @@
+// nerv: inert DiskDevice for Windows builds of fastllm.
+// The upstream disk offload backend depends on mmap/pread/O_DIRECT. This stub
+// keeps the device linkable but registers no disk operators, so disk offload
+// is unavailable while GPU/CPU inference is unaffected.
 #include "devices/disk/diskdevice.h"
-#include "utils/utils.h"
+#include "utils.h"
 
 #include <cstring>
 
-// nerv: the Linux disk-weight backend depends on POSIX memory mapping
-// (mmap/pread/O_DIRECT) that is not available on Windows.  Keep the class
-// linkable so model code that instantiates DiskDevice still builds, but leave
-// it inert: no disk operators are registered and any weight load fails fast.
 namespace fastllm {
+    DiskMoeCacheStats GetDiskMoeCacheStats() { return DiskMoeCacheStats(); }
+    void TrimDiskMoeCache() {}
+    void ReleaseDiskMoeCache(const Data *) {}
+
     DiskDevice::DiskDevice() {
         this->deviceType = "disk";
-        WarnInFastLLM("disk device is not supported on this platform\n");
     }
 
     bool DiskDevice::Malloc(void **ret, size_t size) {

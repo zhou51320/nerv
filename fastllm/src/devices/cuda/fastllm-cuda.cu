@@ -7,8 +7,12 @@
 
 #define FASTLLM_CUDA_NO_MALLOC_CHECK_MACRO
 #include "fastllm-cuda.cuh"
+#include "fastllm-cuda-rope.cuh"
+#include "devices/cuda/cudaworkspace.h"
+#include "fastllm-cuda-mtp.cuh"
 #ifndef USE_ROCM
 #include "fastllm-cuda-ordered-reduce.cuh"
+#include "fastllm-rmsnorm-decode.cuh"
 #endif
 #include "fastllm.h"
 #include "utils/utils.h"
@@ -21,6 +25,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -727,10 +732,17 @@ static thread_local std::string fastllmCudaGraphLastError;
 // on a negative query: tensor-parallel code can temporarily inspect a different
 // device's per-thread stream while the original stream is active.
 static thread_local bool fastllmCudaGraphCaptureMayBeActive = false;
+static thread_local bool fastllmCudaGraphManagedCaptureOnly = false;
+
+bool FastllmCudaGraphSetManagedCaptureOnly(bool enabled) {
+    const bool previous = fastllmCudaGraphManagedCaptureOnly;
+    fastllmCudaGraphManagedCaptureOnly = enabled;
+    return previous;
+}
 
 static bool FastllmCudaGraphCaptureQueryRequired() {
     return fastllmCudaGraphCaptureMayBeActive ||
-           fastllm::GetFastllmEnv().cudaGraph;
+           (!fastllmCudaGraphManagedCaptureOnly && fastllm::GetFastllmEnv().cudaGraph);
 }
 
 static bool FastllmCudaGraphSetError(const char *stage, cudaError_t err) {
@@ -2624,7 +2636,7 @@ __global__ void FastllmLlamaRotatePosition2DKernel(__nv_bfloat16 *data, float *p
 
 __global__ void FastllmRopeEncodingKernel(float *data, float *positionIds,
                                                    int len, int bs, int spatial, int n, int m, int partStride, int rotateDim,
-                                                   float ropeTheta, float ropeScale) {
+                                                   float ropeTheta, float ropeScale, bool preciseFreq) {
     int o = (blockIdx.x / n);
     int l = o % len;
     int b = o / len;
@@ -2632,7 +2644,8 @@ __global__ void FastllmRopeEncodingKernel(float *data, float *positionIds,
     int half = rotateDim / 2;
     int index = (int) (positionIds[b * partStride + l]);
     float position = (float)index / ropeScale;
-    float freq = position / powf(ropeTheta, (float)(2 * j) / rotateDim);
+    float freq = preciseFreq ? FastllmPreciseRopeAngle(position, j, rotateDim, ropeTheta)
+                             : position / powf(ropeTheta, (float)(2 * j) / rotateDim);
     float curSin = sinf(freq);
     float curCos = cosf(freq);
     float *d = (float *) data + o * spatial + j;
@@ -2644,7 +2657,7 @@ __global__ void FastllmRopeEncodingKernel(float *data, float *positionIds,
 
 __global__ void FastllmRopeEncodingKernel(half *data, float *positionIds,
                                                    int len, int bs, int spatial, int n, int m, int partStride, int rotateDim,
-                                                   float ropeTheta, float ropeScale) {
+                                                   float ropeTheta, float ropeScale, bool preciseFreq) {
     int o = (blockIdx.x / n);
     int l = o % len;
     int b = o / len;
@@ -2652,7 +2665,8 @@ __global__ void FastllmRopeEncodingKernel(half *data, float *positionIds,
     int half_dim = rotateDim / 2;
     int index = (int) (positionIds[b * partStride + l]);
     float position = (float)index / ropeScale;
-    float freq = position / powf(ropeTheta, (float)(2 * j) / rotateDim);
+    float freq = preciseFreq ? FastllmPreciseRopeAngle(position, j, rotateDim, ropeTheta)
+                             : position / powf(ropeTheta, (float)(2 * j) / rotateDim);
     float curSin = sinf(freq);
     float curCos = cosf(freq);
     half *d = (half *) data + o * spatial + j;
@@ -2664,7 +2678,7 @@ __global__ void FastllmRopeEncodingKernel(half *data, float *positionIds,
 
 __global__ void FastllmRopeEncodingKernel(__nv_bfloat16 *data, float *positionIds,
                                                    int len, int bs, int spatial, int n, int m, int partStride, int rotateDim,
-                                                   float ropeTheta, float ropeScale) {
+                                                   float ropeTheta, float ropeScale, bool preciseFreq) {
     int o = (blockIdx.x / n);
     int l = o % len;
     int b = o / len;
@@ -2672,7 +2686,8 @@ __global__ void FastllmRopeEncodingKernel(__nv_bfloat16 *data, float *positionId
     int half_dim = rotateDim / 2;
     int index = (int) (positionIds[b * partStride + l]);
     float position = (float)index / ropeScale;
-    float freq = position / powf(ropeTheta, (float)(2 * j) / rotateDim);
+    float freq = preciseFreq ? FastllmPreciseRopeAngle(position, j, rotateDim, ropeTheta)
+                             : position / powf(ropeTheta, (float)(2 * j) / rotateDim);
     float curSin = sinf(freq);
     float curCos = cosf(freq);
     __nv_bfloat16 *d = (__nv_bfloat16 *) data + o * spatial + j;
@@ -3855,6 +3870,93 @@ __global__ void FastllmRMSNormKernelInner1(__nv_bfloat16 *input, float *weight, 
 }
 
 #ifndef USE_ROCM
+// Odd row strides are not aligned for float4/half2/bfloat162 accesses. Scalar
+// loads preserve arbitrary row alignment; the general even-width path stays
+// unchanged. No tensor-core instructions are required.
+template <typename T>
+__global__ void FastllmRMSNormUnalignedKernel(const T *input, const float *weight,
+                                            T *output, int channels, float eps) {
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    input += (uint64_t)blockIdx.x * channels;
+    output += (uint64_t)blockIdx.x * channels;
+    __shared__ float partial[8], scale;
+    float sum = 0.0f;
+    for (int i = tid; i < channels; i += 256) {
+        float v = (float)input[i]; sum += v * v;
+    }
+    for (int offset = 16; offset; offset >>= 1) sum += __shfl_down_sync(0xffffffff, sum, offset);
+    if (lane == 0) partial[warp] = sum;
+    __syncthreads();
+    if (warp == 0) {
+        sum = lane < 8 ? partial[lane] : 0.0f;
+        for (int offset = 16; offset; offset >>= 1) sum += __shfl_down_sync(0xffffffff, sum, offset);
+        if (lane == 0) scale = rsqrtf(sum / channels + eps);
+    }
+    __syncthreads();
+    for (int i = tid; i < channels; i += 256) output[i] = (T)((float)input[i] * scale * weight[i]);
+}
+
+// Emulate the original 1024 lanes with fewer physical threads. Independent
+// virtual-lane sums are interleaved to hide shuffle latency; inputs stay in
+// registers until the scale is ready. The reduction tree is unchanged.
+template <int THREADS>
+__global__ __launch_bounds__(THREADS) void FastllmRMSNormBFloat16Decode5120Kernel(
+        const __nv_bfloat16 *input, const float *weight, __nv_bfloat16 *output, float eps) {
+    constexpr int channels = 5120, groups = 1024 / THREADS;
+    input += (uint64_t)blockIdx.x * channels;
+    output += (uint64_t)blockIdx.x * channels;
+    const auto *pairs = reinterpret_cast<const __nv_bfloat162*>(input);
+    __shared__ float warpSums[32];
+    __shared__ float scale;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    float sums[groups];
+    __nv_bfloat162 values[groups][3];
+#pragma unroll
+    for (int g = 0; g < groups; ++g) {
+        sums[g] = 0.0f;
+#pragma unroll
+        for (int step = 0; step < 3; ++step) {
+            const int i = tid + g * THREADS + step * 1024;
+            if (i < channels / 2) {
+                values[g][step] = pairs[i];
+                float lo = __bfloat162float(values[g][step].x), hi = __bfloat162float(values[g][step].y);
+                sums[g] += lo * lo + hi * hi;
+            }
+        }
+    }
+#pragma unroll
+    for (int offset = 16; offset; offset >>= 1) {
+#pragma unroll
+        for (int g = 0; g < groups; ++g) sums[g] += __shfl_down_sync(0xffffffff, sums[g], offset);
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int g = 0; g < groups; ++g) warpSums[g * (THREADS / 32) + warp] = sums[g];
+    }
+    __syncthreads();
+    if (warp == 0) {
+        float sum = warpSums[lane];
+#pragma unroll
+        for (int offset = 16; offset; offset >>= 1) sum += __shfl_down_sync(0xffffffff, sum, offset);
+        if (lane == 0) scale = rsqrtf(sum / channels + eps);
+    }
+    __syncthreads();
+    auto *out = reinterpret_cast<__nv_bfloat162*>(output);
+#pragma unroll
+    for (int g = 0; g < groups; ++g) {
+#pragma unroll
+        for (int step = 0; step < 3; ++step) {
+            const int i = tid + g * THREADS + step * 1024;
+            if (i < channels / 2) {
+                __nv_bfloat162 result;
+                result.x = __float2bfloat16_rn(__bfloat162float(values[g][step].x) * scale * __ldg(weight + 2 * i));
+                result.y = __float2bfloat16_rn(__bfloat162float(values[g][step].y) * scale * __ldg(weight + 2 * i + 1));
+                out[i] = result;
+            }
+        }
+    }
+}
+
 // hidden=3072 uses three bfloat162 values per thread in the legacy 512-thread
 // kernel.  A physical thread evaluates two independent legacy thread lanes and
 // keeps all six packed values in registers until the scale is available.  The
@@ -4165,16 +4267,26 @@ __global__ void FastllmCatBatchKernel(uint8_t **inputs, uint8_t *output, int out
     }
 }
 
+static uint64_t FastllmCudaHostTransferBytes(const fastllm::Data &data) {
+    // Match Data::ToDevice: a scratch tensor may retain a prefill-sized
+    // allocation while only one decode row is live. Persistent/expanded
+    // storage keeps its full-copy semantics.
+    return data.expansionDims.empty() && !data.isModelWeight && !data.isKVCache
+        ? std::min(data.GetBytes(), data.expansionBytes)
+        : data.expansionBytes;
+}
+
 void *FastllmCudaPrepareInput(const fastllm::Data &input) {
     void *ret;
     if (input.dataDevice == fastllm::DataDevice::CUDA) {
         ret = (void*)input.cudaData;
     } else {
-        ret = FastllmCudaMalloc(input.expansionBytes);
+        const uint64_t bytes = FastllmCudaHostTransferBytes(input);
+        ret = FastllmCudaMalloc(bytes);
         if (ret == nullptr) {
             return nullptr;
         }
-        auto state = cudaMemcpy(ret, input.cpuData, input.expansionBytes, cudaMemcpyHostToDevice);
+        auto state = cudaMemcpy(ret, input.cpuData, bytes, cudaMemcpyHostToDevice);
         if (cudaSuccess != state) {
             checkCudaErrors("Error: CUDA error when copy from memory to GPU!", state);
             FastllmCudaFree(ret);
@@ -4195,14 +4307,15 @@ void *FastllmCudaPrepareOutput(fastllm::Data &output) {
     if (output.dataDevice == fastllm::DataDevice::CUDA) {
         ret = (float*)output.cudaData;
     } else {
-        ret = (float*)FastllmCudaMalloc(output.expansionBytes);
+        ret = (float*)FastllmCudaMalloc(FastllmCudaHostTransferBytes(output));
     }
     return ret;
 }
 
 void FastllmCudaFinishOutput(fastllm::Data &output, void *data) {
     if (output.dataDevice != fastllm::DataDevice::CUDA) {
-        auto state = cudaMemcpy(output.cpuData, data, output.expansionBytes, cudaMemcpyDeviceToHost);
+        auto state = cudaMemcpy(output.cpuData, data,
+                                FastllmCudaHostTransferBytes(output), cudaMemcpyDeviceToHost);
         checkCudaErrors("Error: CUDA error when copy from GPU to memory!", state);
         FastllmCudaFree(data);
     }
@@ -4362,7 +4475,9 @@ static size_t FastllmCudaReleaseIdleBigBuffersLocked(int id, std::vector<CudaMem
         cudaDeviceSynchronize();
     }
     for (auto &buffer : bigBuffers) {
-        if (buffer.busy || !FastllmCudaBufferReadyForReuseLocked(buffer)) {
+        if (buffer.busy || buffer.graphPins > 0 ||
+            !FastllmCudaBufferReadyForReuseLocked(buffer) ||
+            FastllmCudaGraphPoolPointerProtectedLocked(buffer.data)) {
             keep.push_back(buffer);
             continue;
         }
@@ -4833,6 +4948,7 @@ FastllmCudaTryMallocResult FastllmCudaTryDirectMalloc(
 }
 
 void FastllmCudaDirectFree(void *ret) {
+    if (fastllm::TryFreeCudaWorkspace(ret)) return;
 #ifdef CUDA_MEM_DEBUG
     CudaMemDebugRemove(ret);
 #endif
@@ -5181,6 +5297,20 @@ static void *FastllmCudaMallocImpl(
         FastllmCudaGraphCurrentCaptureIdentity();
     const bool capturePoolOnly = captureIdentity.valid ||
         FastllmCudaGraphIsCapturingFast();
+    void *workspacePointer = nullptr;
+    if (fastllm::TryAllocateCudaWorkspace(id, size, &workspacePointer)) {
+        // Arena suballocations have eager stream lifetimes; graph replay must
+        // continue to use the existing graph-owned allocation mechanism.
+        if (capturePoolOnly) {
+            if (workspacePointer) fastllm::TryFreeCudaWorkspace(workspacePointer);
+            FastllmCudaSetThreadError();
+            return nullptr;
+        }
+        if (workspacePointer) return allocationSucceeded(workspacePointer);
+        if (tryResult) *tryResult = FASTLLM_CUDA_TRY_MALLOC_CAPACITY_FAILURE;
+        else FastllmCudaSetThreadError();
+        return nullptr;
+    }
     const bool useAnyFittingPooledBuffer = capturePoolOnly ||
         fastllmCudaMallocDisabled.load(std::memory_order_relaxed);
     std::lock_guard<std::mutex> lock(*view.lock);
@@ -5277,6 +5407,7 @@ static void *FastllmCudaMallocImpl(
         return allocationSucceeded(ret);
     }
     auto &cudaBuffers = *view.smallBuffers;
+    int selectedSmall = -1;
     for (int i = *view.minId; i < cudaBuffers.size(); i++) {
         if (cudaBuffers[i].size >= size && !cudaBuffers[i].busy &&
             cudaBuffers[i].graphPins == 0 &&
@@ -5284,20 +5415,28 @@ static void *FastllmCudaMallocImpl(
                 cudaBuffers[i], captureIdentity.valid) &&
             FastllmCudaGraphPoolPointerReusableLocked(
                 cudaBuffers[i].data, captureIdentity)) {
-            cudaBuffers[i].busy = true;
-            FastllmCudaGraphPoolAfterAllocLocked(
-                cudaBuffers[i].data, captureIdentity);
-            *view.noBusy -= cudaBuffers[i].size;
-            while (*view.minId < cudaBuffers.size() &&
-                   (cudaBuffers[*view.minId].busy ||
-                    cudaBuffers[*view.minId].graphPins > 0)) {
-                (*view.minId)++;
+            if (selectedSmall < 0 || cudaBuffers[i].size < cudaBuffers[selectedSmall].size) {
+                selectedSmall = i;
             }
-#ifdef CUDA_MEM_DEBUG
-            CudaMemDebugRecord(cudaBuffers[i].data, size);
-#endif
-            return allocationSucceeded(cudaBuffers[i].data);
+            // Capture cannot allocate a new block. Preserve larger idle
+            // blocks for later temporaries instead of consuming the first fit.
+            // Keep eager allocation/reuse order unchanged.
+            if (!capturePoolOnly || cudaBuffers[i].size == size) break;
         }
+    }
+    if (selectedSmall >= 0) {
+        auto &buffer = cudaBuffers[selectedSmall];
+        buffer.busy = true;
+        FastllmCudaGraphPoolAfterAllocLocked(buffer.data, captureIdentity);
+        *view.noBusy -= buffer.size;
+        while (*view.minId < cudaBuffers.size() &&
+               (cudaBuffers[*view.minId].busy || cudaBuffers[*view.minId].graphPins > 0)) {
+            (*view.minId)++;
+        }
+#ifdef CUDA_MEM_DEBUG
+        CudaMemDebugRecord(buffer.data, size);
+#endif
+        return allocationSucceeded(buffer.data);
     }
     if (useAnyFittingPooledBuffer) {
         auto &bigBuffers = *view.bigBuffers;
@@ -5398,6 +5537,7 @@ void FastllmCudaForceFree(void *ret) {
     if (ret == nullptr) {
         return;
     }
+    if (fastllm::TryFreeCudaWorkspace(ret)) return;
     if (FastllmCudaTryFreeWeightSlabPtr(ret)) {
         return;
     }
@@ -5486,6 +5626,11 @@ bool FastllmCudaFreeAfterStream(void *ret, cudaStream_t stream) {
     if (ret == nullptr) {
         return true;
     }
+    if (fastllm::IsCudaWorkspacePointer(ret)) {
+        cudaError_t state = cudaStreamSynchronize(stream);
+        checkCudaErrors("Error: synchronizing CUDA workspace release", state);
+        return state == cudaSuccess && fastllm::TryFreeCudaWorkspace(ret);
+    }
     FastllmCudaGraphCaptureIdentity captureIdentity =
         FastllmCudaGraphCurrentCaptureIdentity();
     if (captureIdentity.valid || FastllmCudaGraphIsCapturingFast()) {
@@ -5552,6 +5697,7 @@ void FastllmCudaFree(void *ret) {
     if (ret == nullptr) {
         return;
     }
+    if (fastllm::TryFreeCudaWorkspace(ret)) return;
     if (FastllmCudaTryFreeWeightSlabPtr(ret)) {
         return;
     }
@@ -5756,7 +5902,8 @@ void FastllmCudaMallocBigBuffer(size_t size) {
     bigBuffers.push_back(CudaMemoryBuffer(ret, size, false));
 }
 
-static void FastllmCudaClearBigBufferWithRetain(size_t retainBytes, bool currentDeviceOnly) {
+static void FastllmCudaClearBigBufferWithRetain(
+        size_t retainBytes, bool currentDeviceOnly, bool boundedRetain = false) {
     if (fastllmCudaMallocDisabled.load(std::memory_order_relaxed)) {
         return;
     }
@@ -5783,12 +5930,31 @@ static void FastllmCudaClearBigBufferWithRetain(size_t retainBytes, bool current
         std::vector <CudaMemoryBuffer> temp;
         size_t littleMemSum = 0;
         size_t littleMemSumLimit = retainBytes; // 留一小部分复用
+        size_t idleBytes = 0;
         std::vector <std::pair <std::size_t, int > > v;
         for (int i = 0; i < bigBuffers.size(); i++) {
             if (!bigBuffers[i].busy && bigBuffers[i].graphPins == 0 &&
                 FastllmCudaBufferReadyForReuseLocked(bigBuffers[i])) {
                 v.push_back(std::make_pair(bigBuffers[i].size, i));
+                idleBytes += bigBuffers[i].size;
             }
+        }
+        if (boundedRetain) {
+            // Device capacity is constant; keep this cache local to callers
+            // that opt into reuse, without extending every pool view.
+            static thread_local std::map<int, size_t> capacities;
+            size_t &capacity = capacities[view.device];
+            if (capacity == 0) {
+                cudaDeviceProp prop;
+                state = cudaGetDeviceProperties(&prop, view.device);
+                checkCudaErrors("Error: CUDA error when reading workspace capacity!", state);
+                capacity = prop.totalGlobalMem;
+            }
+            // Retain reusable workspaces within a device-relative budget. Do not
+            // query free memory on every forward: that may wait for queued GPU
+            // work. Allocation pressure is handled by the idle-pool OOM retry.
+            littleMemSumLimit = capacity / 4;
+            if (idleBytes <= littleMemSumLimit) continue;
         }
         std::sort(v.begin(), v.end());
         std::set <int> littleMemIds;
@@ -5823,6 +5989,10 @@ static void FastllmCudaClearBigBufferWithRetain(size_t retainBytes, bool current
 
 void FastllmCudaClearBigBuffer() {
     FastllmCudaClearBigBufferWithRetain(300ULL * 1024ULL * 1024ULL, false);
+}
+
+void FastllmCudaTrimBigBuffer() {
+    FastllmCudaClearBigBufferWithRetain(0, false, true);
 }
 
 void FastllmCudaClearBigBufferCurrentDevice() {
@@ -6052,22 +6222,6 @@ bool FastllmCudaValidatePointerRange(const void *ptr, size_t bytes,
         return bytes == 0;
     }
 
-#if defined(_WIN32)
-    // nerv: Windows ships no driver import library (cuda.lib), so the
-    // driver-API cuMemGetAddressRange path is replaced with a runtime-API
-    // pointer validation here. Upper bound checking is relaxed; bad copies
-    // are still caught by checkCudaErrors downstream.
-    cudaPointerAttributes attrs{};
-    cudaError_t state = cudaPointerGetAttributes(&attrs, ptr);
-    if (state != cudaSuccess || attrs.type == cudaMemoryTypeUnregistered) {
-        cudaGetLastError();
-        return false;
-    }
-    if (attrs.device >= 0 && attrs.device != expectedDevice) {
-        return false;
-    }
-    return true;
-#else
     int originalDevice = FastllmCudaGetDevice();
     cudaError_t state = cudaSetDevice(expectedDevice);
     CUdeviceptr base = 0;
@@ -6084,7 +6238,6 @@ bool FastllmCudaValidatePointerRange(const void *ptr, size_t bytes,
     }
     size_t offset = (size_t)((CUdeviceptr)ptr - base);
     return offset <= allocation && bytes <= allocation - offset;
-#endif
 }
 
 void FastllmCudaMemcpyBetweenDevices(int dstId, void *dst, int srcId, void *src, size_t size) {
@@ -6155,37 +6308,67 @@ void FastllmCudaMemcpyBetweenDevices(int dstId, void *dst, int srcId, void *src,
         cudaGetLastError();
     }
 
-    uint8_t *cpuData = new uint8_t[size];
-    state = cudaSetDevice(srcId);
-    failedStage = "cudaSetDevice(src)";
-    if (state == cudaSuccess) {
-        state = cudaMemcpyAsync(cpuData, src, size, cudaMemcpyDeviceToHost,
-                                cudaStreamPerThread);
-        failedStage = "cudaMemcpyAsyncDeviceToHost";
+    // Bound pinned memory independently of tensor size. The caller waits for
+    // each destination copy before reusing this thread's staging allocation,
+    // preserving the synchronous handoff to other per-thread CUDA streams.
+    struct StagingBuffer {
+        uint8_t *data = nullptr;
+        size_t capacity = 0;
+        ~StagingBuffer() { if (data != nullptr) cudaFreeHost(data); }
+    };
+    static thread_local StagingBuffer staging;
+    constexpr size_t maxStagingBytes = 64ULL << 20;
+    const size_t partBytes = std::min(size, maxStagingBytes);
+    if (staging.capacity < partBytes) {
+        void *replacement = nullptr;
+        state = cudaHostAlloc(&replacement, partBytes, cudaHostAllocPortable);
+        if (state == cudaSuccess) {
+            if (staging.data != nullptr) cudaFreeHost(staging.data);
+            staging.data = (uint8_t *)replacement;
+            staging.capacity = partBytes;
+        } else {
+            cudaGetLastError();
+        }
     }
-    if (state == cudaSuccess) {
-        state = cudaStreamSynchronize(cudaStreamPerThread);
-        failedStage = "cudaStreamSynchronize(src)";
+    // Pinned allocation is an optimization; retain a bounded pageable
+    // fallback on hosts where pinning is unavailable or exhausted.
+    std::unique_ptr<uint8_t[]> pageable;
+    uint8_t *cpuData = staging.data;
+    size_t capacity = staging.capacity;
+    if (cpuData == nullptr) {
+        pageable.reset(new uint8_t[partBytes]);
+        cpuData = pageable.get();
+        capacity = partBytes;
     }
-    if (state == cudaSuccess) {
-        state = cudaSetDevice(dstId);
-        failedStage = "cudaSetDevice(dst)";
+    state = cudaSuccess;
+    for (size_t offset = 0; offset < size && state == cudaSuccess;) {
+        const size_t bytes = std::min(capacity, size - offset);
+        state = cudaSetDevice(srcId);
+        failedStage = "cudaSetDevice(src)";
+        if (state == cudaSuccess) {
+            state = cudaMemcpyAsync(cpuData, (uint8_t *)src + offset, bytes,
+                                    cudaMemcpyDeviceToHost, cudaStreamPerThread);
+            failedStage = "cudaMemcpyAsyncDeviceToHost";
+        }
+        if (state == cudaSuccess) {
+            state = cudaStreamSynchronize(cudaStreamPerThread);
+            failedStage = "cudaStreamSynchronize(src)";
+        }
+        if (state == cudaSuccess) {
+            state = cudaSetDevice(dstId);
+            failedStage = "cudaSetDevice(dst)";
+        }
+        if (state == cudaSuccess) {
+            state = cudaMemcpyAsync((uint8_t *)dst + offset, cpuData, bytes,
+                                    cudaMemcpyHostToDevice, cudaStreamPerThread);
+            failedStage = "cudaMemcpyAsyncHostToDevice";
+        }
+        if (state == cudaSuccess) {
+            state = cudaStreamSynchronize(cudaStreamPerThread);
+            failedStage = "cudaStreamSynchronize(dst)";
+        }
+        offset += bytes;
     }
-    if (state == cudaSuccess) {
-        state = cudaMemcpyAsync(dst, cpuData, size, cudaMemcpyHostToDevice,
-                                cudaStreamPerThread);
-        failedStage = "cudaMemcpyAsyncHostToDevice";
-    }
-    if (state == cudaSuccess) {
-        // The destination is consumed by a persistent TP worker whose
-        // per-thread default stream differs from this caller's stream.  A
-        // pageable H2D cudaMemcpy may return after host staging but before the
-        // DMA reaches device memory, so complete it before handing the tensor
-        // to that worker.
-        state = cudaStreamSynchronize(cudaStreamPerThread);
-        failedStage = "cudaStreamSynchronize(dst)";
-    }
-    delete[] cpuData;
     if (state != cudaSuccess) {
         printf("Error: CUDA copy Between GPUs failed in %s. dstId = %d, srcId = %d, "
                "dst = %p, src = %p, size = %lu, canPeerAccess = %d.\n",
@@ -6225,6 +6408,10 @@ void FastllmCudaMemcpy2DDeviceToDevice(void * 	dst, size_t 	dpitch, const void *
 
     cudaError_t state = cudaSuccess;
     if (FastllmCudaGraphIsCapturingFast()) {
+        // A failed managed capture can carry undersized allocation-failure
+        // placeholders until every TP rank reaches the common abort barrier.
+        // Do not submit a copy against those addresses; the graph is discarded.
+        if (FastllmCudaGetThreadError()) return;
         state = cudaMemcpy2DAsync(dst, dpitch, src, spitch, width, height,
                                   cudaMemcpyDeviceToDevice, cudaStreamPerThread);
         checkCudaErrors("Error: CUDA error when async 2D copy on GPU!", state);
@@ -7733,9 +7920,58 @@ bool FastllmCudaCumSumDecayMaskNegMulCausal(
     return true;
 }
 
+#ifndef USE_ROCM
+// The existing generic kernels remain the fallback for all other shapes,
+// explicit thread-count overrides, alignments, and opt-out configurations.
+template <class T>
+static bool TryLaunchFastllmRMSNormDecode(const T *input, const float *weight, T *output,
+                                        int outer, int channels, float eps) {
+    if (outer < 1 || outer > 8 || channels != 5120 ||
+        reinterpret_cast<uintptr_t>(input) % alignof(uint32_t) ||
+        reinterpret_cast<uintptr_t>(output) % alignof(uint32_t) ||
+        reinterpret_cast<uintptr_t>(weight) % alignof(float2)) {
+        return false;
+    }
+    const char *flag = std::getenv("FASTLLM_CUDA_RMSNORM_DECODE");
+    if (flag != nullptr && flag[0] != '\0' &&
+        !FastllmCudaEnvFlagEnabled("FASTLLM_CUDA_RMSNORM_DECODE")) {
+        return false;
+    }
+    // Query the actual specialization once per host thread/device/type. No tensor
+    // allocation or writes occur here, including during graph capture.
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess) {
+        return false;
+    }
+    static thread_local std::map<int, bool> available;
+    auto it = available.find(device);
+    if (it == available.end()) {
+        cudaFuncAttributes attributes{};
+        cudaError_t status = cudaFuncGetAttributes(&attributes, fastllm::normdecode::Kernel<T>);
+        bool supported = status == cudaSuccess && attributes.maxThreadsPerBlock >= 512;
+        if (status != cudaSuccess) {
+            cudaGetLastError(); // Do not leave an unavailable-image error on the fallback path.
+        }
+        it = available.emplace(device, supported).first;
+    }
+    if (!it->second) {
+        return false;
+    }
+    fastllm::normdecode::Kernel<T><<<outer, 512>>>(input, weight, output, eps);
+    return true;
+}
+#endif
+
 static bool LaunchFastllmRMSNormFloat16(
         const half *input, const float *weight, half *output,
         int outer, int channels, float eps, int threadCount) {
+#ifndef USE_ROCM
+    if (threadCount == 0 && ((channels & 1) || ((uintptr_t)input | (uintptr_t)output) % 4)) {
+        FastllmRMSNormUnalignedKernel<half><<<outer, 256>>>(input, weight, output, channels, eps);
+        return true;
+    }
+#endif
+
     if (channels == 128 && threadCount == 32) {
         FastllmRMSNormHalf128ExactKernel<<<outer, 32>>>(
             input, weight, output, eps);
@@ -7744,6 +7980,11 @@ static bool LaunchFastllmRMSNormFloat16(
     if (threadCount != 0) {
         return false;
     }
+#ifndef USE_ROCM
+    if (TryLaunchFastllmRMSNormDecode(input, weight, output, outer, channels, eps)) {
+        return true;
+    }
+#endif
     if (channels < 512) {
         FastllmRMSNormKernelInner1<64><<<outer, 64>>>(
             (half*)input, (float*)weight, output, outer, channels, eps);
@@ -7784,6 +8025,14 @@ static bool LaunchFastllmRMSNormBFloat16(
         __nv_bfloat16 *input, float *weight, __nv_bfloat16 *output,
         int outer, int channels, float eps, int threadCount) {
 #ifndef USE_ROCM
+    if (threadCount == 0 && ((channels & 1) || ((uintptr_t)input | (uintptr_t)output) % 4)) {
+        FastllmRMSNormUnalignedKernel<__nv_bfloat16><<<outer, 256>>>(input, weight, output, channels, eps);
+        return true;
+    }
+    if (threadCount == 0 && channels == 5120 && outer > 0 && outer <= 8) {
+        FastllmRMSNormBFloat16Decode5120Kernel<512><<<outer, 512>>>(input, weight, output, eps);
+        return true;
+    }
     if (channels == 3072 && threadCount == 256) {
         FastllmRMSNormBFloat16Hidden3072ExactKernel<<<outer, 256>>>(
             input, weight, output, eps);
@@ -7793,6 +8042,11 @@ static bool LaunchFastllmRMSNormBFloat16(
     if (threadCount != 0) {
         return false;
     }
+#ifndef USE_ROCM
+    if (TryLaunchFastllmRMSNormDecode(input, weight, output, outer, channels, eps)) {
+        return true;
+    }
+#endif
     if (channels < 512) {
         FastllmRMSNormKernelInner1<64><<<outer, 64>>>(
             input, weight, output, outer, channels, eps);
@@ -7866,6 +8120,12 @@ bool FastllmCudaRMSNorm(const fastllm::Data &input, fastllm::Data &weight, fastl
     int channels = input.dims[axis];
 
     if (input.dataType == fastllm::DataType::FLOAT32) {
+#ifndef USE_ROCM
+        if (channels % 4 || ((uintptr_t)cudaInput | (uintptr_t)cudaOutput | (uintptr_t)weight.cudaData) % 16) {
+            FastllmRMSNormUnalignedKernel<float><<<outer, 256>>>(
+                cudaInput, (const float*)weight.cudaData, cudaOutput, channels, eps);
+        } else
+#endif
         if (channels < 64) {
             FastllmRMSNormKernelInner1<1> <<< outer, 1 >>>(cudaInput, (float *) weight.cudaData, cudaOutput, outer,
                                                            channels, eps);
@@ -9340,14 +9600,16 @@ __global__ __launch_bounds__(32) void FastllmRMSNormSiluMulHalf128CombinedGateEx
 // Fuse [batch, heads, paddedSeq, 128] -> [batch, seq, heads, 128]
 // with the exact output RMSNorm and z gate.  This avoids the temporary copy
 // required by an in-place head/sequence transpose.
-__global__ __launch_bounds__(32) void FastllmRMSNormSiluMulHalf128HeadMajorCombinedGateExactKernel(
+template<int Warps>
+__global__ __launch_bounds__(32*Warps) void FastllmRMSNormSiluMulHalf128HeadMajorCombinedGateExactKernel(
         const half *headMajorInput, const float *weight,
         const half *combinedGateInput, half *output,
         int seqLen, int paddedSeqLen,
-        int gateStride, int gateOffset, int gateHeads, float eps) {
+        int gateStride, int gateOffset, int gateHeads, float eps,int rows) {
     constexpr int CHANNELS = 128;
-    int row = blockIdx.x;
-    int lane = threadIdx.x;
+    int row = blockIdx.x*Warps+threadIdx.x/32;
+    if(row>=rows)return;
+    int lane = threadIdx.x&31;
     int token = row / gateHeads;
     int head = row - token * gateHeads;
     int batch = token / seqLen;
@@ -9616,14 +9878,26 @@ bool FastllmCudaRMSNormSiluMulFloat16HeadMajorCombinedGate(
         return false;
     }
 
-    FastllmRMSNormSiluMulHalf128HeadMajorCombinedGateExactKernel<<<(
-        int)outer64, 32>>>(
+    const char *multirowEnv = std::getenv("FASTLLM_CUDA_GDN_NORM_MULTIROW");
+    bool multirow = multirowEnv == nullptr || multirowEnv[0] == '\0' ||
+        FastllmCudaEnvFlagEnabled("FASTLLM_CUDA_GDN_NORM_MULTIROW");
+    if (multirow && outer64 >= 64) {
+        FastllmRMSNormSiluMulHalf128HeadMajorCombinedGateExactKernel<4><<<((int)outer64 + 3) / 4, 128>>>(
         (const half *)headMajorInput.cudaData,
         (const float *)weight.cudaData,
         (const half *)combinedGateInput.cudaData,
         (half *)output.cudaData,
         seqLen, paddedSeqLen,
-        gateStride, gateOffset, gateHeads, eps);
+        gateStride, gateOffset, gateHeads, eps, (int)outer64);
+    } else {
+        FastllmRMSNormSiluMulHalf128HeadMajorCombinedGateExactKernel<1><<<(int)outer64, 32>>>(
+        (const half *)headMajorInput.cudaData,
+        (const float *)weight.cudaData,
+        (const half *)combinedGateInput.cudaData,
+        (half *)output.cudaData,
+        seqLen, paddedSeqLen,
+        gateStride, gateOffset, gateHeads, eps, (int)outer64);
+    }
     checkCudaErrors(
         "Error: CUDA error in "
         "FastllmCudaRMSNormSiluMulFloat16HeadMajorCombinedGate.",
@@ -14199,7 +14473,7 @@ bool FastllmCudaAdvanceDecodeMeta(
     return true;
 }
 
-bool FastllmCudaRopeEncoding(fastllm::Data &data, const fastllm::Data &positionIds, int rotaryDim, float ropeTheta, float ropeScale) {
+bool FastllmCudaRopeEncoding(fastllm::Data &data, const fastllm::Data &positionIds, int rotaryDim, float ropeTheta, float ropeScale, bool preciseFreq) {
     float *cudaData = (float *) FastllmCudaPrepareInput(data);
     float *cudaPositionIds = (float *) FastllmCudaPrepareInput(positionIds);
 
@@ -14212,15 +14486,15 @@ bool FastllmCudaRopeEncoding(fastllm::Data &data, const fastllm::Data &positionI
     if (data.dataType == fastllm::DataType::FLOAT32) {
         FastllmRopeEncodingKernel <<< outer * n, halfDim >>> (cudaData, cudaPositionIds,
                                                                                  len, bs, spatial, n, m,
-                                                                                 (int)positionIds.dims.back(), rotaryDim, ropeTheta, ropeScale);
+                                                                                 (int)positionIds.dims.back(), rotaryDim, ropeTheta, ropeScale, preciseFreq);
     } else if (data.dataType == fastllm::DataType::FLOAT16) {
         FastllmRopeEncodingKernel <<< outer * n, halfDim >>> ((half*)cudaData, cudaPositionIds,
                                                                                  len, bs, spatial, n, m,
-                                                                                 (int)positionIds.dims.back(), rotaryDim, ropeTheta, ropeScale);
+                                                                                 (int)positionIds.dims.back(), rotaryDim, ropeTheta, ropeScale, preciseFreq);
     } else if (data.dataType == fastllm::DataType::BFLOAT16) {
         FastllmRopeEncodingKernel <<< outer * n, halfDim >>> ((__nv_bfloat16*)cudaData, cudaPositionIds,
                                                                                  len, bs, spatial, n, m,
-                                                                                 (int)positionIds.dims.back(), rotaryDim, ropeTheta, ropeScale);
+                                                                                 (int)positionIds.dims.back(), rotaryDim, ropeTheta, ropeScale, preciseFreq);
     }
     FastllmCudaFinishInput(positionIds, cudaPositionIds);
     FastllmCudaFinishOutput(data, cudaData);
@@ -14723,18 +14997,80 @@ bool FastllmCudaDFlashDynamicConv(
     return true;
 }
 
+// A position-independent frequency vector preserves the former host powf
+// rounding. Evaluate only the requested positions; no context-sized table or
+// pointers that change at position-capacity boundaries are needed.
+__device__ __forceinline__ void FastllmDFlashRopeSinCos(
+        int position, float inverseFrequency, float &sine, float &cosine) {
+    const float angle = __fmul_rn((float)position, inverseFrequency);
+    double s, c;
+    sincos((double)angle, &s, &c);
+    sine = __double2float_rn(s);
+    cosine = __double2float_rn(c);
+}
+
+template <typename T>
+__global__ void FastllmDFlashApplyRopeKernel(
+        T *input, const float *positions, const float *inverseFrequency,
+        size_t pairs, int heads, int headDim) {
+    const size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= pairs) return;
+    const int halfDim = headDim / 2;
+    const int channel = index % halfDim;
+    const size_t row = index / halfDim;
+    const int position = (int)positions[row / heads];
+    float sine, cosine;
+    FastllmDFlashRopeSinCos(position, inverseFrequency[channel], sine, cosine);
+    T *values = input + row * headDim;
+    const float first = FastllmCudaValueToFloat(values[channel]);
+    const float second = FastllmCudaValueToFloat(values[channel + halfDim]);
+    values[channel] = FastllmCudaFloatToValue<T>(first * cosine - second * sine);
+    values[channel + halfDim] = FastllmCudaFloatToValue<T>(first * sine + second * cosine);
+}
+
+bool FastllmCudaDFlashApplyRope(
+        fastllm::Data &input, const fastllm::Data &positionIds,
+        const fastllm::Data &ropeInvFreq) {
+    if (input.dims.size() != 4 || input.dims[0] <= 0 || input.dims[1] <= 0 ||
+        input.dims[2] <= 0 || input.dims[3] <= 0 || input.dims[3] % 2 ||
+        positionIds.dims != std::vector<int>({input.dims[0], input.dims[1]}) ||
+        positionIds.dataType != fastllm::DataType::FLOAT32 ||
+        ropeInvFreq.dataType != fastllm::DataType::FLOAT32 ||
+        ropeInvFreq.dims != std::vector<int>({input.dims[3] / 2}) ||
+        !FastllmCudaDataHasDenseStrides(input) ||
+        !FastllmCudaDataHasDenseStrides(positionIds) ||
+        !FastllmCudaDataHasDenseStrides(ropeInvFreq) ||
+        !FastllmCudaDataCanShareDevice(input, positionIds) ||
+        !FastllmCudaDataCanShareDevice(input, ropeInvFreq)) return false;
+    int device = -1;
+    if (!FastllmCudaResolveDataDeviceId(input, device) ||
+        FastllmCudaGetDevice() != device) return false;
+    const size_t pairs = (size_t)input.dims[0] * input.dims[1] * input.dims[2] * (input.dims[3] / 2);
+    const unsigned int blocks = (unsigned int)((pairs + 255) / 256);
+#define DFLASH_APPLY_ROPE(TYPE) FastllmDFlashApplyRopeKernel<TYPE><<<blocks, 256, 0, cudaStreamPerThread>>>( \
+        (TYPE*)input.cudaData, (const float*)positionIds.cudaData, (const float*)ropeInvFreq.cudaData, \
+        pairs, input.dims[2], input.dims[3])
+    if (input.dataType == fastllm::DataType::BFLOAT16) { DFLASH_APPLY_ROPE(__nv_bfloat16); }
+    else if (input.dataType == fastllm::DataType::FLOAT16) { DFLASH_APPLY_ROPE(half); }
+    else if (input.dataType == fastllm::DataType::FLOAT32) { DFLASH_APPLY_ROPE(float); }
+    else return false;
+#undef DFLASH_APPLY_ROPE
+    cudaError_t state = cudaPeekAtLastError();
+    if (state != cudaSuccess) { cudaGetLastError(); return false; }
+    return true;
+}
+
 __global__ void FastllmDFlashPrepareQkvBf16Kernel(
         const __nv_bfloat16 *__restrict__ qkv,
         const float *__restrict__ qNormWeight,
         const float *__restrict__ kNormWeight,
         const float *__restrict__ positionIds,
-        const float *__restrict__ sinData,
-        const float *__restrict__ cosData,
+        const float *__restrict__ ropeInvFreq,
         half *__restrict__ query,
         half *__restrict__ key,
         half *__restrict__ value,
         int tokens, int projectionStride, int queryHeads,
-        int kvHeads, int headDim, int sinCosStride, float eps) {
+        int kvHeads, int headDim, float eps) {
     const int outputHead = blockIdx.x / tokens;
     const int token = blockIdx.x % tokens;
     int kind;
@@ -14815,9 +15151,8 @@ __global__ void FastllmDFlashPrepareQkvBf16Kernel(
     const int halfHeadDim = headDim / 2;
     if (tid < halfHeadDim) {
         const int position = (int)positionIds[token];
-        const float sine = sinData[(size_t)position * sinCosStride + tid];
-        const float cosine =
-            cosData[(size_t)position * sinCosStride + tid];
+        float sine, cosine;
+        FastllmDFlashRopeSinCos(position, ropeInvFreq[tid], sine, cosine);
         const float first = __bfloat162float(normalized[tid]);
         const float second =
             __bfloat162float(normalized[tid + halfHeadDim]);
@@ -14837,8 +15172,7 @@ bool FastllmCudaDFlashPrepareQKV(
         const fastllm::Data &qNormWeight,
         const fastllm::Data &kNormWeight,
         const fastllm::Data &positionIds,
-        const fastllm::Data &sinData,
-        const fastllm::Data &cosData,
+        const fastllm::Data &ropeInvFreq,
         fastllm::Data &query,
         fastllm::Data &key,
         fastllm::Data &value,
@@ -14848,8 +15182,7 @@ bool FastllmCudaDFlashPrepareQKV(
         qNormWeight.dataType != fastllm::DataType::FLOAT32 ||
         kNormWeight.dataType != fastllm::DataType::FLOAT32 ||
         positionIds.dataType != fastllm::DataType::FLOAT32 ||
-        sinData.dataType != fastllm::DataType::FLOAT32 ||
-        cosData.dataType != fastllm::DataType::FLOAT32 ||
+        ropeInvFreq.dataType != fastllm::DataType::FLOAT32 ||
         query.dataType != fastllm::DataType::FLOAT16 ||
         key.dataType != fastllm::DataType::FLOAT16 ||
         value.dataType != fastllm::DataType::FLOAT16 ||
@@ -14858,8 +15191,7 @@ bool FastllmCudaDFlashPrepareQKV(
         qNormWeight.dims != std::vector<int>({headDim}) ||
         kNormWeight.dims != std::vector<int>({headDim}) ||
         positionIds.dims != std::vector<int>({1, tokens}) ||
-        sinData.dims.size() != 2 || cosData.dims != sinData.dims ||
-        sinData.dims[1] < headDim ||
+        ropeInvFreq.dims != std::vector<int>({headDim / 2}) ||
         query.dims != std::vector<int>({queryHeads, tokens, headDim}) ||
         key.dims != std::vector<int>({kvHeads, tokens, headDim}) ||
         value.dims != std::vector<int>({kvHeads, tokens, headDim}) ||
@@ -14867,16 +15199,14 @@ bool FastllmCudaDFlashPrepareQKV(
         !FastllmCudaDataHasDenseStrides(qNormWeight) ||
         !FastllmCudaDataHasDenseStrides(kNormWeight) ||
         !FastllmCudaDataHasDenseStrides(positionIds) ||
-        !FastllmCudaDataHasDenseStrides(sinData) ||
-        !FastllmCudaDataHasDenseStrides(cosData) ||
+        !FastllmCudaDataHasDenseStrides(ropeInvFreq) ||
         !FastllmCudaDataHasDenseStrides(query) ||
         !FastllmCudaDataHasDenseStrides(key) ||
         !FastllmCudaDataHasDenseStrides(value) ||
         !FastllmCudaDataCanShareDevice(qkv, qNormWeight) ||
         !FastllmCudaDataCanShareDevice(qkv, kNormWeight) ||
         !FastllmCudaDataCanShareDevice(qkv, positionIds) ||
-        !FastllmCudaDataCanShareDevice(qkv, sinData) ||
-        !FastllmCudaDataCanShareDevice(qkv, cosData) ||
+        !FastllmCudaDataCanShareDevice(qkv, ropeInvFreq) ||
         !FastllmCudaDataCanShareDevice(qkv, query) ||
         !FastllmCudaDataCanShareDevice(qkv, key) ||
         !FastllmCudaDataCanShareDevice(qkv, value)) {
@@ -14895,12 +15225,11 @@ bool FastllmCudaDFlashPrepareQKV(
             (const float *)qNormWeight.cudaData,
             (const float *)kNormWeight.cudaData,
             (const float *)positionIds.cudaData,
-            (const float *)sinData.cudaData,
-            (const float *)cosData.cudaData,
+            (const float *)ropeInvFreq.cudaData,
             (half *)query.cudaData, (half *)key.cudaData,
             (half *)value.cudaData,
             tokens, qkv.dims[2], queryHeads, kvHeads, headDim,
-            sinData.dims[1], eps);
+            eps);
     cudaError_t state = cudaPeekAtLastError();
     if (state != cudaSuccess) {
         cudaGetLastError();
@@ -14984,12 +15313,11 @@ __global__ void FastllmDFlashMaterializeKvBf16Kernel(
         const __nv_bfloat16 *__restrict__ projectedKv,
         const float *__restrict__ kNormWeights,
         const float *__restrict__ positionIds,
-        const float *__restrict__ sinData,
-        const float *__restrict__ cosData,
+        const float *__restrict__ ropeInvFreq,
         half *__restrict__ output,
         FastllmDFlashKvCacheOutput cacheOutput,
         int tokens, int projectionStride, int kvHeads,
-        int headDim, int sinCosStride, float eps) {
+        int headDim, float eps) {
     int item = blockIdx.x;
     int kind = item & 1;
     item >>= 1;
@@ -15071,8 +15399,8 @@ __global__ void FastllmDFlashMaterializeKvBf16Kernel(
     const int halfHeadDim = headDim / 2;
     if (tid < halfHeadDim) {
         const int position = (int)positionIds[token];
-        const float sine = sinData[(size_t)position * sinCosStride + tid];
-        const float cosine = cosData[(size_t)position * sinCosStride + tid];
+        float sine, cosine;
+        FastllmDFlashRopeSinCos(position, ropeInvFreq[tid], sine, cosine);
         const float first = __bfloat162float(normalized[tid]);
         const float second =
             __bfloat162float(normalized[tid + halfHeadDim]);
@@ -15091,16 +15419,14 @@ bool FastllmCudaDFlashMaterializeKV(
         const fastllm::Data &projectedKv,
         const fastllm::Data &kNormWeights,
         const fastllm::Data &positionIds,
-        const fastllm::Data &sinData,
-        const fastllm::Data &cosData,
+        const fastllm::Data &ropeInvFreq,
         fastllm::Data &output,
         int layers, int tokens, int kvHeads, int headDim, float eps) {
     if (layers <= 0 || tokens <= 0 || kvHeads <= 0 || headDim != 128 ||
         projectedKv.dataType != fastllm::DataType::BFLOAT16 ||
         kNormWeights.dataType != fastllm::DataType::FLOAT32 ||
         positionIds.dataType != fastllm::DataType::FLOAT32 ||
-        sinData.dataType != fastllm::DataType::FLOAT32 ||
-        cosData.dataType != fastllm::DataType::FLOAT32 ||
+        ropeInvFreq.dataType != fastllm::DataType::FLOAT32 ||
         output.dataType != fastllm::DataType::FLOAT16 ||
         projectedKv.dims.size() != 3 || projectedKv.dims[0] != 1 ||
         projectedKv.dims[1] < tokens ||
@@ -15108,20 +15434,17 @@ bool FastllmCudaDFlashMaterializeKV(
         kNormWeights.dims != std::vector<int>({layers, headDim}) ||
         positionIds.dims.size() != 2 || positionIds.dims[0] != 1 ||
         positionIds.dims[1] < tokens ||
-        sinData.dims.size() != 2 || cosData.dims != sinData.dims ||
-        sinData.dims[1] < headDim ||
+        ropeInvFreq.dims != std::vector<int>({headDim / 2}) ||
         output.dims !=
             std::vector<int>({layers, 2, kvHeads, tokens, headDim}) ||
         !FastllmCudaDataHasDenseStrides(projectedKv) ||
         !FastllmCudaDataHasDenseStrides(kNormWeights) ||
         !FastllmCudaDataHasDenseStrides(positionIds) ||
-        !FastllmCudaDataHasDenseStrides(sinData) ||
-        !FastllmCudaDataHasDenseStrides(cosData) ||
+        !FastllmCudaDataHasDenseStrides(ropeInvFreq) ||
         !FastllmCudaDataHasDenseStrides(output) ||
         !FastllmCudaDataCanShareDevice(projectedKv, kNormWeights) ||
         !FastllmCudaDataCanShareDevice(projectedKv, positionIds) ||
-        !FastllmCudaDataCanShareDevice(projectedKv, sinData) ||
-        !FastllmCudaDataCanShareDevice(projectedKv, cosData) ||
+        !FastllmCudaDataCanShareDevice(projectedKv, ropeInvFreq) ||
         !FastllmCudaDataCanShareDevice(projectedKv, output)) {
         return false;
     }
@@ -15138,11 +15461,10 @@ bool FastllmCudaDFlashMaterializeKV(
             (const __nv_bfloat16 *)projectedKv.cudaData,
             (const float *)kNormWeights.cudaData,
             (const float *)positionIds.cudaData,
-            (const float *)sinData.cudaData,
-            (const float *)cosData.cudaData,
+            (const float *)ropeInvFreq.cudaData,
             (half *)output.cudaData, cacheOutput,
             tokens, projectedKv.dims[2], kvHeads, headDim,
-            sinData.dims[1], eps);
+            eps);
     cudaError_t state = cudaPeekAtLastError();
     if (state != cudaSuccess) {
         cudaGetLastError();
@@ -15155,8 +15477,7 @@ bool FastllmCudaDFlashMaterializeKVToCache(
         const fastllm::Data &projectedKv,
         const fastllm::Data &kNormWeights,
         const fastllm::Data &positionIds,
-        const fastllm::Data &sinData,
-        const fastllm::Data &cosData,
+        const fastllm::Data &ropeInvFreq,
         const std::vector<fastllm::Data*> &caches,
         int layers, int tokens, int kvHeads, int headDim, float eps) {
     if (layers != 5 || tokens <= 0 || kvHeads <= 0 || headDim != 128 ||
@@ -15164,21 +15485,18 @@ bool FastllmCudaDFlashMaterializeKVToCache(
         projectedKv.dataType != fastllm::DataType::BFLOAT16 ||
         kNormWeights.dataType != fastllm::DataType::FLOAT32 ||
         positionIds.dataType != fastllm::DataType::FLOAT32 ||
-        sinData.dataType != fastllm::DataType::FLOAT32 ||
-        cosData.dataType != fastllm::DataType::FLOAT32 ||
+        ropeInvFreq.dataType != fastllm::DataType::FLOAT32 ||
         projectedKv.dims.size() != 3 || projectedKv.dims[0] != 1 ||
         projectedKv.dims[1] < tokens ||
         projectedKv.dims[2] != layers * 2 * kvHeads * headDim ||
         kNormWeights.dims != std::vector<int>({layers, headDim}) ||
         positionIds.dims.size() != 2 || positionIds.dims[0] != 1 ||
         positionIds.dims[1] < tokens ||
-        sinData.dims.size() != 2 || cosData.dims != sinData.dims ||
-        sinData.dims[1] < headDim ||
+        ropeInvFreq.dims != std::vector<int>({headDim / 2}) ||
         !FastllmCudaDataHasDenseStrides(projectedKv) ||
         !FastllmCudaDataHasDenseStrides(kNormWeights) ||
         !FastllmCudaDataHasDenseStrides(positionIds) ||
-        !FastllmCudaDataHasDenseStrides(sinData) ||
-        !FastllmCudaDataHasDenseStrides(cosData)) {
+        !FastllmCudaDataHasDenseStrides(ropeInvFreq)) {
         return false;
     }
     int device = -1;
@@ -15186,8 +15504,7 @@ bool FastllmCudaDFlashMaterializeKVToCache(
         FastllmCudaGetDevice() != device ||
         !FastllmCudaDataCanShareDevice(projectedKv, kNormWeights) ||
         !FastllmCudaDataCanShareDevice(projectedKv, positionIds) ||
-        !FastllmCudaDataCanShareDevice(projectedKv, sinData) ||
-        !FastllmCudaDataCanShareDevice(projectedKv, cosData)) {
+        !FastllmCudaDataCanShareDevice(projectedKv, ropeInvFreq)) {
         return false;
     }
 
@@ -15231,11 +15548,10 @@ bool FastllmCudaDFlashMaterializeKVToCache(
             (const __nv_bfloat16 *)projectedKv.cudaData,
             (const float *)kNormWeights.cudaData,
             (const float *)positionIds.cudaData,
-            (const float *)sinData.cudaData,
-            (const float *)cosData.cudaData,
+            (const float *)ropeInvFreq.cudaData,
             nullptr, cacheOutput,
             tokens, projectedKv.dims[2], kvHeads, headDim,
-            sinData.dims[1], eps);
+            eps);
     cudaError_t state = cudaPeekAtLastError();
     if (state != cudaSuccess) {
         cudaGetLastError();
@@ -15826,6 +16142,184 @@ bool FastllmCudaTopKTopPSampling(float *logits, float *temperatures,
         nullptr, nullptr, nullptr, nullptr, 0, 0.09f, 0.3f);
 }
 
+namespace {
+// Both proposal generation and target verification use the same distribution
+// as TopKTopPSamplingFromProb: intersect top-k and top-p on the original
+// temperature softmax. Applying top-k first and then top-p would change p.
+struct FastllmMtpSamplingWorkspace {
+    uint8_t *scratch = nullptr;
+    bool own = false;
+    float *a, *b, *temperatures, *topPs;
+    int *topKs, *output, *draftIds, *accepted, *emitted;
+    bool *valid;
+    flashinfer::sampling::RadixRowState *rowStates;
+    explicit FastllmMtpSamplingWorkspace(int rows, int vocab) {
+        size_t need = 0;
+        auto reserve = [&](size_t bytes) {
+            size_t offset = need;
+            need += FastllmCudaAlignBytes(bytes, 256);
+            return offset;
+        };
+        size_t ao = reserve((size_t)rows * vocab * sizeof(float));
+        size_t bo = reserve((size_t)rows * vocab * sizeof(float));
+        size_t to = reserve(rows * sizeof(float)), ko = reserve(rows * sizeof(int));
+        size_t po = reserve(rows * sizeof(float)), oo = reserve(rows * sizeof(int));
+        size_t doff = reserve(rows * sizeof(int)), ac = reserve(rows * sizeof(int));
+        size_t em = reserve(rows * sizeof(int)), va = reserve(rows * sizeof(bool));
+        size_t rs = reserve(rows * sizeof(flashinfer::sampling::RadixRowState));
+        size_t bytes = 0;
+        scratch = (uint8_t*)FastllmBorrowDequantScratch(need, &bytes, &own);
+        if (!scratch || bytes < need) {
+            FastllmReleaseDequantScratch(scratch, own);
+            scratch = nullptr;
+            return;
+        }
+        a = (float*)(scratch + ao); b = (float*)(scratch + bo);
+        temperatures = (float*)(scratch + to); topKs = (int*)(scratch + ko);
+        topPs = (float*)(scratch + po); output = (int*)(scratch + oo);
+        draftIds = (int*)(scratch + doff); accepted = (int*)(scratch + ac);
+        emitted = (int*)(scratch + em); valid = (bool*)(scratch + va);
+        rowStates = (flashinfer::sampling::RadixRowState*)(scratch + rs);
+    }
+    ~FastllmMtpSamplingWorkspace() { FastllmReleaseDequantScratch(scratch, own); }
+    bool Prepare(float *logits, const float *hostTemperatures,
+                 const int *hostTopKs, const float *hostTopPs, int rows, int vocab) {
+        if (!scratch) return false;
+        std::vector<float> ts(rows), ps(rows);
+        std::vector<int> ks(rows);
+        bool needTopP = false, needTopK = false;
+        for (int i = 0; i < rows; ++i) {
+            if (!std::isfinite(hostTemperatures[i]) || hostTemperatures[i] <= 0 ||
+                !std::isfinite(hostTopPs[i]) || hostTopPs[i] <= 0 || hostTopPs[i] > 1)
+                return false;
+            ts[i] = hostTemperatures[i];
+            ps[i] = hostTopPs[i];
+            ks[i] = hostTopKs[i] <= 0 ? vocab : std::min(hostTopKs[i], vocab);
+            needTopP |= ps[i] < 1;
+            needTopK |= ks[i] < vocab;
+        }
+        FastllmCudaCopyFromHostToDevice(temperatures, ts.data(), rows * sizeof(float));
+        FastllmCudaCopyFromHostToDevice(topKs, ks.data(), rows * sizeof(int));
+        FastllmCudaCopyFromHostToDevice(topPs, ps.data(), rows * sizeof(float));
+        cudaStream_t stream = cudaStreamPerThread;
+        FastllmTemperatureSoftmaxKernel<1024><<<rows, 1024, 0, stream>>>(
+            logits, a, temperatures, vocab);
+        cudaError_t state = cudaGetLastError();
+        if (state == cudaSuccess && needTopP) {
+            state = flashinfer::sampling::TopPRenormProb<float>(
+                a, b, topPs, rows, 1.0f, vocab, stream);
+            std::swap(a, b);
+        }
+        if (state == cudaSuccess && needTopK) {
+            state = cudaMemsetAsync(rowStates, 0,
+                rows * sizeof(flashinfer::sampling::RadixRowState), stream);
+            if (state == cudaSuccess) {
+                state = flashinfer::sampling::RadixTopKRenormProbMultiCTA<float, int>(
+                    a, b, topKs, rows, 0, vocab, rowStates, stream);
+                std::swap(a, b);
+            }
+        }
+        return state == cudaSuccess;
+    }
+};
+uint64_t FastllmMtpSamplingSeed() {
+    static thread_local std::mt19937_64 rng(std::random_device{}());
+    return rng();
+}
+}
+
+bool FastllmCudaMtpSampleDraft(float *logits, float *proposalProbs,
+                              const float *temperatures, const int *topKs,
+                              const float *topPs, int *output, int batch, int vocabSize) {
+    if (!logits || !proposalProbs || !temperatures || !topKs || !topPs ||
+        !output || batch <= 0 || vocabSize <= 0) return false;
+    FastllmMtpSamplingWorkspace ws(batch, vocabSize);
+    if (!ws.Prepare(logits, temperatures, topKs, topPs, batch, vocabSize)) return false;
+    cudaStream_t stream = cudaStreamPerThread;
+    // Persist exactly the probabilities used for sampling, before scratch reuse.
+    cudaError_t state = cudaMemcpyAsync(proposalProbs, ws.a,
+        (size_t)batch * vocabSize * sizeof(float), cudaMemcpyDeviceToDevice, stream);
+    if (state == cudaSuccess) {
+        state = flashinfer::sampling::SamplingFromProb<float, int>(
+            proposalProbs, ws.output, ws.valid, nullptr, batch, vocabSize, true,
+            nullptr, FastllmMtpSamplingSeed(), nullptr, 0, stream);
+    }
+    if (state != cudaSuccess) return false;
+    FastllmCudaCopyFromDeviceToHost(output, ws.output, batch * sizeof(int));
+    DeviceSync();
+    return std::all_of(output, output + batch,
+                       [vocabSize](int id) { return id >= 0 && id < vocabSize; });
+}
+
+bool FastllmCudaMtpRejectionSampling(float *logits, float *proposalProbs,
+                                    const float *temperatures, const int *topKs,
+                                    const float *topPs, const int *draftTokenIds,
+                                    int *output, int *acceptedDraftTokens,
+                                    int batch, int draftTokens, int vocabSize) {
+    if (!logits || !proposalProbs || !temperatures || !topKs || !topPs ||
+        !draftTokenIds || !output || !acceptedDraftTokens || batch <= 0 ||
+        draftTokens <= 0 || vocabSize <= 0) return false;
+    const int rows = batch * (draftTokens + 1);
+    for (int i = 0; i < batch * draftTokens; ++i)
+        if (draftTokenIds[i] < 0 || draftTokenIds[i] >= vocabSize) return false;
+    FastllmMtpSamplingWorkspace ws(rows, vocabSize);
+    if (!ws.Prepare(logits, temperatures, topKs, topPs, rows, vocabSize)) return false;
+    FastllmCudaCopyFromHostToDevice(ws.draftIds, (void*)draftTokenIds,
+                                   batch * draftTokens * sizeof(int));
+    cudaStream_t stream = cudaStreamPerThread;
+    cudaError_t state = cudaMemsetAsync(ws.accepted, 0, batch * sizeof(int), stream);
+    if (state == cudaSuccess)
+        state = cudaMemsetAsync(ws.emitted, 0, batch * sizeof(int), stream);
+    if (state == cudaSuccess) {
+        state = flashinfer::sampling::ChainSpeculativeSampling<float, int>(
+            proposalProbs, ws.draftIds, ws.a, ws.output, ws.accepted, ws.emitted,
+            batch, draftTokens, vocabSize, true, nullptr, FastllmMtpSamplingSeed(),
+            nullptr, 0, stream);
+    }
+    if (state != cudaSuccess) return false;
+    FastllmCudaCopyFromDeviceToHost(output, ws.output, rows * sizeof(int));
+    // emitted counts the accepted prefix; accepted also counts later positions
+    // after the first rejection and must never be used as the commit length.
+    FastllmCudaCopyFromDeviceToHost(acceptedDraftTokens, ws.emitted, batch * sizeof(int));
+    DeviceSync();
+    for (int b = 0; b < batch; ++b) {
+        int n = acceptedDraftTokens[b];
+        if (n < 0 || n > draftTokens) return false;
+        for (int i = 0; i <= n; ++i)
+            if (output[b * (draftTokens + 1) + i] < 0 ||
+                output[b * (draftTokens + 1) + i] >= vocabSize) return false;
+    }
+    return true;
+}
+
+bool FastllmCudaMtpRejectionSamplingLogits(float *logits,
+        const float *proposalLogits, const float *proposalLogsumexp,
+        const int *deviceDraftTokens, const float *temperatures,
+        const int *topKs, const float *topPs, int *output, int *accepted,
+        int batch, int drafts, int vocab) {
+    if (!logits || !proposalLogits || !proposalLogsumexp || !deviceDraftTokens ||
+        !temperatures || !topKs || !topPs || !output || !accepted ||
+        batch <= 0 || drafts <= 0 || drafts > 8 || vocab <= 0) return false;
+    const int rows = batch * (drafts + 1);
+    FastllmMtpSamplingWorkspace ws(rows, vocab);
+    if (!ws.Prepare(logits, temperatures, topKs, topPs, rows, vocab)) return false;
+    return FastllmCudaMtpRejectionFromProbs(ws.a, proposalLogits, proposalLogsumexp,
+        deviceDraftTokens, output, accepted, batch, drafts, vocab);
+}
+
+bool FastllmCudaMtpRejectionSamplingLogitsBatch(float *logits,
+        const FastllmMtpProposalView *proposals, const float *temperatures,
+        const int *topKs, const float *topPs, int *output, int *accepted,
+        int batch, int drafts, int vocab) {
+    if (!logits || !proposals || !temperatures || !topKs || !topPs ||
+        !output || !accepted || batch <= 0 || drafts <= 0 || drafts > 8 || vocab <= 0) return false;
+    const int rows = batch * (drafts + 1);
+    FastllmMtpSamplingWorkspace ws(rows, vocab);
+    if (!ws.Prepare(logits, temperatures, topKs, topPs, rows, vocab)) return false;
+    return FastllmCudaMtpRejectionFromProbsBatch(ws.a, proposals,
+        output, accepted, batch, drafts, vocab);
+}
+
 struct FastllmGreedyPartial {
     float value;
     int id;
@@ -15837,18 +16331,20 @@ __device__ __forceinline__ bool FastllmGreedyIsBetter(
            (value == bestValue && id < bestId);
 }
 
-template <int THREAD_PER_BLOCK>
-__global__ void FastllmGreedySamplingKernel(float *logits, int *output,
-                                            float *floatOutput, int vocabSize) {
+template <int THREAD_PER_BLOCK, typename T = float>
+__global__ void FastllmGreedySamplingKernel(const T *logits, int *output,
+                                            float *floatOutput, int vocabSize,
+                                            const int *tokenMap = nullptr,
+                                            float *scores = nullptr) {
     int b = blockIdx.x;
     int tid = threadIdx.x;
-    float *row = logits + (long long)b * vocabSize;
+    const T *row = logits + (long long)b * vocabSize;
 
     __shared__ float maxData[THREAD_PER_BLOCK];
     __shared__ int idData[THREAD_PER_BLOCK];
     float localMax = -INFINITY;
     int localId = 0;
-    for (int i = tid; i < vocabSize; i += THREAD_PER_BLOCK) {
+    for (int64_t i = tid; i < vocabSize; i += THREAD_PER_BLOCK) {
         float v = row[i];
         // Token IDs increase monotonically in this loop, so strict greater
         // already preserves the smallest ID for equal values in one lane.
@@ -15872,9 +16368,11 @@ __global__ void FastllmGreedySamplingKernel(float *logits, int *output,
     }
 
     if (tid == 0) {
-        output[b] = idData[0];
+        int token = tokenMap ? tokenMap[idData[0]] : idData[0];
+        output[b] = token;
+        if (scores != nullptr) scores[b] = maxData[0];
         if (floatOutput != nullptr) {
-            floatOutput[b] = (float)idData[0];
+            floatOutput[b] = (float)token;
         }
     }
 }
@@ -15891,20 +16389,20 @@ __device__ __forceinline__ void FastllmGreedyWarpReduce(
     }
 }
 
-template <int THREAD_PER_BLOCK>
+template <int THREAD_PER_BLOCK, typename T = float>
 __global__ void FastllmGreedySamplingPartialKernel(
-        const float *logits, FastllmGreedyPartial *partials,
+        const T *logits, FastllmGreedyPartial *partials,
         int vocabSize, int partCount) {
     int part = blockIdx.x;
     int batch = blockIdx.y;
-    int chunk = (vocabSize + partCount - 1) / partCount;
+    int chunk = (vocabSize - 1) / partCount + 1;
     int start = part * chunk;
-    int end = min(vocabSize, start + chunk);
-    const float *row = logits + (int64_t)batch * vocabSize;
+    int end = start + min(chunk, vocabSize - start);
+    const T *row = logits + (int64_t)batch * vocabSize;
 
     float localMax = -INFINITY;
-    int localId = start;
-    for (int i = start + threadIdx.x; i < end;
+    int localId = 0;
+    for (int64_t i = (int64_t)start + threadIdx.x; i < end;
          i += THREAD_PER_BLOCK) {
         float value = row[i];
         if (value > localMax) {
@@ -15937,22 +16435,27 @@ __global__ void FastllmGreedySamplingPartialKernel(
 
 __global__ void FastllmGreedySamplingFinalizeKernel(
         const FastllmGreedyPartial *partials, int *output,
-        float *floatOutput, int partCount) {
+        float *floatOutput, int partCount, const int *tokenMap = nullptr,
+        float *scores = nullptr) {
     int batch = blockIdx.x;
     int lane = threadIdx.x;
     float localMax = -INFINITY;
     int localId = 0;
-    if (lane < partCount) {
+    for (int part = lane; part < partCount; part += 32) {
         FastllmGreedyPartial partial =
-            partials[(int64_t)batch * partCount + lane];
-        localMax = partial.value;
-        localId = partial.id;
+            partials[(int64_t)batch * partCount + part];
+        if (FastllmGreedyIsBetter(partial.value, partial.id, localMax, localId)) {
+            localMax = partial.value;
+            localId = partial.id;
+        }
     }
     FastllmGreedyWarpReduce(localMax, localId);
     if (lane == 0) {
-        output[batch] = localId;
+        int token = tokenMap ? tokenMap[localId] : localId;
+        output[batch] = token;
+        if (scores != nullptr) scores[batch] = localMax;
         if (floatOutput != nullptr) {
-            floatOutput[batch] = (float)localId;
+            floatOutput[batch] = (float)token;
         }
     }
 }
@@ -16032,6 +16535,85 @@ bool FastllmCudaGreedySamplingWithFloatOutput(float *logits, int *output,
         return false;
     }
     return true;
+}
+
+// Shape-based dispatch; no vocabulary/model-specific assumptions. Small
+// vocabularies and larger batches keep a single CTA per row to avoid the
+// extra launch when row parallelism is already sufficient.
+static int FastllmGreedyTypedPartCount(int batch, int vocabSize) {
+    if (batch <= 0 || batch > 8 || vocabSize < 16384) return 1;
+    return vocabSize >= 196608 ? 128 : (vocabSize >= 65536 ? 64 : 32);
+}
+
+size_t FastllmCudaGreedySamplingWorkspaceBytes(int batch, int vocabSize) {
+    if (batch <= 0 || vocabSize <= 0) return 0;
+    int parts = FastllmGreedyTypedPartCount(batch, vocabSize);
+    return parts == 1 ? 0 : (size_t)batch * parts * sizeof(FastllmGreedyPartial);
+}
+
+template <typename T>
+static bool FastllmLaunchTypedGreedy(
+        const T *logits, int *output, float *floatOutput,
+        const int *tokenMap, int batch, int vocabSize,
+        void *scratch, size_t scratchBytes, float *scores = nullptr) {
+    int parts = FastllmGreedyTypedPartCount(batch, vocabSize);
+    size_t required = FastllmCudaGreedySamplingWorkspaceBytes(batch, vocabSize);
+    // Insufficient scratch is rejected before any work is submitted.
+    if (required && (!scratch || scratchBytes < required ||
+                     reinterpret_cast<uintptr_t>(scratch) % alignof(FastllmGreedyPartial))) {
+        return false;
+    }
+    if (parts == 1) {
+        FastllmGreedySamplingKernel<256><<<batch, 256>>>(
+            logits, output, floatOutput, vocabSize, tokenMap, scores);
+    } else {
+        FastllmGreedySamplingPartialKernel<256><<<dim3(parts, batch), 256>>>(
+            logits, (FastllmGreedyPartial*)scratch, vocabSize, parts);
+        if (cudaGetLastError() != cudaSuccess) return false;
+        FastllmGreedySamplingFinalizeKernel<<<batch, 32>>>(
+            (const FastllmGreedyPartial*)scratch, output, floatOutput, parts, tokenMap, scores);
+    }
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool FastllmCudaGreedySamplingTyped(
+        const void *logits, fastllm::DataType type, int *output,
+        float *floatOutput, const int *tokenMap, int batch, int vocabSize,
+        void *scratch, size_t scratchBytes) {
+    if (batch == 0) return true;
+    if (batch < 0 || vocabSize <= 0 || !logits || !output) return false;
+    switch (type) {
+        case fastllm::DataType::FLOAT32:
+            return FastllmLaunchTypedGreedy((const float*)logits, output,
+                floatOutput, tokenMap, batch, vocabSize, scratch, scratchBytes);
+        case fastllm::DataType::FLOAT16:
+            return FastllmLaunchTypedGreedy((const half*)logits, output,
+                floatOutput, tokenMap, batch, vocabSize, scratch, scratchBytes);
+        case fastllm::DataType::BFLOAT16:
+            return FastllmLaunchTypedGreedy((const __nv_bfloat16*)logits, output,
+                floatOutput, tokenMap, batch, vocabSize, scratch, scratchBytes);
+        default:
+            return false;
+    }
+}
+
+bool FastllmCudaGreedySamplingTypedWithScores(
+        const void *logits, fastllm::DataType type, int *output, float *scores,
+        int batch, int vocabSize, void *scratch, size_t scratchBytes) {
+    if (batch == 0) return true;
+    if (batch < 0 || vocabSize <= 0 || !logits || !output || !scores) return false;
+    switch (type) {
+        case fastllm::DataType::FLOAT32:
+            return FastllmLaunchTypedGreedy((const float*)logits, output,
+                nullptr, nullptr, batch, vocabSize, scratch, scratchBytes, scores);
+        case fastllm::DataType::FLOAT16:
+            return FastllmLaunchTypedGreedy((const half*)logits, output,
+                nullptr, nullptr, batch, vocabSize, scratch, scratchBytes, scores);
+        case fastllm::DataType::BFLOAT16:
+            return FastllmLaunchTypedGreedy((const __nv_bfloat16*)logits, output,
+                nullptr, nullptr, batch, vocabSize, scratch, scratchBytes, scores);
+        default: return false;
+    }
 }
 
 struct FastllmGreedyCandidate {
@@ -17040,8 +17622,16 @@ __global__ void FastllmShiftAppendConv1DPerChannelSiluMultiTokenHalfPointerKerne
     cacheRow[3] = x3;
 }
 
+// One request and at most seven prefix snapshots fit in launch parameters.
+// This avoids staging a device pointer table for the single-request path.
+struct FastllmInlineConvCachePointers {
+    half *values[8];
+    __device__ half *operator[](int index) const { return values[index]; }
+};
+
+template <typename PointerTable>
 __global__ void FastllmShiftAppendConv1DPerChannelSiluMultiTokenMajorHalfPointerKernel(
-    half **pointers, const half *newTokens, const float *weight,
+    PointerTable pointers, const half *newTokens, const float *weight,
     const float *bias, half *output, int batch, int channels,
     int numTokens, int inputChannels, int inputOffset, int numSnaps) {
     int row = blockIdx.x * blockDim.x + threadIdx.x;
@@ -17759,7 +18349,8 @@ bool FastllmCudaShiftAppendConv1DPerChannelSiluMultiTokenFloat16(
         snap->dataType = cache.dataType;
         snap->Resize(cache.dims);
         snap->ToDevice(cache.dataDevice, std::vector<int>{cacheDevice});
-        snap->Allocate();
+        // The kernel fully overwrites the snapshot before it is read.
+        snap->Allocate(false);
         snap->isLinearAttentionTransposed = false;
         if (snap->cudaData == nullptr || !FastllmCudaDataHasDenseStrides(*snap) ||
             !FastllmCudaDataCanShareDevice(cache, *snap)) {
@@ -17891,7 +18482,8 @@ bool FastllmCudaShiftAppendConv1DPerChannelSiluMultiTokenFloat16BatchPointers(
             snapshot->Resize(first.dims);
             snapshot->ToDevice(fastllm::DataDevice::CUDA,
                                std::vector<int>{device});
-            snapshot->Allocate();
+            // The kernel fully overwrites the snapshot before it is read.
+            snapshot->Allocate(false);
             snapshot->isLinearAttentionTransposed = false;
             if (snapshot->cudaData == nullptr ||
                 !FastllmCudaDataHasDenseStrides(*snapshot) ||
@@ -17913,6 +18505,26 @@ bool FastllmCudaShiftAppendConv1DPerChannelSiluMultiTokenFloat16BatchPointers(
     if (output.cudaData == nullptr || !FastllmCudaDataHasDenseStrides(output) ||
         !FastllmCudaDataCanShareDevice(first, output)) {
         return false;
+    }
+    if (batch == 1 && tokenMajorInput && numTokenCaches > 0 &&
+        numTokens <= FASTLLM_CUDA_MTP_FAST_SEQ_MAX && pointers.size() <= 8) {
+        FastllmInlineConvCachePointers inlinePointers = {};
+        for (size_t i = 0; i < pointers.size(); ++i) {
+            inlinePointers.values[i] = static_cast<half*>(pointers[i]);
+        }
+        FastllmShiftAppendConv1DPerChannelSiluMultiTokenMajorHalfPointerKernel
+            <<<(channels + 255) / 256, 256>>>(
+                inlinePointers, (const half*)newTokens.cudaData,
+                (const float*)weight.cudaData,
+                bias.dims.empty() ? nullptr : (const float*)bias.cudaData,
+                (half*)output.cudaData, batch, channels, numTokens,
+                newTokens.dims[2], tokenMajorInputOffset, numTokenCaches);
+        cudaError_t state = cudaGetLastError();
+        if (state != cudaSuccess) {
+            checkCudaErrors("Error: CUDA error in single-request token-major conv.", state);
+            return false;
+        }
+        return true;
     }
     void **devicePointers = FastllmCudaStagePointers(pointers);
     int total = batch * channels;
@@ -18820,6 +19432,27 @@ int GetPointerDeviceId(void *ptr) {
         cudaGetLastError();
         return -1;
     }
+}
+
+int FastllmCudaGetHostNumaNode(int device) {
+#if defined(__linux__) && !defined(USE_ROCM)
+    char busId[32];
+    if (cudaDeviceGetPCIBusId(busId, sizeof(busId), device) != cudaSuccess) {
+        return -1;
+    }
+    unsigned domain, bus, slot, function;
+    if (std::sscanf(busId, "%x:%x:%x.%x", &domain, &bus, &slot, &function) != 4) {
+        return -1;
+    }
+    char path[128];
+    std::snprintf(path, sizeof(path),
+        "/sys/bus/pci/devices/%04x:%02x:%02x.%x/numa_node",
+        domain, bus, slot, function);
+    int node = -1;
+    std::ifstream file(path);
+    if (file >> node) return node;
+#endif
+    return -1;
 }
 
 int FastllmCudaGetDeviceCount() {
@@ -20320,7 +20953,89 @@ static bool LaunchFastllmRecurrentGatedDeltaRuleBatchFromConvBaTransposedHalfWar
     return true;
 }
 
-template <int TILE_V>
+// Keep the same two-warp reduction order as the fused sequence kernel.
+// Prepared values stay FP32; state rounding still occurs after every token.
+__global__ void FastllmGdnSequencePrepare128Kernel(
+    const half *conv, const half *ba, const float *norm,
+    const float *aLog, const float *dtBias, float *qk, float *coeff,
+    int seqLen, int numKHeads, int numVHeads, int headVDim, float eps) {
+    const int head = blockIdx.x, token = blockIdx.y, batch = blockIdx.z;
+    const int tid = threadIdx.x, lane = tid & 31;
+    constexpr int headKDim = 128;
+    const int channels = 2 * numKHeads * headKDim + numVHeads * headVDim;
+    const half *row = conv + ((size_t)batch * seqLen + token) * channels;
+    const float2 q = __half22float2(
+        reinterpret_cast<const half2*>(row + head * headKDim)[tid]);
+    const float2 k = __half22float2(
+        reinterpret_cast<const half2*>(row + (numKHeads + head) * headKDim)[tid]);
+    float qSum = q.x * q.x + q.y * q.y;
+    float kSum = k.x * k.x + k.y * k.y;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        qSum += __shfl_down_sync(0xffffffff, qSum, offset);
+        kSum += __shfl_down_sync(0xffffffff, kSum, offset);
+    }
+    __shared__ float sums[4];
+    if (lane == 0) {
+        sums[tid >> 5] = qSum;
+        sums[2 + (tid >> 5)] = kSum;
+    }
+    __syncthreads();
+    const float qScale = rsqrtf((sums[0] + sums[1]) / headKDim + eps);
+    const float kScale = rsqrtf((sums[2] + sums[3]) / headKDim + eps);
+    const float w0 = __ldg(norm + tid * 2), w1 = __ldg(norm + tid * 2 + 1);
+    float *dst = qk +
+        (((size_t)batch * seqLen + token) * numKHeads + head) * 2 * headKDim;
+    dst[tid * 2] = q.x * qScale * w0;
+    dst[tid * 2 + 1] = q.y * qScale * w1;
+    dst[headKDim + tid * 2] = k.x * kScale * w0;
+    dst[headKDim + tid * 2 + 1] = k.y * kScale * w1;
+    const int group = numVHeads / numKHeads;
+    for (int index = tid; index < group; index += 64) {
+        const int valueHead = head * group + index;
+        const half *input = ba + ((size_t)batch * seqLen + token) * numVHeads * 2;
+        const float bRaw = __half2float(input[valueHead]);
+        const float aRaw = __half2float(input[numVHeads + valueHead]);
+        const float gRaw = -__expf(aLog[valueHead]) *
+            softplus_fast(aRaw + dtBias[valueHead]);
+        float *output = coeff +
+            (((size_t)batch * seqLen + token) * numVHeads + valueHead) * 2;
+        output[0] = 1.0f / (1.0f + __expf(-bRaw));
+        output[1] = __expf(gRaw);
+    }
+}
+
+static float *FastllmGdnSequencePrepareScratch(int device, size_t count) {
+    struct Scratch {
+        void *data = nullptr;
+        size_t bytes = 0;
+        int device = -1;
+        ~Scratch() {
+            if (data == nullptr) return;
+            int previous = 0;
+            cudaGetDevice(&previous);
+            cudaSetDevice(device);
+            FastllmCudaFree(data);
+            cudaSetDevice(previous);
+        }
+    };
+    // Each worker launches on its own per-thread default stream. Reusing this
+    // workspace between layers is safe there; graph scopes retain the old path.
+    static thread_local std::map<int, Scratch> scratches;
+    Scratch &scratch = scratches[device];
+    const size_t bytes = count * sizeof(float);
+    if (scratch.bytes < bytes) {
+        if (scratch.data != nullptr) {
+            FastllmCudaSyncCurrentThreadStream();
+            FastllmCudaFree(scratch.data);
+        }
+        scratch.data = FastllmCudaMalloc(bytes);
+        scratch.bytes = scratch.data == nullptr ? 0 : bytes;
+        scratch.device = device;
+    }
+    return (float*)scratch.data;
+}
+
+template <int TILE_V, bool RESTORE = false, bool PREPARED = false>
 __global__ void FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWarpKernel(
     const half *convOutput,
     const half *ba,
@@ -20333,13 +21048,18 @@ __global__ void FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWa
     float eps, float qScale,
     half *snap0, half *snap1, half *snap2, half *snap3, half *snap4,
     half *snap5, half *snap6,
-    half **snapshotPointers, int numSnaps) {
+    half **snapshotPointers, int numSnaps,
+    void **prefixLengths = nullptr, half **initialStates = nullptr,
+    const float *preparedQk = nullptr, const float *preparedBa = nullptr) {
     int head_idx = blockIdx.x;
     int v_base = blockIdx.y * TILE_V;
     if (head_idx >= numVHeads || v_base >= headVDim) {
         return;
     }
 
+    int batchIndex = blockIdx.z;
+    int restoreLen = RESTORE ? (int)(size_t)prefixLengths[batchIndex] : seqLen;
+    if (RESTORE && restoreLen == seqLen) return;
     int tid = threadIdx.x;
     int warp_id = tid >> 5;
     int lane_id = tid & 31;
@@ -20357,7 +21077,6 @@ __global__ void FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWa
     float *scales = warp_k + seqLen * 2;
     float *ba_values = scales + seqLen * 2;
 
-    int batchIndex = blockIdx.z;
     if (statePointers != nullptr) {
         last_recurrent_state = statePointers[batchIndex];
     }
@@ -20366,76 +21085,95 @@ __global__ void FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWa
         last_recurrent_state + stateHeadBase + (size_t)v_col * headKDim :
         last_recurrent_state;
 
-    // Normalize the short sequence together. Once these shared values are
-    // ready, each warp owns its state row and needs no block-wide barriers
-    // between recurrent steps.
-    for (int token = tid / 64; token < seqLen; token += blockDim.x / 64) {
-        int convBase = (batchIndex * seqLen + token) * qkvDim;
-        int qOffset = convBase + qHead * headKDim;
-        int kOffset = convBase + numKHeads * headKDim + qHead * headKDim;
-        int normTid = tid % 64;
-        const half2 *q_h2 = reinterpret_cast<const half2*>(convOutput + qOffset);
-        const half2 *k_h2 = reinterpret_cast<const half2*>(convOutput + kOffset);
-        half2 qh = q_h2[normTid];
-        half2 kh = k_h2[normTid];
-        float2 qf = __half22float2(qh);
-        float2 kf = __half22float2(kh);
-        float q_sum2 = qf.x * qf.x + qf.y * qf.y;
-        float k_sum2 = kf.x * kf.x + kf.y * kf.y;
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            q_sum2 += __shfl_down_sync(0xffffffff, q_sum2, offset);
-            k_sum2 += __shfl_down_sync(0xffffffff, k_sum2, offset);
-        }
-        if (lane_id == 0) {
-            int norm_warp = normTid >> 5;
-            warp_q[token * 2 + norm_warp] = q_sum2;
-            warp_k[token * 2 + norm_warp] = k_sum2;
-        }
-    }
-    __syncthreads();
+    const half *initialRow = RESTORE ?
+        initialStates[batchIndex] + stateHeadBase + (size_t)v_col * headKDim : state_row;
 
-    for (int token = warp_id; token < seqLen; token += TILE_V) {
-        float q_val = lane_id < 2 ? warp_q[token * 2 + lane_id] : 0.0f;
-        float k_val = lane_id < 2 ? warp_k[token * 2 + lane_id] : 0.0f;
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            q_val += __shfl_down_sync(0xffffffff, q_val, offset);
-            k_val += __shfl_down_sync(0xffffffff, k_val, offset);
+    // The batched eager path prepares each Q/K head once instead of repeating
+    // its normalization and gate activations in every V-state tile. The
+    // existing path remains available for single requests, restore and graphs.
+    const float *qValues = q_norm;
+    const float *kValues = k_norm;
+    const float *gateValues = ba_values;
+    const int qTokenStride = PREPARED ? numKHeads * 2 * headKDim : headKDim;
+    const int gateTokenStride = PREPARED ? numVHeads * 2 : 2;
+    if constexpr (PREPARED) {
+        qValues = preparedQk +
+            ((size_t)batchIndex * seqLen * numKHeads + qHead) * 2 * headKDim;
+        kValues = qValues + headKDim;
+        gateValues = preparedBa +
+            ((size_t)batchIndex * seqLen * numVHeads + head_idx) * 2;
+    } else {
+        // Normalize the short sequence together. Once these shared values are
+        // ready, each warp owns its state row and needs no block-wide barriers
+        // between recurrent steps.
+        for (int token = tid / 64; token < restoreLen; token += blockDim.x / 64) {
+            int convBase = (batchIndex * seqLen + token) * qkvDim;
+            int qOffset = convBase + qHead * headKDim;
+            int kOffset = convBase + numKHeads * headKDim + qHead * headKDim;
+            int normTid = tid % 64;
+            const half2 *q_h2 = reinterpret_cast<const half2*>(convOutput + qOffset);
+            const half2 *k_h2 = reinterpret_cast<const half2*>(convOutput + kOffset);
+            half2 qh = q_h2[normTid];
+            half2 kh = k_h2[normTid];
+            float2 qf = __half22float2(qh);
+            float2 kf = __half22float2(kh);
+            float q_sum2 = qf.x * qf.x + qf.y * qf.y;
+            float k_sum2 = kf.x * kf.x + kf.y * kf.y;
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                q_sum2 += __shfl_down_sync(0xffffffff, q_sum2, offset);
+                k_sum2 += __shfl_down_sync(0xffffffff, k_sum2, offset);
+            }
+            if (lane_id == 0) {
+                int norm_warp = normTid >> 5;
+                warp_q[token * 2 + norm_warp] = q_sum2;
+                warp_k[token * 2 + norm_warp] = k_sum2;
+            }
         }
-        if (lane_id == 0) {
-            scales[token * 2] = rsqrtf(q_val / headKDim + eps);
-            scales[token * 2 + 1] = rsqrtf(k_val / headKDim + eps);
-            const half *baRow = ba +
-                (size_t)(batchIndex * seqLen + token) * (numVHeads * 2);
-            float bRaw = __half2float(baRow[head_idx]);
-            float aRaw = __half2float(baRow[numVHeads + head_idx]);
-            float gRaw = -__expf(aLog[head_idx]) * softplus_fast(aRaw + dtBias[head_idx]);
-            ba_values[token * 2] = 1.0f / (1.0f + __expf(-bRaw));
-            ba_values[token * 2 + 1] = __expf(gRaw);
-        }
-    }
-    __syncthreads();
+        __syncthreads();
 
-    for (int index = tid; index < seqLen * 64; index += blockDim.x) {
-        int token = index / 64;
-        int normTid = index % 64;
-        int convBase = (batchIndex * seqLen + token) * qkvDim;
-        int qOffset = convBase + qHead * headKDim;
-        int kOffset = convBase + numKHeads * headKDim + qHead * headKDim;
-        const half2 *q_h2 = reinterpret_cast<const half2*>(convOutput + qOffset);
-        const half2 *k_h2 = reinterpret_cast<const half2*>(convOutput + kOffset);
-        half2 qh = q_h2[normTid];
-        half2 kh = k_h2[normTid];
-        float2 qf = __half22float2(qh);
-        float2 kf = __half22float2(kh);
-        float w0 = __ldg(&normWeight[normTid * 2]);
-        float w1 = __ldg(&normWeight[normTid * 2 + 1]);
-        int normIndex = token * headKDim + normTid * 2;
-        q_norm[normIndex] = qf.x * scales[token * 2] * w0;
-        q_norm[normIndex + 1] = qf.y * scales[token * 2] * w1;
-        k_norm[normIndex] = kf.x * scales[token * 2 + 1] * w0;
-        k_norm[normIndex + 1] = kf.y * scales[token * 2 + 1] * w1;
+        for (int token = warp_id; token < restoreLen; token += TILE_V) {
+            float q_val = lane_id < 2 ? warp_q[token * 2 + lane_id] : 0.0f;
+            float k_val = lane_id < 2 ? warp_k[token * 2 + lane_id] : 0.0f;
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                q_val += __shfl_down_sync(0xffffffff, q_val, offset);
+                k_val += __shfl_down_sync(0xffffffff, k_val, offset);
+            }
+            if (lane_id == 0) {
+                scales[token * 2] = rsqrtf(q_val / headKDim + eps);
+                scales[token * 2 + 1] = rsqrtf(k_val / headKDim + eps);
+                const half *baRow = ba +
+                    (size_t)(batchIndex * seqLen + token) * (numVHeads * 2);
+                float bRaw = __half2float(baRow[head_idx]);
+                float aRaw = __half2float(baRow[numVHeads + head_idx]);
+                float gRaw = -__expf(aLog[head_idx]) * softplus_fast(aRaw + dtBias[head_idx]);
+                ba_values[token * 2] = 1.0f / (1.0f + __expf(-bRaw));
+                ba_values[token * 2 + 1] = __expf(gRaw);
+            }
+        }
+        __syncthreads();
+
+        for (int index = tid; index < restoreLen * 64; index += blockDim.x) {
+            int token = index / 64;
+            int normTid = index % 64;
+            int convBase = (batchIndex * seqLen + token) * qkvDim;
+            int qOffset = convBase + qHead * headKDim;
+            int kOffset = convBase + numKHeads * headKDim + qHead * headKDim;
+            const half2 *q_h2 = reinterpret_cast<const half2*>(convOutput + qOffset);
+            const half2 *k_h2 = reinterpret_cast<const half2*>(convOutput + kOffset);
+            half2 qh = q_h2[normTid];
+            half2 kh = k_h2[normTid];
+            float2 qf = __half22float2(qh);
+            float2 kf = __half22float2(kh);
+            float w0 = __ldg(&normWeight[normTid * 2]);
+            float w1 = __ldg(&normWeight[normTid * 2 + 1]);
+            int normIndex = token * headKDim + normTid * 2;
+            q_norm[normIndex] = qf.x * scales[token * 2] * w0;
+            q_norm[normIndex + 1] = qf.y * scales[token * 2] * w1;
+            k_norm[normIndex] = kf.x * scales[token * 2 + 1] * w0;
+            k_norm[normIndex + 1] = kf.y * scales[token * 2 + 1] * w1;
+        }
+        __syncthreads();
     }
-    __syncthreads();
 
     if (activeV) {
         // The entry points require headKDim == 128. Preserve the reference
@@ -20443,15 +21181,15 @@ __global__ void FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWa
         half stateValues[4];
 #pragma unroll
         for (int j = 0; j < 4; j++) {
-            stateValues[j] = state_row[lane_id + j * 32];
+            stateValues[j] = initialRow[lane_id + j * 32];
         }
-        for (int token = 0; token < seqLen; token++) {
+        for (int token = 0; token < restoreLen; token++) {
             int convBase = (batchIndex * seqLen + token) * qkvDim;
             int vOffset = convBase + 2 * numKHeads * headKDim + head_idx * headVDim;
             int outBase = ((batchIndex * seqLen + token) * numVHeads + head_idx) * headVDim;
-            const float *qToken = q_norm + token * headKDim;
-            const float *kToken = k_norm + token * headKDim;
-            float gVal = ba_values[token * 2 + 1];
+            const float *qToken = qValues + token * qTokenStride;
+            const float *kToken = kValues + token * qTokenStride;
+            float gVal = gateValues[token * gateTokenStride + 1];
             float sumK = 0.0f;
 #pragma unroll
             for (int j = 0; j < 4; j++) {
@@ -20461,7 +21199,7 @@ __global__ void FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWa
                 sumK += __shfl_down_sync(0xffffffff, sumK, offset);
             }
             float delta = (__half2float(convOutput[vOffset + v_col]) -
-                           __shfl_sync(0xffffffff, sumK, 0)) * ba_values[token * 2];
+                           __shfl_sync(0xffffffff, sumK, 0)) * gateValues[token * gateTokenStride];
 
             float sumQ = 0.0f;
             half *snapBase = nullptr;
@@ -20495,7 +21233,7 @@ __global__ void FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWa
             for (int offset = 16; offset > 0; offset >>= 1) {
                 sumQ += __shfl_down_sync(0xffffffff, sumQ, offset);
             }
-            if (lane_id == 0) {
+            if (!RESTORE && lane_id == 0) {
                 core_attn_out[outBase + v_col] = __float2half_rn(sumQ);
             }
         }
@@ -20504,6 +21242,101 @@ __global__ void FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWa
             state_row[lane_id + j * 32] = stateValues[j];
         }
     }
+}
+
+__global__ void FastllmDFlashRestoreConvPrefixesKernel(
+    void **pointers, const half *input, int batch, int seqLen,
+    int channels, int inputStride) {
+    int b = blockIdx.y;
+    int accepted = (int)(size_t)pointers[4 * batch + b];
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (accepted == seqLen || index >= channels * 4) return;
+    int channel = index / 4;
+    int token = accepted + index % 4 - 4;
+    half *dst = (half*)pointers[2 * batch + b];
+    const half *src = (const half*)pointers[3 * batch + b];
+    dst[index] = token < 0 ? src[channel * 4 + token + 4] :
+        input[((size_t)b * seqLen + token) * inputStride + channel];
+}
+
+bool FastllmCudaDFlashRestoreLinearPrefixes(
+    fastllm::Data &input, fastllm::Data &conv, fastllm::Data &ba,
+    fastllm::Data &norm, fastllm::Data &aLog, fastllm::Data &dtBias,
+    const std::vector<fastllm::Data*> &keys,
+    const std::vector<fastllm::Data*> &values,
+    const std::vector<fastllm::Data*> &initialKeys,
+    const std::vector<fastllm::Data*> &initialValues,
+    const std::vector<int> &prefixLengths,
+    int keyHeads, int valueHeads, int headKDim, int headVDim, float eps) {
+    const int batch = (int)keys.size();
+    if (batch <= 0 || values.size() != keys.size() ||
+        initialKeys.size() != keys.size() || initialValues.size() != keys.size() ||
+        prefixLengths.size() != keys.size() || keyHeads <= 0 ||
+        valueHeads <= 0 || valueHeads % keyHeads != 0 || headKDim != 128 ||
+        headVDim <= 0 || !std::isfinite(eps) || eps < 0 ||
+        conv.dims.size() != 3 || conv.dims[0] != batch ||
+        input.dims.size() != 3 || ba.dims.size() != 3) return false;
+    int seqLen = conv.dims[1];
+    int channels = keyHeads * headKDim * 2 + valueHeads * headVDim;
+    if (seqLen < 2 || seqLen > FASTLLM_CUDA_MTP_FAST_SEQ_MAX ||
+        conv.dims[2] != channels || input.dims[0] != batch ||
+        input.dims[1] != seqLen || input.dims[2] < channels ||
+        ba.dims != std::vector<int>({batch, seqLen, valueHeads * 2}) ||
+        norm.dims != std::vector<int>({headKDim}) ||
+        aLog.dims != std::vector<int>({valueHeads}) || dtBias.dims != aLog.dims)
+        return false;
+    int device = -1;
+    if (!FastllmCudaResolveDataDeviceId(conv, device) ||
+        FastllmCudaGetDevice() != device) return false;
+    auto valid = [&](const fastllm::Data *data, fastllm::DataType type) {
+        return data != nullptr && data->dataType == type &&
+            data->cudaData != nullptr && FastllmCudaDataHasDenseStrides(*data) &&
+            FastllmCudaDataCanShareDevice(conv, *data);
+    };
+    for (auto *data : {&input, &conv, &ba})
+        if (!valid(data, fastllm::DataType::FLOAT16)) return false;
+    for (auto *data : {&norm, &aLog, &dtBias})
+        if (!valid(data, fastllm::DataType::FLOAT32)) return false;
+    std::vector<void*> pointers(batch * 5);
+    std::set<void*> states;
+    for (int b = 0; b < batch; b++) {
+        if (prefixLengths[b] < 0 || prefixLengths[b] > seqLen) return false;
+        for (auto *key : {keys[b], initialKeys[b]}) {
+            if (!valid(key, fastllm::DataType::FLOAT16) ||
+                key->dims != std::vector<int>({1, channels, 4}) ||
+                !states.insert(key->cudaData).second) return false;
+        }
+        for (auto *value : {values[b], initialValues[b]}) {
+            if (!valid(value, fastllm::DataType::FLOAT16) ||
+                value->dims != std::vector<int>({1, valueHeads, headKDim, headVDim}) ||
+                !value->isLinearAttentionTransposed ||
+                !states.insert(value->cudaData).second) return false;
+        }
+        pointers[b] = values[b]->cudaData;
+        pointers[batch + b] = initialValues[b]->cudaData;
+        pointers[2 * batch + b] = keys[b]->cudaData;
+        pointers[3 * batch + b] = initialKeys[b]->cudaData;
+        pointers[4 * batch + b] = (void*)(size_t)prefixLengths[b];
+    }
+    void **devicePointers = FastllmCudaStagePointers(pointers);
+    dim3 convGrid((channels * 4 + 255) / 256, batch);
+    FastllmDFlashRestoreConvPrefixesKernel<<<convGrid, 256>>>(
+        devicePointers, (const half*)input.cudaData, batch, seqLen,
+        channels, input.dims[2]);
+    constexpr int tileV = 16;
+    size_t sharedBytes = seqLen * (2 * (size_t)headKDim + 8) * sizeof(float);
+    dim3 grid(valueHeads, (headVDim + tileV - 1) / tileV, batch);
+    FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWarpKernel<tileV, true>
+        <<<grid, tileV * 32, sharedBytes>>>(
+            (const half*)conv.cudaData, (const half*)ba.cudaData,
+            (const float*)norm.cudaData, (const float*)aLog.cudaData,
+            (const float*)dtBias.cudaData, nullptr, (half**)devicePointers, nullptr,
+            seqLen, keyHeads, valueHeads, headKDim, headVDim, eps,
+            1.0f / std::sqrt((float)headKDim),
+            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+            nullptr, 0, devicePointers + 4 * batch, (half**)(devicePointers + batch));
+    checkCudaErrors("Error restoring DFlash linear prefixes.", cudaGetLastError());
+    return true;
 }
 
 bool FastllmRecurrentGatedDeltaRuleBatchFromConvBaDevicePointers(
@@ -20873,7 +21706,8 @@ bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16Snapshots(
         snap->dataType = last_recurrent_state.dataType;
         snap->Resize(last_recurrent_state.dims);
         snap->ToDevice(fastllm::DataDevice::CUDA, std::vector<int>{stateDevice});
-        snap->Allocate();
+        // The kernel fully overwrites the snapshot before it is read.
+        snap->Allocate(false);
         snap->isLinearAttentionTransposed = true;
         if (snap->cudaData == nullptr || !FastllmCudaDataHasDenseStrides(*snap) ||
             !FastllmCudaDataCanShareDevice(last_recurrent_state, *snap)) {
@@ -20882,28 +21716,35 @@ bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16Snapshots(
         snaps[t] = (half*)snap->cudaData;
     }
 
-    constexpr int tileV = 16;
-    int threadsPerBlock = tileV * 32;
     size_t sharedMemSize = seqLen * (2 * (size_t)headKDim + 8) * sizeof(float);
-    dim3 gridDim(numVHeads, (headVDim + tileV - 1) / tileV);
 
     cudaError_t pendingState = cudaGetLastError();
     if (pendingState != cudaSuccess) {
         checkCudaErrors("Error: stale CUDA error before FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16.", pendingState);
         return false;
     }
-    FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWarpKernel<tileV><<<gridDim, threadsPerBlock, sharedMemSize>>>(
-        (const half*)convOutput.cudaData,
-        (const half*)ba.cudaData,
-        (const float*)normWeight.cudaData,
-        (const float*)aLog.cudaData,
-        (const float*)dtBias.cudaData,
-        (half*)last_recurrent_state.cudaData, nullptr,
-        (half*)core_attn_out.cudaData,
-        seqLen, numKHeads, numVHeads, headKDim, headVDim, eps, qScale,
-        snaps[0], snaps[1], snaps[2], snaps[3], snaps[4], snaps[5], snaps[6],
-        nullptr, numTokenStates
-    );
+    auto launch = [&](auto tile) {
+        constexpr int tileV = decltype(tile)::value;
+        FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWarpKernel<tileV>
+            <<<dim3(numVHeads, (headVDim + tileV - 1) / tileV), tileV * 32, sharedMemSize>>>(
+                (const half*)convOutput.cudaData,
+                (const half*)ba.cudaData,
+                (const float*)normWeight.cudaData,
+                (const float*)aLog.cudaData,
+                (const float*)dtBias.cudaData,
+                (half*)last_recurrent_state.cudaData, nullptr,
+                (half*)core_attn_out.cudaData,
+                seqLen, numKHeads, numVHeads, headKDim, headVDim, eps, qScale,
+                snaps[0], snaps[1], snaps[2], snaps[3], snaps[4], snaps[5], snaps[6],
+                nullptr, numTokenStates);
+    };
+    // Use eight warps for 128-wide states, including per-rank TP shards.
+    // Keep the existing tile for other value dimensions.
+    if (headVDim == 128) {
+        launch(std::integral_constant<int, 8>{});
+    } else {
+        launch(std::integral_constant<int, 16>{});
+    }
 
     cudaError_t launchState = cudaGetLastError();
     if (launchState != cudaSuccess) {
@@ -21003,7 +21844,8 @@ bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16BatchSnaps
             snapshot->Resize(first.dims);
             snapshot->ToDevice(fastllm::DataDevice::CUDA,
                                std::vector<int>{device});
-            snapshot->Allocate();
+            // The kernel fully overwrites the snapshot before it is read.
+            snapshot->Allocate(false);
             snapshot->isLinearAttentionTransposed = true;
             if (snapshot->cudaData == nullptr ||
                 !FastllmCudaDataHasDenseStrides(*snapshot) ||
@@ -21027,6 +21869,39 @@ bool FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedFloat16BatchSnaps
         !FastllmCudaDataHasDenseStrides(coreAttnOut) ||
         !FastllmCudaDataCanShareDevice(first, coreAttnOut)) {
         return false;
+    }
+    static const bool prepareEnabled = []() {
+        const char *value = std::getenv("FASTLLM_CUDA_GDN_SEQUENCE_PREPARE");
+        return value == nullptr || value[0] == '\0' ||
+            FastllmCudaEnvFlagEnabled("FASTLLM_CUDA_GDN_SEQUENCE_PREPARE");
+    }();
+    const bool prepare = prepareEnabled && batch >= 4 && headVDim == 128 &&
+        fastllmCudaGraphPointerTableScopes.empty() && !FastllmCudaGraphIsCapturingFast();
+    if (prepare) {
+        const size_t qkCount = (size_t)batch * seqLen * numKHeads * headKDim * 2;
+        const size_t gateCount = (size_t)batch * seqLen * numVHeads * 2;
+        float *prepared = FastllmGdnSequencePrepareScratch(device, qkCount + gateCount);
+        if (prepared != nullptr) {
+            FastllmGdnSequencePrepare128Kernel<<<dim3(numKHeads, seqLen, batch), 64>>>(
+                (const half*)convOutput.cudaData, (const half*)ba.cudaData,
+                (const float*)normWeight.cudaData, (const float*)aLog.cudaData,
+                (const float*)dtBias.cudaData, prepared, prepared + qkCount,
+                seqLen, numKHeads, numVHeads, headVDim, eps);
+            constexpr int tileV = 8;
+            dim3 grid(numVHeads, (headVDim + tileV - 1) / tileV, batch);
+            FastllmRecurrentGatedDeltaRuleSequenceFromConvBaTransposedHalfWarpKernel<tileV, false, true>
+                <<<grid, tileV * 32>>>(
+                    (const half*)convOutput.cudaData, (const half*)ba.cudaData,
+                    (const float*)normWeight.cudaData, (const float*)aLog.cudaData,
+                    (const float*)dtBias.cudaData, nullptr, (half**)devicePointers,
+                    (half*)coreAttnOut.cudaData,
+                    seqLen, numKHeads, numVHeads, headKDim, headVDim, eps, qScale,
+                    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                    (half**)(devicePointers + batch), numTokenStates,
+                    nullptr, nullptr, prepared, prepared + qkCount);
+            checkCudaErrors("Error: CUDA error in prepared batched GDN sequence.", cudaGetLastError());
+            return true;
+        }
     }
     constexpr int tileV = 16;
     int threads = tileV * 32;
@@ -22246,7 +23121,8 @@ void FastllmChunkGatedDeltaRulePrefill(fastllm::Data &q, fastllm::Data &k, fastl
     size_t scratchUnitBytes = unitBytes;
     void *hData = useBatchedGemm ? nullptr :
         FastllmCudaMalloc(hElems * scratchUnitBytes);
-    void *vNewData = FastllmCudaMalloc(vNewElems * scratchUnitBytes);
+    void *vNewData = useBatchedGemm ? nullptr :
+        FastllmCudaMalloc(vNewElems * scratchUnitBytes);
 
     void *qData = FastllmCudaPrepareInput(q);
     void *kData = FastllmCudaPrepareInput(k);
@@ -22267,15 +23143,25 @@ void FastllmChunkGatedDeltaRulePrefill(fastllm::Data &q, fastllm::Data &k, fastl
         size_t stateElems = (size_t)bhCount * stateStride;
         size_t kScaledTransElems = (size_t)bhCount * chunkWindowCapacity *
                                    kdim * chunk_size;
-        qScaledData = FastllmCudaMalloc(qScaledElems * unitBytes);
-        kScaledTransData = FastllmCudaMalloc(kScaledTransElems * unitBytes);
-        if (!combineQKScale) {
-            gScaleData = (float*)FastllmCudaMalloc(
-                (size_t)bhCount * chunkWindowCapacity * chunk_size *
-                sizeof(float));
-        }
-        gLastExpData = (float*)FastllmCudaMalloc(
-            (size_t)bhCount * chunkWindowCapacity * sizeof(float));
+        auto aligned = [](size_t bytes) { return (bytes + 255) & ~size_t(255); };
+        size_t vBytes = aligned(vNewElems * scratchUnitBytes);
+        size_t qBytes = aligned(qScaledElems * unitBytes);
+        size_t kBytes = aligned(kScaledTransElems * unitBytes);
+        size_t gBytes = combineQKScale ? 0 : aligned(
+            (size_t)bhCount * chunkWindowCapacity * chunk_size * sizeof(float));
+        size_t lastBytes = aligned((size_t)bhCount * chunkWindowCapacity * sizeof(float));
+        // GDN and full attention run sequentially on the same worker stream.
+        // The cuBLAS handle has a separate workspace; borrow the attention
+        // float arena without changing the chunk window or GEMM arithmetic.
+        uint8_t *scratch = (uint8_t *)FastllmBorrowCudaTempBuffer(
+            vBytes + qBytes + kBytes + gBytes + lastBytes, nullptr, nullptr);
+        fastllm::AssertInFastLLM(scratch != nullptr,
+                               "CUDA chunk GDN workspace allocation failed.\n");
+        vNewData = scratch;
+        qScaledData = scratch + vBytes;
+        kScaledTransData = scratch + vBytes + qBytes;
+        if (gBytes) gScaleData = (float *)(scratch + vBytes + qBytes + kBytes);
+        gLastExpData = (float *)(scratch + vBytes + qBytes + kBytes + gBytes);
 
         const int threads = 256;
         int stateScaleBlocks = (int)((stateElems + threads - 1) / threads);
@@ -22585,12 +23471,8 @@ void FastllmChunkGatedDeltaRulePrefill(fastllm::Data &q, fastllm::Data &k, fastl
     FastllmCudaFinishInput(k_cumdecay, kCumData);
     FastllmCudaFinishInput(last_recurrent_state, stateData);
     FastllmCudaFinishOutput(core_attn_out, outData);
-    if (qScaledData != nullptr) FastllmCudaFree(qScaledData);
-    if (kScaledTransData != nullptr) FastllmCudaFree(kScaledTransData);
-    if (gScaleData != nullptr) FastllmCudaFree(gScaleData);
-    if (gLastExpData != nullptr) FastllmCudaFree(gLastExpData);
     if (hData != nullptr) FastllmCudaFree(hData);
-    if (vNewData != nullptr) FastllmCudaFree(vNewData);
+    if (!useBatchedGemm && vNewData != nullptr) FastllmCudaFree(vNewData);
 }
 
 void FastllmPickInput(uint8_t *input, uint8_t *partInput, int rows, int cols, int *cudaIndex) {

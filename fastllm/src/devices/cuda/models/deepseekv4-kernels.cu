@@ -805,6 +805,78 @@ __global__ void DeepSeekV4WoAPairBlockReduceKernel(const InT *o, const WT *w, __
     }
 }
 
+// Share each pair of weight rows across a tile of input tokens. Flattening
+// batch/sequence dimensions also handles incomplete tiles. Each individual
+// dot keeps the 256-thread accumulation/reduction order of the pair kernel.
+template <typename InT, typename WT, int Tokens>
+__global__ void DeepSeekV4WoATokenPairBlockReduceKernel(
+        const InT *o, const WT *w, __nv_bfloat16 *output,
+        int tokens, int fullDim, int groupDim, int groups, int oRank) {
+    extern __shared__ float partial[];
+    const int pair = blockIdx.x % (oRank / 2);
+    const int group = (blockIdx.x / (oRank / 2)) % groups;
+    const int token = (blockIdx.x / (oRank / 2) / groups) * Tokens;
+    const WT *w0 = w + ((uint64_t)group * oRank + pair * 2) * groupDim;
+    const WT *w1 = w0 + groupDim;
+    float sums[Tokens][2] = {};
+    for (int d = threadIdx.x; d < groupDim; d += blockDim.x) {
+        const float weight0 = Dsv4ToFloat(w0[d]);
+        const float weight1 = Dsv4ToFloat(w1[d]);
+#pragma unroll
+        for (int t = 0; t < Tokens; ++t) {
+            if (token + t < tokens) {
+                const float x = Dsv4ToFloat(o[(uint64_t)(token + t) * fullDim + group * groupDim + d]);
+                sums[t][0] += x * weight0;
+                sums[t][1] += x * weight1;
+            }
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < Tokens; ++t) {
+        partial[(t * 2) * blockDim.x + threadIdx.x] = sums[t][0];
+        partial[(t * 2 + 1) * blockDim.x + threadIdx.x] = sums[t][1];
+    }
+    __syncthreads();
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+#pragma unroll
+            for (int t = 0; t < Tokens * 2; ++t) {
+                partial[t * blockDim.x + threadIdx.x] += partial[t * blockDim.x + threadIdx.x + stride];
+            }
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+#pragma unroll
+        for (int t = 0; t < Tokens; ++t) {
+            if (token + t < tokens) {
+                const uint64_t offset = ((uint64_t)(token + t) * groups + group) * oRank + pair * 2;
+                output[offset] = __float2bfloat16_rn(partial[(t * 2) * blockDim.x]);
+                output[offset + 1] = __float2bfloat16_rn(partial[(t * 2 + 1) * blockDim.x]);
+            }
+        }
+    }
+}
+
+template <typename InT, typename WT>
+void DeepSeekV4LaunchWoATokenPair(const InT *o, const WT *w, __nv_bfloat16 *output,
+        int bsz, int seqlen, int heads, int headDim, int groups, int oRank) {
+    const int tokens = bsz * seqlen;
+    const int tile = tokens <= 2 ? 2 : 4;
+    if (tokens == 1) {
+        DeepSeekV4WoAPairBlockReduceKernel<<<tokens * groups * (oRank / 2), 256, 512 * sizeof(float)>>>(
+            o,w,output,bsz,seqlen,heads,headDim,groups,oRank);
+    } else if (tile == 2) {
+        DeepSeekV4WoATokenPairBlockReduceKernel<InT, WT, 2>
+            <<<((tokens + 1) / 2) * groups * (oRank / 2), 256, 1024 * sizeof(float)>>>(
+                o,w,output,tokens,heads*headDim,(heads/groups)*headDim,groups,oRank);
+    } else {
+        DeepSeekV4WoATokenPairBlockReduceKernel<InT, WT, 4>
+            <<<((tokens + 3) / 4) * groups * (oRank / 2), 256, 2048 * sizeof(float)>>>(
+                o,w,output,tokens,heads*headDim,(heads/groups)*headDim,groups,oRank);
+    }
+}
+
 // The checkpoint stores wo_a as block-scaled FP8 E4M3, but the legacy path
 // expands it to FP16 while loading.  Decode is bandwidth-bound on this 64 MiB
 // matrix.  Read the original 8-bit payload and reproduce the legacy FP16
@@ -894,6 +966,7 @@ bool DeepSeekV4PrepareWoAQuantizedInput(const fastllm::Data &input,
 // DeepSeek-V4 applies the routed score before its second dynamic activation
 // quantization; moving the score after the GEMM is not equivalent once the
 // UE8M0 scale and E4M3 rounding are observable.
+template<int QuantBlock>
 __global__ void DeepSeekV4PrepareMoeDownInputKernel(
         const __nv_bfloat16 *__restrict__ gateUp,
         __nv_bfloat16 *__restrict__ downInput,
@@ -901,10 +974,10 @@ __global__ void DeepSeekV4PrepareMoeDownInputKernel(
         int intermediateDimension, float swigluLimit, bool quantize) {
     __shared__ float warpMax[4];
     __shared__ float quantScale;
-    const int blocksPerRow = intermediateDimension / 128;
+    const int blocksPerRow = intermediateDimension / QuantBlock;
     const int row = blockIdx.x / blocksPerRow;
     const int blockInRow = blockIdx.x - row * blocksPerRow;
-    const int dimension = blockInRow * 128 + threadIdx.x;
+    const int dimension = blockInRow * QuantBlock + threadIdx.x;
     const uint64_t gateUpOffset =
         (uint64_t)row * intermediateDimension * 2 + dimension * 2;
     const uint64_t outputOffset =
@@ -941,14 +1014,18 @@ __global__ void DeepSeekV4PrepareMoeDownInputKernel(
     }
     __syncthreads();
     if (warp == 0) {
-        maximum = lane < 4 ? warpMax[lane] : 0.0f;
+        maximum = lane < QuantBlock / 32 ? warpMax[lane] : 0.0f;
         for (int delta = 16; delta > 0; delta >>= 1) {
             maximum = fmaxf(
                 maximum,
                 __shfl_down_sync(0xffffffffu, maximum, delta));
         }
         if (lane == 0) {
-            quantScale = exp2f(ceilf(log2f(maximum / 448.0f)));
+            if constexpr (QuantBlock == 32) {
+                const unsigned bits = __float_as_uint(maximum / 448.0f);
+                const int exponent = int((bits >> 23) & 255) - 127 + ((bits & 0x7fffff) != 0);
+                quantScale = exp2f(float(exponent));
+            } else quantScale = exp2f(ceilf(log2f(maximum / 448.0f)));
         }
     }
     __syncthreads();
@@ -958,7 +1035,7 @@ __global__ void DeepSeekV4PrepareMoeDownInputKernel(
 
 bool DeepSeekV4PrepareMoeDownInputImpl(
         const fastllm::Data &gateUp, fastllm::Data &downInput,
-        const float *routeScales, float swigluLimit, bool quantize) {
+        const float *routeScales, float swigluLimit, bool quantize, int activationQuantBlock) {
     if (gateUp.dataDevice != fastllm::DataDevice::CUDA ||
         gateUp.dataType != fastllm::DataType::BFLOAT16 ||
         gateUp.cudaData == nullptr || routeScales == nullptr ||
@@ -968,17 +1045,23 @@ bool DeepSeekV4PrepareMoeDownInputImpl(
     }
     const int rows = gateUp.dims[0];
     const int intermediateDimension = gateUp.dims[1] / 2;
-    if ((intermediateDimension & 127) != 0 ||
+    if ((activationQuantBlock != 32 && activationQuantBlock != 128) ||
+        intermediateDimension % activationQuantBlock != 0 ||
         !DeepSeekV4PrepareCudaOutput(
             downInput, fastllm::DataType::BFLOAT16,
             {rows, intermediateDimension})) {
         return false;
     }
-    const int blocks = rows * intermediateDimension / 128;
-    DeepSeekV4PrepareMoeDownInputKernel<<<blocks, 128>>>(
-        (const __nv_bfloat16*)gateUp.cudaData,
-        (__nv_bfloat16*)downInput.cudaData,
-        routeScales, intermediateDimension, swigluLimit, quantize);
+    const int blocks = rows * intermediateDimension / activationQuantBlock;
+    if (activationQuantBlock == 32) {
+        DeepSeekV4PrepareMoeDownInputKernel<32><<<blocks, 32>>>(
+            (const __nv_bfloat16*)gateUp.cudaData, (__nv_bfloat16*)downInput.cudaData,
+            routeScales, intermediateDimension, swigluLimit, quantize);
+    } else {
+        DeepSeekV4PrepareMoeDownInputKernel<128><<<blocks, 128>>>(
+            (const __nv_bfloat16*)gateUp.cudaData, (__nv_bfloat16*)downInput.cudaData,
+            routeScales, intermediateDimension, swigluLimit, quantize);
+    }
     return cudaGetLastError() == cudaSuccess;
 }
 
@@ -5784,7 +5867,10 @@ bool DeepSeekV4LaunchWoAByWeight(const fastllm::Data &o, const fastllm::Data &wo
     bool useKahanAcc = !usePair && !useFloatAcc && std::getenv("FASTLLM_DSV4_ENABLE_CUDA_WOA_KAHAN_ACC") != nullptr;
     bool useBlockReduce = !usePair && !useFloatAcc && !useKahanAcc &&
                           std::getenv("FASTLLM_DSV4_DISABLE_CUDA_WOA_BLOCK") == nullptr;
-    bool usePairBlockReduce = useBlockReduce && seqlen == 1 && (oRank % 2 == 0) &&
+    // Pairing output rows preserves each dot product's reduction order and
+    // halves the CTA count for the small verification/draft batches too.
+    const bool pairSmallBatch = bsz * seqlen < 16;
+    bool usePairBlockReduce = useBlockReduce && (seqlen == 1 || pairSmallBatch) && (oRank % 2 == 0) &&
                               std::getenv("FASTLLM_DSV4_DISABLE_CUDA_WOA_PAIR_BLOCK") == nullptr;
     int total = bsz * seqlen * groups * oRank;
     int threads = std::min(256, std::max(1, total));
@@ -5825,8 +5911,12 @@ bool DeepSeekV4LaunchWoAByWeight(const fastllm::Data &o, const fastllm::Data &wo
             if (tokenTile != nullptr) {
                 tokensPerBlock = std::atoi(tokenTile);
             }
+            // Small decode/verification batches benefit from four output rows
+            // per CTA: this reduces the token tile shared-memory footprint and
+            // register pressure. Keep the wider tile for larger prefill batches.
+            const bool smallTokenBatch = totalTokens >= 2 && totalTokens <= 8;
             int rowsPerBlock =
-                (oRank % 8 == 0 && woA.blockK % 8 == 0) ? 8 : 4;
+                (!smallTokenBatch && oRank % 8 == 0 && woA.blockK % 8 == 0) ? 8 : 4;
             const char *rowTile =
                 std::getenv("FASTLLM_DSV4_CUDA_WOA_ROWS_PER_BLOCK");
             if (rowTile != nullptr) {
@@ -5906,7 +5996,7 @@ bool DeepSeekV4LaunchWoAByWeight(const fastllm::Data &o, const fastllm::Data &wo
             DeepSeekV4WoAPairKernel<<<blocks, threads>>>(oData, (const __nv_bfloat16 *)woA.cudaData, outData,
                                                          bsz, seqlen, heads, headDim, groups, oRank);
         } else if (usePairBlockReduce) {
-            DeepSeekV4WoAPairBlockReduceKernel<<<pairTotal, 256, 512 * sizeof(float)>>>(
+            DeepSeekV4LaunchWoATokenPair(
                 oData, (const __nv_bfloat16 *)woA.cudaData, outData,
                 bsz, seqlen, heads, headDim, groups, oRank);
         } else if (useBlockReduce) {
@@ -5928,7 +6018,7 @@ bool DeepSeekV4LaunchWoAByWeight(const fastllm::Data &o, const fastllm::Data &wo
             DeepSeekV4WoAPairKernel<<<blocks, threads>>>(oData, (const half *)woA.cudaData, outData,
                                                          bsz, seqlen, heads, headDim, groups, oRank);
         } else if (usePairBlockReduce) {
-            DeepSeekV4WoAPairBlockReduceKernel<<<pairTotal, 256, 512 * sizeof(float)>>>(
+            DeepSeekV4LaunchWoATokenPair(
                 oData, (const half *)woA.cudaData, outData,
                 bsz, seqlen, heads, headDim, groups, oRank);
         } else if (useBlockReduce) {
@@ -5950,7 +6040,7 @@ bool DeepSeekV4LaunchWoAByWeight(const fastllm::Data &o, const fastllm::Data &wo
             DeepSeekV4WoAPairKernel<<<blocks, threads>>>(oData, (const float *)woA.cudaData, outData,
                                                          bsz, seqlen, heads, headDim, groups, oRank);
         } else if (usePairBlockReduce) {
-            DeepSeekV4WoAPairBlockReduceKernel<<<pairTotal, 256, 512 * sizeof(float)>>>(
+            DeepSeekV4LaunchWoATokenPair(
                 oData, (const float *)woA.cudaData, outData,
                 bsz, seqlen, heads, headDim, groups, oRank);
         } else if (useBlockReduce) {
@@ -7112,9 +7202,9 @@ bool DeepSeekV4LaunchHcHeadDotsByWeight(const fastllm::Data &x,
 
 extern "C" bool FastllmCudaDeepSeekV4PrepareMoeDownInput(
         const fastllm::Data &gateUp, fastllm::Data &downInput,
-        const float *routeScales, float swigluLimit, bool quantize) {
+        const float *routeScales, float swigluLimit, bool quantize, int activationQuantBlock) {
     return DeepSeekV4PrepareMoeDownInputImpl(
-        gateUp, downInput, routeScales, swigluLimit, quantize);
+        gateUp, downInput, routeScales, swigluLimit, quantize, activationQuantBlock);
 }
 
 extern "C" bool FastllmCudaDeepSeekV4DsparkMarkovLocalArgmax(

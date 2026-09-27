@@ -36,10 +36,10 @@
 
 namespace MARLIN_NAMESPACE_NAME {
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
 
 // FastLLM can be built as a multi-architecture CUDA binary.  Keep an
-// ABI-identical no-op specialization below SM80 so the translation unit still
+// ABI-identical no-op specialization below SM75 so the translation unit still
 // compiles; the host launcher rejects those devices before dispatch.
 template <const fastllm_marlin_moe_types::ScalarTypeId a_type_id,
           const fastllm_marlin_moe_types::ScalarTypeId b_type_id,
@@ -76,6 +76,14 @@ __device__ inline void ldsm(typename MarlinScalarType<type_id>::FragA& frag_a,
                             const void* smem_ptr) {
   uint32_t* a = reinterpret_cast<uint32_t*>(&frag_a);
   uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 750
+  // Turing requires valid shared addresses in every lane, including lanes
+  // whose addresses x1/x2 do not consume. Reuse the contributing lanes'
+  // addresses so an 8-row MoE tile cannot point beyond its shared allocation.
+  if constexpr (count < 4) {
+    smem = __shfl_sync(0xffffffff, smem, threadIdx.x % (8 * count));
+  }
+#endif
   if constexpr (count == 4) {
     asm volatile(
         "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
@@ -278,6 +286,12 @@ __global__ void Marlin(
   // configurations, while requiring as few slow global cross-threadblock
   // reductions as possible.
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 750
+  // Only the FP16 NVFP4 two-stage specializations are dispatched on Turing.
+  // Discard unsupported BF16 / four-stage bodies in fat-binary builds.
+  if constexpr (a_type_id == fastllm_marlin_moe_types::kFloat16.id() &&
+                s_type_id == fastllm_marlin_moe_types::kFE4M3fn.id() && stages == 2) {
+#endif
   #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 890
   // FP8 computation is only supported for Ada Lovelace or newer architectures.
   if constexpr (a_type_id == fastllm_marlin_moe_types::kFE4M3fn.id()) return;
@@ -2219,6 +2233,9 @@ __global__ void Marlin(
       }
     }
   }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 750
+  }
+#endif
 }
 
 }  // namespace MARLIN_NAMESPACE_NAME

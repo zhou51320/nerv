@@ -24,6 +24,7 @@ namespace fastllm {
         ~Qwen4ExpModel() override;
 
         void InitParams() override;
+        bool RetainCudaWorkspace() const override;
 
         std::map<std::string, std::vector<std::pair<std::string, DataType>>>
         GetTensorMap(const std::vector<std::string> &tensorNames) override;
@@ -73,11 +74,13 @@ namespace fastllm {
         bool UseGenericHistoryCache() const override { return false; }
 
     private:
+        friend struct Qwen4PrefixCacheTestAccess;
         struct PrefixSnapshot;
         struct DecodeCudaGraphState;
         struct PleStagingState;
         struct MtpDraftCudaGraphState;
         struct QsaHostMirrorTransfer;
+        struct ServingCache;
         struct MtpRuntimeState;
         struct ThreadTpState;
         std::unique_ptr<ThreadTpState> threadTpState;
@@ -98,6 +101,8 @@ namespace fastllm {
                 const Data *precomputedEmbedding = nullptr);
 
         struct RequestState {
+            // Exclusive request lease on the model's startup allocation.
+            std::shared_ptr<ServingCache> servingCache;
             std::shared_ptr<PleStagingState> pleStaging;
             int previousToken1 = -1;
             int previousToken2 = -1;
@@ -129,6 +134,9 @@ namespace fastllm {
             // TP dense graphs retain the legacy attention padding width even
             // when physical KV storage is reserved or reused across requests.
             int denseGraphWidth = 0;
+            // Token IDs cannot identify image/video embeddings or M-RoPE state.
+            // Keep this flag through decode, including direct C++ forwards.
+            bool hasMultimodalInput = false;
             std::vector<int> processedTokens;
             int prefixRequestId = 0;
             int lastPrefixSnapshotLen = 0;
@@ -143,6 +151,19 @@ namespace fastllm {
             std::shared_ptr<MtpRuntimeState> mtpState;
             bool mtpDisabled = false;
         };
+
+        struct ServingCache {
+            std::vector<std::pair<Data, Data>> layers;
+            std::pair<Data, Data> mtp;
+            std::map<int, std::shared_ptr<QsaHostMirrorTransfer>> hostMirrors;
+        };
+        std::shared_ptr<ServingCache> servingCache;
+        void ClearWarmupCache(std::vector<std::pair<Data, Data>> &cache);
+        void ReserveServingCache(std::vector<std::pair<Data, Data>> &warmupCache);
+        void AcquireServingCache(std::vector<std::pair<Data, Data>> &cache,
+                                 RequestState &state);
+        std::shared_ptr<QsaHostMirrorTransfer> &GetQsaHostMirror(
+                RequestState &state, int layer);
 
         struct RequestRuntimeCheckpoint {
             int previousToken1 = -1;
@@ -195,6 +216,12 @@ namespace fastllm {
             // the host reads only the compact token-id prefix.
             Data sampledTokenIds;
             Data sampledTokenValues;
+            // Actual temperature-scaled draft distribution, as in Qwen3.5.
+            Data proposalLogits;
+            Data proposalLogsumexp;
+            float proposalTemperature = 1.0f;
+            bool sampleProposal = false;
+            int proposalCount = 0;
             std::shared_ptr<MtpDraftCudaGraphState> draftGraphState;
             std::vector<int> proposals;
             std::deque<int> pendingOutputTokens;
@@ -278,8 +305,6 @@ namespace fastllm {
         std::vector<int> visionDeepstackIndexes;
         std::vector<float> visionImageMean = {0.5f, 0.5f, 0.5f};
         std::vector<float> visionImageStd = {0.5f, 0.5f, 0.5f};
-        Data visionSinData;
-        Data visionCosData;
 
         bool preparedWeights = false;
         std::atomic<int> mtpWeightsStatus{-1};
@@ -305,12 +330,7 @@ namespace fastllm {
         // Logical concatenation of the lazy shard metadata used by the
         // standard disk EmbeddingDirect operation.
         Data pleNgramDiskWeight;
-        // QSA cache compression applies RoPE on the host while regular
-        // attention applies it on its execution device. Keep an immutable
-        // host view so cache updates never migrate the shared sinData/cosData
-        // tensors away from CUDA during decode.
-        std::vector<float> qsaSinValues;
-        std::vector<float> qsaCosValues;
+        // Host QSA compression must not move the device normalization weights.
         std::map<int, std::vector<float>> qsaKeyNormValues;
         std::vector<Data *> mtpMoeWeights;
         std::vector<Data *> mtpMoeBiass;
@@ -411,12 +431,14 @@ namespace fastllm {
                                 Data *alphaCapture = nullptr,
                                 Data *betaCapture = nullptr,
                                 Data *recurrentStateOutput = nullptr);
-        void RunMoE(int layer, const Data &input, Data &output);
+        void RunMoE(int layer, const Data &input, Data &output,
+                    bool reduceOutput = true);
         void RunMoEWithPrefix(int deviceLayer,
                               const std::string &mlpPrefix,
                               std::vector<Data *> &moeWeights,
                               std::vector<Data *> &moeBiass,
-                              const Data &input, Data &output);
+                              const Data &input, Data &output,
+                              bool reduceOutput = true);
 
         bool HasMtpWeights() const;
         bool MtpSupportsGenerationConfig(

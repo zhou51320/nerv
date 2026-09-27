@@ -811,6 +811,120 @@ __global__ void FastllmSoftmaxKernelInner1(half* input, half *output, int outer,
 }
 
 template <int THREAD_PER_BLOCK>
+__global__ void FastllmMaskedSoftmaxHalfKernel(
+        half *scores, const half *mask, int queries, int keys,
+        int headsPerMask, uint64_t maskBatchStride, uint64_t maskRowStride) {
+    const int row = blockIdx.x;
+    const int head = row / queries;
+    const half *maskRow = mask + (head / headsPerMask) * maskBatchStride +
+                          (row % queries) * maskRowStride;
+    half *scoreRow = scores + (uint64_t)row * keys;
+    for (int column = threadIdx.x; column < keys; column += THREAD_PER_BLOCK) {
+        if (__half2float(maskRow[column]) > 0.99f) {
+            scoreRow[column] = __float2half_rn(-10000.0f);
+        }
+    }
+    __syncthreads();
+    // Keep the existing FP16 score/probability boundaries and reduction tree.
+    FastllmSoftmaxKernelInner1Func<THREAD_PER_BLOCK>(
+        scoreRow, scoreRow, keys, nullptr, nullptr);
+}
+
+__global__ void FastllmMaskedAttentionPointersKernel(
+        half **pointers, half *q, half *k, half *v, half *output, half *scores,
+        int heads, int group, uint64_t queryStride, uint64_t keyStride,
+        uint64_t valueStride, uint64_t outputStride, uint64_t scoreStride) {
+    const int head = blockIdx.x * blockDim.x + threadIdx.x;
+    if (head < heads) {
+        pointers[head] = k + (head / group) * keyStride;
+        pointers[heads + head] = q + head * queryStride;
+        pointers[2 * heads + head] = scores + head * scoreStride;
+        pointers[3 * heads + head] = v + (head / group) * valueStride;
+        pointers[4 * heads + head] = output + head * outputStride;
+    }
+}
+
+static bool TryBatchedMaskedHalfAttention(
+        const fastllm::Data &q, const fastllm::Data &k,
+        const fastllm::Data &v, const fastllm::Data &mask,
+        const fastllm::Data &output, int group, float scale) {
+    if (q.dims.size() != 3 || k.dims.size() != 3 || v.dims.size() != 3 ||
+        (mask.dims.size() != 2 && mask.dims.size() != 3) ||
+        mask.dataType != fastllm::DataType::FLOAT16 || mask.cudaData == nullptr ||
+        q.dims[0] <= 0 || q.dims[1] <= 1 || q.dims[2] <= 0 ||
+        group <= 0 || q.dims[0] != k.dims[0] * group ||
+        v.dims[0] != k.dims[0] || v.dims[1] != k.dims[1] ||
+        v.dims[2] <= 0 || output.dims != std::vector<int>({q.dims[0], q.dims[1], v.dims[2]}) ||
+        q.dims[2] != k.dims[2] || k.dims[1] <= 0 ||
+        q.strides.size() != 3 || k.strides.size() != 3 || v.strides.size() != 3 ||
+        output.strides.size() != 3 || mask.strides.size() != mask.dims.size() ||
+        q.strides[2] != 1 || k.strides[2] != 1 || v.strides[2] != 1 ||
+        output.strides[2] != 1 ||
+        q.strides[1] < q.dims[2] || k.strides[1] < k.dims[2] ||
+        v.strides[1] < v.dims[2] || output.strides[1] < v.dims[2] ||
+        mask.strides.back() != 1 || mask.dims.back() != k.dims[1] ||
+        mask.dims[mask.dims.size() - 2] != q.dims[1] ||
+        FastllmCudaGraphIsCapturing()) {
+        return false;
+    }
+    const int heads = q.dims[0], queries = q.dims[1], keys = k.dims[1];
+    const int batches = mask.dims.size() == 3 ? mask.dims[0] : 1;
+    if (batches <= 0 || heads % batches != 0) return false;
+    // Batch heads only while the complete score workspace is small. Large
+    // prefill/long-KV shapes retain the bounded, per-head implementation.
+    constexpr size_t scratchLimit = 8ULL * 1024 * 1024;
+    const uint64_t scoreRowBytes = (uint64_t)keys * sizeof(half);
+    const uint64_t rows = (uint64_t)heads * queries;
+    if (rows > scratchLimit / scoreRowBytes) return false;
+    const size_t pointerOffset = (rows * scoreRowBytes + 255) / 256 * 256;
+    const size_t scratchBytes = pointerOffset + 5 * (size_t)heads * sizeof(half *);
+    void *scratch = nullptr;
+    if (FastllmCudaTryMalloc(&scratch, scratchBytes) !=
+            FASTLLM_CUDA_TRY_MALLOC_SUCCESS || scratch == nullptr) return false;
+    half *scores = (half *)scratch;
+    half **pointers = (half **)((uint8_t *)scratch + pointerOffset);
+    const half zero = __float2half_rn(0), one = __float2half_rn(1);
+    const half hscale = __float2half_rn(scale);
+    auto handle = getFastllmCublasHandle();
+    FastllmMaskedAttentionPointersKernel<<<(heads + 127) / 128, 128>>>(
+        pointers, (half *)q.cudaData, (half *)k.cudaData, (half *)v.cudaData,
+        (half *)output.cudaData, scores, heads, group, q.strides[0],
+        k.strides[0], v.strides[0], output.strides[0], (uint64_t)queries * keys);
+    // Keep each head's GEMM shape instead of concatenating the GQA query
+    // group. Pointer batching also respects independent K/V head capacities.
+    auto status = cublasHgemmBatched(
+        handle, CUBLAS_OP_T, CUBLAS_OP_N,
+        keys, queries, q.dims[2], &hscale,
+        (const half **)pointers, k.strides[1],
+        (const half **)(pointers + heads), q.strides[1],
+        &zero, pointers + 2 * heads, keys, heads);
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        const uint64_t maskBatchStride = mask.dims.size() == 3 ? mask.strides[0] : 0;
+        const uint64_t maskRowStride = mask.strides[mask.dims.size() - 2];
+#define FASTLLM_MASKED_SOFTMAX(THREADS) \
+        FastllmMaskedSoftmaxHalfKernel<THREADS><<<rows, THREADS>>>( \
+            scores, (const half *)mask.cudaData, queries, keys, heads / batches, \
+            maskBatchStride, maskRowStride)
+        if (keys < 8) { FASTLLM_MASKED_SOFTMAX(1); }
+        else if (keys < 64) { FASTLLM_MASKED_SOFTMAX(8); }
+        else if (keys < 512) { FASTLLM_MASKED_SOFTMAX(64); }
+        else { FASTLLM_MASKED_SOFTMAX(256); }
+#undef FASTLLM_MASKED_SOFTMAX
+        status = cublasHgemmBatched(
+            handle, CUBLAS_OP_N, CUBLAS_OP_N,
+            v.dims[2], queries, keys, &one,
+            (const half **)(pointers + 3 * heads), v.strides[1],
+            (const half **)(pointers + 2 * heads), keys,
+            &zero, pointers + 4 * heads, output.strides[1], heads);
+    }
+    // The allocator may hand the returned buffer to another PTDS. Complete
+    // its consumers before releasing it; graph capture keeps its old path.
+    FastllmCudaSyncCurrentThreadStream();
+    FastllmCudaFree(scratch);
+    return status == CUBLAS_STATUS_SUCCESS;
+}
+
+template <int THREAD_PER_BLOCK>
 __global__ void FastllmSoftmaxKernelInner1(half* input, half *output, int outer, int channels, float *maxp, float *sump) {
     int o = blockIdx.x;
     FastllmSoftmaxKernelInner1Func <THREAD_PER_BLOCK> (input + o * channels, output + o * channels, channels, maxp + o, sump + o);
@@ -1215,6 +1329,10 @@ FastllmCudaPermute(*((fastllm::Data*)&output), {1, 0, 2});
     // Fallback 到原始实现
     half beta = __float2half_rn(0.0f), one = __float2half_rn(1.0f), hscale = __float2half_rn(scale);
 
+    if (use_custom_mask && TryBatchedMaskedHalfAttention(q, k, v, mask, output, group, scale)) {
+        return true;
+    }
+
     // Vision self-attention is non-causal and can have tens of thousands of
     // queries.  The legacy fallback below processes one head at a time, but it
     // still materializes a full [q1, k1] score matrix (8 GiB at 65536 x 65536
@@ -1454,6 +1572,13 @@ printf("n = %d, m = %d, k = %d, spend %f s, gops = %f\n", n, m, k, spend, gops);
     if (true) {
         half *qk = (half *) FastllmCudaMalloc(q0 * q1 * k1 * sizeof(half));
         half *temp = (half *) FastllmCudaMalloc(q0 * q1 * k1 * sizeof(half));
+        if (qk == nullptr || temp == nullptr) {
+            FastllmCudaFree(qk);
+            FastllmCudaFree(temp);
+            // Let all TP ranks reach the capture abort without passing null to cuBLAS.
+            if (FastllmCudaGraphIsCapturingFast()) return false;
+            throw std::runtime_error("CUDA half attention could not allocate score workspace");
+        }
         auto fastllmCublasHandle = getFastllmCublasHandle();
         cublasStatus_t status;
 
@@ -1540,6 +1665,101 @@ __global__ void FastllmDFlashImplicitAttentionMaskKernel(
     }
 }
 
+#ifdef FASTLLM_ENABLE_FLASHINFER
+namespace fastllm_dflash_attention {
+// Reuse FlashInfer's attention and split-KV merge kernels. DFlash is
+// bidirectional within the draft block; inactive draft
+// slots are masked, and each query has its own sliding-window boundary.
+struct Params : flashinfer::SinglePrefillParams<half, half, half> {
+    int runtimeBlockSize;
+    int slidingWindow;
+};
+
+template <bool SyncOutput = false>
+struct Attention : flashinfer::DefaultAttention<false, true, false, false> {
+    // Opt into the shared-reduction/output-stage synchronization required by
+    // the SM75 Q32 tile. Generic prefill attention policies stay unchanged.
+    static constexpr bool dflash_sync_output = SyncOutput;
+    template <class P>
+    __host__ __device__ Attention(const P &p, unsigned batch, uint8_t *smem)
+        : flashinfer::DefaultAttention<false, true, false, false>(p, batch, smem) {}
+    REGISTER_LOGITS_MASK(p, batch, qi, ki, qh, kh, {
+        int cached = int(p.kv_len) - int(p.qo_len);
+        int distance = int(ki) - (cached + int(qi));
+        return ki < unsigned(cached + p.runtimeBlockSize) && distance > -p.slidingWindow &&
+               distance < p.slidingWindow;
+    })
+};
+
+__global__ void ToHnd(const uint4 *input, uint4 *output, int heads, int queries) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < heads * queries * 16) {
+        int d = i % 16, q = (i / 16) % queries, h = i / (16 * queries);
+        output[i] = input[(q * heads + h) * 16 + d];
+    }
+}
+
+template <int TileQ = 64>
+inline cudaError_t Run(const half *q, const half *k, const half *v, half *out, half *scratch,
+                       int heads, int kvHeads, int queries, int keys, int kStrideH, int vStrideH,
+                       int runtimeBlock, int window, float scale, cudaStream_t stream) {
+    // SM75 uses 32 query rows and two KV warps. B8 with GQA=4
+    // exactly fills that tile; it avoids the 64-row tile's inactive Q work.
+    // FlashInfer's half MMA uses m16n8k8 and synchronous shared loads on
+    // SM75. Keep FP32 QK/softmax accumulation and the custom window mask.
+    constexpr int MmaKV = 2, Chunk = 128;
+    int trim = std::max(0, keys - queries - window + 1);
+    k += trim * 128;
+    v += trim * 128;
+    keys -= trim;
+    constexpr int WQ = TileQ / 16, WK = 4 / WQ;
+    using Traits = flashinfer::KernelTraits<flashinfer::MaskMode::kCustom, TileQ, 1, MmaKV, 8, 8,
+                                            WQ, WK, flashinfer::PosEncodingMode::kNone, half, half,
+                                            half, float, int, Attention<TileQ == 32>>;
+    // IsInvalid also prunes Q=32 for the *generic* prefill tile selector,
+    // which never selects it for head_dim=128. This fixed DFlash tile is
+    // instantiated directly: two Q warps, two KV warps, one MMA Q tile,
+    // FP16 operands and a bounded register/shared-memory footprint.
+    static_assert(TileQ == 32 ?
+        (Traits::NUM_THREADS == 128 && Traits::NUM_MMA_Q == 1 &&
+         Traits::HEAD_DIM_QK == 128 && Traits::HEAD_DIM_VO == 128 &&
+         Traits::NUM_MMA_Q * (8 * Traits::NUM_MMA_D_VO_TILE +
+                             2 * sizeof(float) * MmaKV) < 256) :
+        !Traits::IsInvalid());
+    static_assert(sizeof(typename Traits::SharedStorageSingle) <= 49152);
+    int splits = (keys + Chunk - 1) / Chunk;
+    half *nhd = scratch, *partition = scratch + heads * queries * 128;
+    Params p;
+    static_cast<flashinfer::SinglePrefillParams<half, half, half> &>(p) =
+        flashinfer::SinglePrefillParams<half, half, half>(
+            const_cast<half *>(q), const_cast<half *>(k), const_cast<half *>(v), nullptr,
+            splits > 1 ? partition : nhd, nullptr, nullptr, heads, kvHeads, queries, keys, 128,
+            queries * 128, 128, kStrideH, 128, window - 1, 0, scale, 1, 10000);
+    p.v_stride_h = vStrideH;
+    p.runtimeBlockSize = runtimeBlock;
+    p.slidingWindow = window;
+    p.partition_kv = splits > 1;
+    p.lse = splits > 1 ? reinterpret_cast<float *>(partition + splits * heads * queries * 128)
+                       : nullptr;
+    flashinfer::SinglePrefillWithKVCacheKernel<Traits, Params>
+        <<<dim3((queries * (heads / kvHeads) + TileQ - 1) / TileQ, splits, kvHeads),
+           dim3(32, WQ, WK), sizeof(typename Traits::SharedStorageSingle), stream>>>(p);
+    auto status = cudaGetLastError();
+    if (status != cudaSuccess)
+        return status;
+    if (splits > 1) {
+        status = flashinfer::MergeStates(partition, p.lse, nhd, nullptr, splits, queries, heads,
+                                         128, stream);
+        if (status != cudaSuccess)
+            return status;
+    }
+    ToHnd<<<(heads * queries * 16 + 255) / 256, 256, 0, stream>>>(
+        reinterpret_cast<uint4 *>(nhd), reinterpret_cast<uint4 *>(out), heads, queries);
+    return cudaGetLastError();
+}
+} // namespace fastllm_dflash_attention
+#endif
+
 bool FastllmCudaDFlashAttention(
         const fastllm::Data &q, const fastllm::Data &k,
         const fastllm::Data &v, fastllm::Data &output,
@@ -1590,6 +1810,62 @@ bool FastllmCudaDFlashAttention(
     const int headDim = q.dims[2];
     const int valueDim = v.dims[2];
     const int cachedTokens = keys - queries;
+#ifdef FASTLLM_ENABLE_FLASHINFER
+    const auto capability = flashinfer::GetCudaComputeCapability();
+    const bool isSm75 = capability.first == 7 && capability.second == 5;
+    const char *attentionFlag = std::getenv("FASTLLM_DFLASH_ATTENTION");
+    const bool useFusedAttention = attentionFlag ?
+        std::strcmp(attentionFlag, "1") == 0 : (isSm75 || capability.first >= 8);
+    const bool useSm75Tile = isSm75 && useFusedAttention;
+    const bool useSm80Tile = capability.first >= 8 && useFusedAttention;
+    // One switch controls both tiles: 0 restores cuBLAS, 1 opts in on
+    // supported devices. The Q32 (SM75) and Q64 (SM80+) fused paths default
+    // on. Unsupported shapes/architectures keep cuBLAS.
+    if (queries > 0 && queries <= 16 && group <= 64 / queries &&
+        heads > 0 && k.dims[0] <= 65535 &&
+        slidingWindow >= queries && slidingWindow <= 4096 &&
+        k.Count(1) <= std::numeric_limits<int>::max() &&
+        v.Count(1) <= std::numeric_limits<int>::max() &&
+        (useSm75Tile || useSm80Tile) &&
+        FastllmCudaFlashInferSupported()) {
+        // Crop keys invisible to every query, preserving the independent
+        // physical K/V head strides after expansion or rollback.
+        const size_t visibleKeys = std::min(cachedTokens, slidingWindow - 1) + queries;
+        const size_t chunks = (visibleKeys + 127) / 128;
+        const size_t rows = (size_t)heads * queries;
+        const size_t workspaceBytes = rows * 128 * sizeof(half) * (chunks + 1) +
+                                      rows * chunks * sizeof(float);
+        size_t availableBytes = 0;
+        bool own = false;
+        half *workspace = (half*)FastllmBorrowCudaTempBuffer(workspaceBytes, &availableBytes, &own);
+        if (workspace != nullptr && availableBytes >= workspaceBytes) {
+            const cudaError_t state = useSm75Tile ?
+                fastllm_dflash_attention::Run<32>(
+                    (const half*)q.cudaData, (const half*)k.cudaData,
+                    (const half*)v.cudaData, (half*)output.cudaData, workspace,
+                    heads, k.dims[0], queries, keys, k.Count(1), v.Count(1),
+                    runtimeBlockSize, slidingWindow, scale, cudaStreamPerThread) :
+                fastllm_dflash_attention::Run<64>(
+                    (const half*)q.cudaData, (const half*)k.cudaData,
+                    (const half*)v.cudaData, (half*)output.cudaData, workspace,
+                    heads, k.dims[0], queries, keys, k.Count(1), v.Count(1),
+                    runtimeBlockSize, slidingWindow, scale, cudaStreamPerThread);
+            FastllmReleaseCudaTempBuffer(workspace, own);
+            if (state != cudaSuccess) {
+                throw std::runtime_error(std::string("DFlash FlashInfer attention: ") +
+                                         cudaGetErrorString(state));
+            }
+            static thread_local std::map<int, bool> loggedSm75;
+            if (useSm75Tile && !loggedSm75[device]) {
+                printf("[DFlash attention] SM75 FP16 tileQ=32 on GPU %d, queries=%d heads=%d\n",
+                    device, queries, heads);
+                loggedSm75[device] = true;
+            }
+            return true;
+        }
+        FastllmReleaseCudaTempBuffer(workspace, own);
+    }
+#endif
     const size_t scoreElements = (size_t)heads * queries * keys;
     const size_t scratchBytes = scoreElements * sizeof(half) * 2;
     size_t availableBytes = 0;
@@ -2888,6 +3164,145 @@ bool FastllmCudaPreparePagedBatchParamsSingle(
     return true;
 }
 
+// Upstream #722: the pageable H2D copies of the paged batch parameters hold
+// the CUDA driver lock while the DMA completes; past the 256-page boundary
+// that window overlaps the peer rank's allocation/collective submission and
+// can deadlock a long-context prefill.  Carry the values in kernel parameters
+// instead: no blocking copy, and the launch is capturable by a CUDA Graph.
+constexpr int kFastllmPagedIntParamsMaxSmall = 64;
+constexpr int kFastllmPagedIntParamsChunkPages = 512;
+constexpr int kFastllmPagedIntParamsMaxPages = 4096;
+
+template <int MaxPages>
+struct FastllmPagedIntParamsList {
+    int32_t qSizes[kFastllmPagedIntParamsMaxSmall];
+    int32_t pageSizes[kFastllmPagedIntParamsMaxSmall];
+    int32_t lastPageLens[kFastllmPagedIntParamsMaxSmall];
+    int32_t pageIdx[MaxPages];
+};
+
+// Leave space for pointer/count arguments on pre-Volta and older toolchains.
+// Bounded launches also work in fat binaries containing both sm_60 and sm_75.
+static_assert(sizeof(FastllmPagedIntParamsList<kFastllmPagedIntParamsChunkPages>)
+                  + 128 <= 4096, "Paged upload kernel exceeds legacy parameter space");
+
+template <int MaxPages>
+__global__ void FastllmUploadPagedIntParamsKernel(
+        int32_t *qSizes, int qSizesCount,
+        int32_t *pageSizes, int pageSizesCount,
+        int32_t *pageIndexs, int pageIndexsCount,
+        int32_t *lastPageLens, int lastPageLensCount,
+        FastllmPagedIntParamsList<MaxPages> values) {
+    const int total = qSizesCount + pageSizesCount + pageIndexsCount +
+                      lastPageLensCount;
+    for (int i = threadIdx.x; i < total; i += blockDim.x) {
+        if (i < qSizesCount) {
+            qSizes[i] = values.qSizes[i];
+        } else if (i < qSizesCount + pageSizesCount) {
+            const int j = i - qSizesCount;
+            pageSizes[j] = values.pageSizes[j];
+        } else if (i < qSizesCount + pageSizesCount + pageIndexsCount) {
+            const int j = i - qSizesCount - pageSizesCount;
+            pageIndexs[j] = values.pageIdx[j];
+        } else {
+            const int j = i - qSizesCount - pageSizesCount - pageIndexsCount;
+            lastPageLens[j] = values.lastPageLens[j];
+        }
+    }
+}
+
+template <int MaxPages>
+static bool UploadPagedIntParamsKernel(
+        int32_t *qSizes, int qSizesCount,
+        int32_t *pageSizes, int pageSizesCount,
+        int32_t *pageIndexs, int pageIndexsCount,
+        int32_t *lastPageLens, int lastPageLensCount,
+        const int *qSizesHost, const int *pageSizesHost,
+        const int *pageIndexsHost, const int *lastPageLensHost) {
+    FastllmPagedIntParamsList<MaxPages> values = {};
+    for (int i = 0; i < qSizesCount; i++) {
+        values.qSizes[i] = qSizesHost[i];
+    }
+    for (int i = 0; i < pageSizesCount; i++) {
+        values.pageSizes[i] = pageSizesHost[i];
+    }
+    for (int i = 0; i < pageIndexsCount; i++) {
+        values.pageIdx[i] = pageIndexsHost[i];
+    }
+    for (int i = 0; i < lastPageLensCount; i++) {
+        values.lastPageLens[i] = lastPageLensHost[i];
+    }
+    FastllmUploadPagedIntParamsKernel<MaxPages><<<1, 256>>>(
+        qSizes, qSizesCount, pageSizes, pageSizesCount,
+        pageIndexs, pageIndexsCount, lastPageLens, lastPageLensCount,
+        values);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool FastllmCudaUploadPagedIntParams(
+        int32_t *qSizes, int qSizesCount,
+        int32_t *pageSizes, int pageSizesCount,
+        int32_t *pageIndexs, int pageIndexsCount,
+        int32_t *lastPageLens, int lastPageLensCount,
+        const int *qSizesHost, const int *pageSizesHost,
+        const int *pageIndexsHost, const int *lastPageLensHost) {
+    if (qSizes == nullptr || pageSizes == nullptr || pageIndexs == nullptr ||
+        qSizesCount <= 0 ||
+        qSizesCount > kFastllmPagedIntParamsMaxSmall ||
+        pageSizesCount <= 0 ||
+        pageSizesCount > kFastllmPagedIntParamsMaxSmall ||
+        lastPageLensCount < 0 ||
+        lastPageLensCount > kFastllmPagedIntParamsMaxSmall ||
+        pageIndexsCount < 0 ||
+        pageIndexsCount > kFastllmPagedIntParamsMaxPages ||
+        (qSizesCount > 0 && qSizesHost == nullptr) ||
+        (pageSizesCount > 0 && pageSizesHost == nullptr) ||
+        (pageIndexsCount > 0 && pageIndexsHost == nullptr) ||
+        (lastPageLensCount > 0 &&
+         (lastPageLens == nullptr || lastPageLensHost == nullptr))) {
+        return false;
+    }
+    // Launch only small by-value parameter lists. This preserves capture and
+    // avoids pageable H2D copies without requiring large kernel-argument support.
+    // Metadata is written once; following launches upload disjoint page chunks.
+    bool uploaded = true;
+    if (pageIndexsCount <= 256) {
+        uploaded = UploadPagedIntParamsKernel<256>(
+            qSizes, qSizesCount, pageSizes, pageSizesCount, pageIndexs,
+            pageIndexsCount, lastPageLens, lastPageLensCount, qSizesHost,
+            pageSizesHost, pageIndexsHost, lastPageLensHost);
+    } else {
+        for (int offset = 0; offset < pageIndexsCount;
+             offset += kFastllmPagedIntParamsChunkPages) {
+            const bool first = offset == 0;
+            const int count = std::min(kFastllmPagedIntParamsChunkPages,
+                                       pageIndexsCount - offset);
+            uploaded = UploadPagedIntParamsKernel<kFastllmPagedIntParamsChunkPages>(
+                qSizes, first ? qSizesCount : 0,
+                pageSizes, first ? pageSizesCount : 0,
+                pageIndexs + offset, count,
+                lastPageLens, first ? lastPageLensCount : 0,
+                qSizesHost, pageSizesHost, pageIndexsHost + offset,
+                lastPageLensHost);
+            if (!uploaded) {
+                break;
+            }
+        }
+    }
+    if (!uploaded) {
+        return false;
+    }
+    // Honor debug synchronization once after all launches, outside capture.
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(cudaStreamPerThread, &capture) != cudaSuccess) {
+        return false;
+    }
+    if (capture == cudaStreamCaptureStatusNone) {
+        DeviceSync();
+    }
+    return true;
+}
+
 // CUDA kernel for batch copying data from input to paged KV cache
 // input: [batch, numHeads, headDim], pagedData: [maxPages, pageLen, numHeads, headDim]
 // Each batch has 1 token, so we copy [numHeads, headDim] for each batch
@@ -3010,16 +3425,33 @@ static size_t ParseSizeFromEnv(const char* env_name, size_t default_size) {
 
 struct FlashInferWorkSpaceManager {
     const size_t float_workspace_size = ParseSizeFromEnv("FT_FLOAT_WORKSPACE_SIZE", 256 * 1024 * 1024);
-    const size_t int_workspace_size = 64 * 1024 * 1024;     // 64 MB
+    size_t int_workspace_size = 1024 * 1024;
 
     std::mutex plan_mutex;
     void* d_float_workspace = nullptr;
     void* d_int_workspace = nullptr;
     void* h_page_locked_int_workspace = nullptr;
 
+    // Integer schedules are usually only a few KiB. Size the staging arena
+    // from the counting planner; keep the float arena (kernel split policy)
+    // unchanged. Call under plan_mutex, outside stream capture.
+    void EnsureIntCapacity(size_t required) {
+        if (required <= int_workspace_size) return;
+        size_t capacity = ((required + (1 << 20) - 1) >> 20) << 20;
+        checkCudaErrors("FlashInfer integer workspace resize sync", cudaDeviceSynchronize());
+        void *device = FastllmCudaDirectMalloc(capacity);
+        void *host = nullptr;
+        checkCudaErrors("FlashInfer integer host workspace resize", cudaMallocHost(&host, capacity));
+        FastllmCudaDirectFree(d_int_workspace);
+        checkCudaErrors("FlashInfer integer host workspace release", cudaFreeHost(h_page_locked_int_workspace));
+        d_int_workspace = device;
+        h_page_locked_int_workspace = host;
+        int_workspace_size = capacity;
+    }
+
     FlashInferWorkSpaceManager() {
         d_float_workspace = FastllmCudaMalloc(float_workspace_size);
-        d_int_workspace = FastllmCudaMalloc(int_workspace_size);
+        d_int_workspace = FastllmCudaDirectMalloc(int_workspace_size);
         cudaError_t err = cudaMallocHost(&h_page_locked_int_workspace, int_workspace_size);
         if (err != cudaSuccess || h_page_locked_int_workspace == nullptr) {
             printf("FlashInferWorkSpaceManager: Failed to allocate h_page_locked_int_workspace: %s\n", cudaGetErrorString(err));
@@ -3029,7 +3461,7 @@ struct FlashInferWorkSpaceManager {
 
     ~FlashInferWorkSpaceManager() {
         FastllmCudaFree(d_float_workspace);
-        FastllmCudaFree(d_int_workspace);
+        FastllmCudaDirectFree(d_int_workspace);
         cudaFreeHost(h_page_locked_int_workspace);
     }
 };
@@ -3454,6 +3886,14 @@ bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::
         int current_device_id = -1;
         cudaGetDevice(&current_device_id);
         if (!inited || !plan_inited_map[current_device_id]) {
+            std::lock_guard<std::mutex> workspace_guard(workspace.plan_mutex);
+            size_t floatBytes = 0, intBytes = 0;
+            checkCudaErrors("FlashInfer prefill workspace size",
+                PrefillPlanWorkspaceSize<uint32_t>(floatBytes, intBytes,
+                    q_indptr_host.data(), indptr_host.data(), total_num_rows,
+                    batch_size, num_qo_heads_per_batch, numHeads, headDim, headDim,
+                    pageLen, false, sizeof(QType), -1, -1, false, 0, 0, stream));
+            workspace.EnsureIntCapacity(intBytes);
             cudaError_t plan_status = PrefillPlan<uint32_t>(
                 workspace.d_float_workspace, workspace.float_workspace_size, workspace.d_int_workspace, workspace.h_page_locked_int_workspace,
                 workspace.int_workspace_size, plan_info_map[current_device_id], q_indptr_host.data(), indptr_host.data(), 
@@ -3981,7 +4421,7 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
         // one entry per device makes mixed full/sliding models rebuild at every
         // layer boundary.  Use a stable signature for the cache slot and keep
         // the complete key above as that slot's current contents.
-        std::array<uint32_t, 12> eager_slot_key = {
+        std::vector<uint32_t> eager_slot_key = {
             batch_size,
             num_qo_heads_per_batch,
             (uint32_t)numHeads,
@@ -3995,6 +4435,13 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
             (uint32_t)pagedKVCacheK->dataType,
             (uint32_t)windowLeft
         };
+
+        // Different query lengths alternate during speculative decoding. Keep
+        // each query distribution in its own bounded LRU slot; KV page changes
+        // still rebuild that slot using the complete plan_key above.
+        for (uint32_t i = 0; i <= batch_size; ++i) {
+            eager_slot_key.push_back((uint32_t)qSizes.cpuIntDatas[i]);
+        }
 
         struct PrefillPlanCacheEntry {
             PrefillPlanInfo plan_info;
@@ -4061,7 +4508,7 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
             uint64_t last_use = 0;
         };
         struct EagerPlanDeviceCache {
-            std::map<std::array<uint32_t, 12>, EagerPlanCacheSlot> slots;
+            std::map<std::vector<uint32_t>, EagerPlanCacheSlot> slots;
             uint64_t use_counter = 0;
         };
         static thread_local std::map<int, EagerPlanDeviceCache> eager_plan_caches;
@@ -4078,6 +4525,13 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
             // on different GPUs never block each other while one rank waits
             // for its plan staging copies to finish.
             std::lock_guard<std::mutex> workspace_guard(workspace.plan_mutex);
+            size_t floatBytes = 0, intBytes = 0;
+            checkCudaErrors("FlashInfer batch prefill workspace size",
+                PrefillPlanWorkspaceSize<uint32_t>(floatBytes, intBytes,
+                    (uint32_t*)qSizes.cpuIntDatas.data(), (uint32_t*)pageSizes.cpuIntDatas.data(),
+                    total_num_rows, batch_size, num_qo_heads_per_batch, numHeads, headDim, headDim,
+                    pageLen, useFlashInferCudaGraph, sizeof(QType), windowLeft, -1, false, 0, 0, stream));
+            workspace.EnsureIntCapacity(intBytes);
             PrefillPlanInfo created_plan_info;
             cudaError_t plan_status = PrefillPlan<uint32_t>(
                     workspace.d_float_workspace, workspace.float_workspace_size, workspace.d_int_workspace, workspace.h_page_locked_int_workspace,
@@ -4412,6 +4866,9 @@ bool FastllmCudaMLAPaged(const fastllm::Data &qNope, const fastllm::Data &qPe, c
     std::vector<int32_t> kv_len_arr_h = {kvLen};
     const uint32_t batch_size = 1;
 
+    // MLA uses a separate scheduler without a counting interface.
+    std::lock_guard<std::mutex> workspace_guard(workspace.plan_mutex);
+    workspace.EnsureIntCapacity(64ULL << 20);
     MLAPlanInfo plan_info;
     cudaError_t plan_status = MLAPlan<int32_t>(
         workspace.d_float_workspace, workspace.float_workspace_size, workspace.d_int_workspace, workspace.h_page_locked_int_workspace,

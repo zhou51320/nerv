@@ -140,6 +140,8 @@ function Show-KeyCacheValues([string]$bdir) {
     'PY_API',
     'BUILD_CLI',
     'CMAKE_CUDA_STANDARD',
+    'CMAKE_CUDA_RUNTIME_LIBRARY',
+    'CMAKE_PROJECT_fastllm_INCLUDE',
     'CMAKE_RUNTIME_OUTPUT_DIRECTORY'
   )
   $content = Get-Content -LiteralPath $cache
@@ -204,18 +206,50 @@ if ($Clean) {
   Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $bdir
 }
 
+# Same Win7 toolchain setup as build-llama-win7-cuda.ps1: MSVC v142 host compiler,
+# _WIN32_WINNT=0x0601 everywhere, static cudart, YY-Thunks for missing Win8+ APIs.
+# Flags go into *_FLAGS_INIT so CMake keeps its MSVC defaults (/EHsc, /GR, ...).
+$winVerFlags = '/D_WIN32_WINNT=0x0601 /DWINVER=0x0601'
+$hostFlags = "$winVerFlags /D_USE_MATH_DEFINES /bigobj"
+$cudaCompatFlags = "--allow-unsupported-compiler -D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH -Xcompiler=/D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH -Xcompiler=/D_WIN32_WINNT=0x0601 -Xcompiler=/DWINVER=0x0601 -Xcompiler=/D_USE_MATH_DEFINES -Xcompiler=/bigobj"
+
+# Upstream fastllm stays untouched; Windows compat (NCCL stub, disk stub, MSVC shims)
+# is injected right after project(fastllm).
+$win7Compat = Join-Path (Join-Path (Join-Path $ROOT 'third_party') 'fastllm-win7') 'fastllm-win7.cmake'
+if (-not (Test-Path $win7Compat)) { throw "fastllm Win7 compat layer missing: $win7Compat" }
+
 $defs = @(
   '-DCMAKE_BUILD_TYPE=Release',
+  "-DCMAKE_PROJECT_fastllm_INCLUDE:FILEPATH=$win7Compat",
+  "-DCMAKE_C_FLAGS_INIT:STRING=$hostFlags",
+  "-DCMAKE_CXX_FLAGS_INIT:STRING=$hostFlags",
+  "-DCMAKE_CUDA_FLAGS_INIT:STRING=$cudaCompatFlags",
   "-DCMAKE_CUDA_COMPILER:FILEPATH=$nvccPath",
+  '-DCMAKE_CUDA_HOST_COMPILER:FILEPATH=cl.exe',
+  '-DCMAKE_CUDA_STANDARD=17',
+  '-DCMAKE_CUDA_STANDARD_REQUIRED=ON',
+  '-DCMAKE_CUDA_RUNTIME_LIBRARY=Static',
   "-DCMAKE_CUDA_ARCHITECTURES=$CudaArch",
+  "-DCUDA_ARCH=$CudaArch",
   '-DUSE_CUDA=ON',
   '-DUSE_NUMAS=OFF',
   '-DUSE_MMAP=OFF',
   '-DUSE_ROCM=OFF',
   '-DUSE_TFACC=OFF',
+  '-DUSE_IVCOREX=OFF',
+  '-DUSE_SENTENCEPIECE=OFF',
   '-DPY_API=OFF',
-  '-DBUILD_CLI=OFF'
+  '-DBUILD_CLI=OFF',
+  '-DUNIT_TEST=OFF'
 )
+
+$yyThunksObj = Join-Path (Join-Path (Join-Path (Join-Path (Join-Path $ROOT 'third_party') 'YY-Thunks') 'objs') 'x64') 'YY_Thunks_for_Win7.obj'
+if (Test-Path $yyThunksObj) {
+  $defs += "-DCMAKE_EXE_LINKER_FLAGS_INIT:STRING=$($yyThunksObj -replace '\\', '/')"
+  Write-Host "Configured YY-Thunks for Win7: $yyThunksObj"
+} else {
+  Write-Warning "YY-Thunks object not found: $yyThunksObj"
+}
 
 if (Test-Path $bdir) {
   Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $bdir
@@ -233,13 +267,25 @@ Invoke-Native 'cmake' $configureArgs
 Show-KeyCacheValues $bdir
 
 $buildArgs = @('--build', $bdir, '--config', 'Release')
+# Only the shipped executables: upstream's fastllm_tools.dll recompiles every source
+# and its Windows POST_BUILD step relies on the VS-only $(Configuration) macro.
+$buildArgs += @('--target', 'main', 'quant', 'apiserver')
 if ($Jobs -gt 0) { $buildArgs += @('--parallel', "$Jobs") }
+# -k 0: keep going so a single CI run reports every compile error
+$buildArgs += @('--', '-k', '0')
 Invoke-Native 'cmake' $buildArgs
 
 $outDir = Join-Path (Join-Path (Join-Path (Join-Path $OUT $arch) 'win7') 'cuda') 'fastllm'
 $okMain = Copy-Binary $bdir 'main' $outDir
 $okQuant = Copy-Binary $bdir 'quant' $outDir
-$okApi = Copy-Binary $bdir 'fastllm-apiserver' $outDir
+$okApi = $false
+$apiSrc = Get-BinaryPath $bdir 'apiserver'
+if ($apiSrc) {
+  # keep the historical name used by EVA
+  Copy-Item $apiSrc -Destination (Join-Path $outDir 'fastllm-apiserver.exe') -Force
+  Write-Host "Copied $apiSrc -> $outDir\fastllm-apiserver.exe"
+  $okApi = $true
+}
 
 if (-not $okMain -or -not $okQuant -or -not $okApi) {
   Write-Warning "Built exe files found under ${bdir}:"
@@ -252,4 +298,4 @@ if (-not $okMain -or -not $okQuant -or -not $okApi) {
 Write-Host "Done. Artifacts under: $outDir"
 Write-Host "  main.exe  -> $((Get-BinaryPath $bdir 'main') -replace [regex]::Escape((Get-Location).Path), '.')"
 Write-Host "  quant.exe -> $((Get-BinaryPath $bdir 'quant') -replace [regex]::Escape((Get-Location).Path), '.')"
-Write-Host "  fastllm-apiserver.exe -> $((Get-BinaryPath $bdir 'fastllm-apiserver') -replace [regex]::Escape((Get-Location).Path), '.')"
+Write-Host "  fastllm-apiserver.exe -> $((Get-BinaryPath $bdir 'apiserver') -replace [regex]::Escape((Get-Location).Path), '.')"

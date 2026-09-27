@@ -294,18 +294,22 @@ namespace fastllm {
         }
         std::vector<FastllmCudaMoeCacheLayer> layers;
         layers.reserve(layerWeights.size());
-        for (const auto &weights : layerWeights) {
+        bool allNuma = true;
+        for (int layer = 0; layer < static_cast<int>(layerWeights.size()); ++layer) {
+            const std::string device = SelectMoeDeviceForLayer(layer);
+            // GPU-resident layers keep their own expert layout. Register only
+            // host tables, including when the first layer resides on CUDA.
+            const bool numa = device == "numa" || device.compare(0, 5, "numa:") == 0;
+            if (device != "cpu" && !numa) continue;
+            allNuma = allNuma && numa;
+            const auto &weights = layerWeights[layer];
             layers.push_back({
                 weights.data(),
                 static_cast<int>(weights.size())});
         }
+        if (layers.empty()) return false;
         std::function<void()> registerNumaWeights;
 #ifdef USE_NUMAS
-        bool allNuma = true;
-        for (int layer = 0; layer < static_cast<int>(layers.size()); ++layer) {
-            const std::string device = SelectMoeDeviceForLayer(layer);
-            allNuma = allNuma && (device == "numa" || device.compare(0, 5, "numa:") == 0);
-        }
         if (allNuma) {
             registerNumaWeights = [this] { WarmupNumaMoeWeights(); };
         }
@@ -360,7 +364,6 @@ namespace fastllm {
             if (!weights.empty()) {
                 FastllmCudaReleaseMoeCache(
                     weights.data(), static_cast<int>(weights.size()));
-                return;
             }
         }
 #else
@@ -2413,19 +2416,22 @@ namespace fastllm {
             }
             weight.blockK = blockK;
             weight.blockM = blockM;
-            if (targetDataType == DataType::NVFP4 &&
+            if ((targetDataType == DataType::NVFP4 ||
+                 (targetDataType == DataType::FP8_E4M3 && weightType == WeightType::EMBEDDING)) &&
                 (scaleTensor->dtype == "F8_E8M0" || scaleTensor->dtype == "U8")) {
                 if (isScalarScale) {
-                    ErrorInFastLLM("Disk MoE compact NVFP4 does not support scalar scale: " + weight.name + "\n");
+                    ErrorInFastLLM("Disk compact weights do not support scalar scale: " + weight.name + "\n");
                 }
-                AssertInFastLLM(scaleTensor->bytes == GetNVFP4ScaleBytes(n, m, blockK, blockM),
-                                "Disk MoE NVFP4 scale tensor bytes mismatch: " + weight.name + "\n");
+                const uint64_t scaleRows = ((uint64_t)n + blockK - 1) / blockK;
+                const uint64_t scaleCols = ((uint64_t)m + blockM - 1) / blockM;
+                AssertInFastLLM(scaleTensor->bytes == scaleRows * scaleCols,
+                                "Disk weight scale tensor bytes mismatch: " + weight.name + "\n");
                 DiskWeightPart scalePart;
                 scalePart.fileName = scaleTensor->fileName;
                 scalePart.fileOffset = (long long)scaleTensor->data_offsets[0];
                 scalePart.bytes = scaleTensor->bytes;
                 scalePart.sourceDataType = DataType::INT8;
-                scalePart.dims = {(int)scaleTensor->bytes};
+                scalePart.dims = {(int)scaleRows, (int)scaleCols};
                 scalePart.isScalePart = true;
                 weight.diskWeightParts.push_back(scalePart);
                 weight.scales.clear();
@@ -5133,7 +5139,9 @@ namespace fastllm {
                                                         scaleTensor->dtype == "F8_E8M0" || scaleTensor->dtype == "F8_E4M3" ||
                                                         scaleTensor->dtype == "U8",
                                                         "Tensor scale error: scale's dtype should be F32, BF16, F8_E8M0, F8_E4M3 or U8.");
-                                        if (!((diskDataType == DataType::NVFP4 &&
+                                        if (!(((diskDataType == DataType::NVFP4 ||
+                                                (diskDataType == DataType::FP8_E4M3 &&
+                                                 diskLazyWeightType == WeightType::EMBEDDING)) &&
                                                (scaleTensor->dtype == "F8_E8M0" || scaleTensor->dtype == "U8")) ||
                                               ((diskDataType == DataType::NVFP4_BLOCK_16 ||
                                                 diskDataType == DataType::NVFP4_BLOCK_16_E4M3) && scaleTensor->dtype == "F8_E4M3"))) {

@@ -458,6 +458,8 @@ fastllm_lib.set_layered_moe_device_map.argtypes = [ctypes.c_int, ctypes.c_void_p
 fastllm_lib.set_moe_device_layers.argtypes = [ctypes.c_int]
 fastllm_lib.set_ngram_device.argtypes = [ctypes.c_char_p]
 fastllm_lib.set_moe_cuda_cache.argtypes = [ctypes.c_uint64]
+fastllm_lib.set_moe_cpu_cache.argtypes = [ctypes.c_uint64]
+fastllm_lib.get_disk_moe_cache_stats.argtypes = [ctypes.POINTER(ctypes.c_uint64)]
 
 fastllm_lib.apply_chat_template.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p]
 fastllm_lib.apply_chat_template.restype = ctypes.c_char_p
@@ -623,6 +625,19 @@ def set_moe_cuda_cache(bytes_: int):
     if bytes_ < 0 or bytes_ > (1 << 64) - 1:
         raise ValueError("MoE CUDA cache size must fit in uint64")
     fastllm_lib.set_moe_cuda_cache(ctypes.c_uint64(bytes_));
+
+def set_moe_cpu_cache(bytes_: int):
+    bytes_ = int(bytes_)
+    if bytes_ < 0 or bytes_ > (1 << 64) - 1:
+        raise ValueError("MoE CPU cache size must fit in uint64")
+    fastllm_lib.set_moe_cpu_cache(ctypes.c_uint64(bytes_))
+
+def get_disk_moe_cache_stats():
+    """Process-wide cumulative route counts and resident expert payload bytes."""
+    values = (ctypes.c_uint64 * 9)()
+    fastllm_lib.get_disk_moe_cache_stats(values)
+    return dict(zip(("cpu_bytes", "cuda_bytes", "cpu_hits", "cuda_hits", "misses",
+                     "disk_bytes", "uploads", "cpu_evictions", "cuda_evictions"), values))
 
 def disable_cuda_malloc():
     fastllm_lib.disable_cuda_malloc();
@@ -1619,12 +1634,9 @@ class model:
         model_type = str(config.get("model_type", ""))
         if model_type not in ("deepseek_v41", "deepseek_v41_text"):
             return
-        if os.environ.get("FASTLLM_DSV41_ENGRAM_META"):
-            return
         try:
             from ftllm.deepseek_v41_engram import ensure_engram_meta
-            meta_path = ensure_engram_meta(path)
-            os.environ["FASTLLM_DSV41_ENGRAM_META"] = meta_path
+            ensure_engram_meta(path)
         except Exception as e:
             print("[ftllm] warning: failed to prepare DeepSeek-V4.1 engram meta:", e)
 
@@ -1649,6 +1661,18 @@ class model:
         except Exception:
             return False
 
+    def remember_deepseek_v41_tool_output(self, raw, content, tool_calls,
+                                          thinking=False, reasoning_content=None):
+        if not self._is_deepseek_v41():
+            return
+        if not hasattr(self, "_deepseek_v41_tool_history"):
+            from ftllm.deepseek_v41_history import ToolHistory
+            self._deepseek_v41_tool_history = ToolHistory()
+        self._deepseek_v41_tool_history.remember(raw, {
+            "content": content, "tool_calls": tool_calls,
+            "reasoning_content": reasoning_content,
+        }, thinking=thinking)
+
     def _deepseek_encode_messages(self, reasoning_effort = None):
         """返回与当前模型版本匹配的官方 encode_messages（V4.1 的 DSML 标签与 V4 不同）。
 
@@ -1657,10 +1681,9 @@ class model:
         """
         if self._is_deepseek_v41():
             from ftllm.encoding_dsv41 import encode_messages
-            if reasoning_effort is not None:
-                return functools.partial(
-                    encode_messages, reasoning_effort = reasoning_effort)
-            return encode_messages
+            return functools.partial(
+                encode_messages, reasoning_effort=reasoning_effort,
+                tool_history=getattr(self, "_deepseek_v41_tool_history", None))
         from ftllm.encoding_dsv4 import encode_messages
         return encode_messages
 
