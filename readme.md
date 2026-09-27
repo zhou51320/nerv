@@ -198,8 +198,18 @@ inline bool mmap::open(const char *path) {
   - 集成 YY-Thunks（`YY_Thunks_for_Win7.obj`）：链接阶段自动挂钩缺失的 Win8+ 系统调用（如 `GetSystemTimePreciseAsFileTime`、`CreateFile2`、`SetThreadDescription` 等），在 Win7 下无缝降级到兼容 API
   - 避免打包 CI 容器内 Windows Server 2022 的不兼容 VC 运行时 DLL，由目标机上的 VC++ 2015-2022 运行库或 YY-Thunks 提供干净运行时环境
   - 开启 `-DGGML_CUDA_NO_VMM=ON`，避免依赖老驱动层的 CUDA VMM 造成不稳定
-  - 关闭 `-DGGML_CUDA_FA=OFF` 与 `-DGGML_CUDA_GRAPHS=OFF`，使用成熟稳定的 cuBLAS / MMQ 矩阵乘法路径
+  - 开启 `-DGGML_CUDA_FA=ON` + `-DGGML_CUDA_FA_QUANTS=all`（Turing 走 mma-f16 Tensor Core 路径，支持任意 KV cache 量化组合）
+  - 开启 `-DGGML_CUDA_GRAPHS=ON`（CUDA 11.4 走 `cudaGraphExecUpdate` 旧签名分支）；如遇显存随对话增长或异常，运行时设 `GGML_CUDA_DISABLE_GRAPHS=1` 关闭
+  - CI 可选 `cuda_version=11.7`：启用 CUB（ne0>1024 的 ARGSORT/TOP_K 可在 GPU 执行），Win7 下运行未验证，默认仍为 11.4
+  - 运行建议：`-fa on`，KV cache `-ctk q8_0 -ctv q8_0`；Win7 驱动无显存回落，爆显存直接 OOM，需预留余量或减小 `-ub`
 - 运行要求：目标机安装 Windows 7 最终官方驱动（NVIDIA 472.12 或 474.xx），安装 KB2999226（Universal C Runtime）及 Visual C++ 2015-2022 x64 运行库。直接解压运行即可使用 CUDA 11.4 进行 2080Ti 硬件加速推理。
+
+## llama.cpp（Win7 Vulkan / 2080Ti）
+- CI：`.github/workflows/build-llama-win7-vulkan.yml`（MinGW 静态链接 + Vulkan SDK 1.3.290，push `llama.cpp/**` 或手动触发）
+- 产物：`EVA_BACKEND/x86_64/win7/vulkan/llama.cpp/`
+- 本地补丁 `ggml/src/ggml-vulkan/ggml-vulkan.cpp` `get_device_architecture`：Win7 驱动无 `VK_KHR_cooperative_matrix`，原逻辑把 2080Ti 误判为 `NVIDIA_PRE_TURING`（dmmv 工作组等启发式走老卡参数）；改为先用 `VK_NV_shader_sm_builtins` 的 `shaderWarpsPerSM==32` 识别 Turing。更新 llama.cpp 时需重新打上
+- Vulkan SDK 不要低于 1.3.290：v0.5.0 新增的 `flash_attn_decode_phase_*.comp` 无条件使用 `GL_KHR_cooperative_matrix`
+- Win7 474.xx 驱动只提供 Vulkan 1.2.175，没有 integer dot / cooperative matrix，prefill 明显慢于 CUDA，2080Ti 建议优先用 CUDA 后端；`GGML_VK_DISABLE_COOPMAT*`、`GGML_VK_DISABLE_INTEGER_DOT_PRODUCT` 在该驱动上无效，不要设 `GGML_VK_PREFER_HOST_MEMORY`
 
 ## llama-swap（Win7）
 - 源码：作为普通 vendor 目录存放在 `llama-swap/`

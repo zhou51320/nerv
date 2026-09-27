@@ -7,6 +7,14 @@ on:
         description: 'CUDA Compute Capability (e.g. 75 for RTX 2080Ti, 61 for GTX 1080)'
         required: true
         default: '75'
+      cuda_version:
+        description: 'CUDA Toolkit version (11.4 = verified on Win7; 11.7 = enables CUB for GPU argsort/top-k, Win7 unverified)'
+        required: true
+        default: '11.4'
+        type: choice
+        options:
+          - '11.4'
+          - '11.7'
   push:
     branches:
       - main
@@ -22,8 +30,12 @@ permissions:
 
 jobs:
   build-llama-win7-cuda:
-    name: Build llama.cpp (Win7 + CUDA sm_${{ inputs.cuda_arch || '75' }})
+    name: Build llama.cpp (Win7 + CUDA ${{ matrix.cuda_version }} sm_${{ inputs.cuda_arch || '75' }})
     runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        cuda_version: ${{ fromJSON(inputs.cuda_version && format('["{0}"]', inputs.cuda_version) || '["11.4","11.7"]') }}
     timeout-minutes: 360
     steps:
       - name: Checkout
@@ -34,7 +46,7 @@ jobs:
       - name: Setup CUDA Toolkit
         uses: ./.github/actions/windows-setup-cuda
         with:
-          cuda_version: '11.4'
+          cuda_version: ${{ matrix.cuda_version }}
 
       - name: Configure CUDA environment
         shell: pwsh
@@ -93,7 +105,7 @@ jobs:
           $clBanner = (& cl.exe 2>&1 | Select-Object -First 3) -join "`n"
           Write-Host $clBanner
           if (-not $env:VCToolsVersion -or $env:VCToolsVersion -notlike '14.29*') {
-            throw "CUDA 11.4 requires MSVC v142 (14.29.x). Current VCToolsVersion=$env:VCToolsVersion"
+            throw "CUDA 11.x requires MSVC v142 (14.29.x). Current VCToolsVersion=$env:VCToolsVersion"
           }
 
       - name: Install Ninja
@@ -210,11 +222,13 @@ jobs:
           $arch = "${{ inputs.cuda_arch }}"
           if (-not $arch) { $arch = "75" }
           New-Item -ItemType Directory -Force -Path artifacts | Out-Null
-          Compress-Archive -Path 'EVA_BACKEND\x86_64\win7\cuda\llama.cpp' -DestinationPath "artifacts/llama-win7-cuda-sm${arch}.zip" -Force
+          $cudaVer = "${{ matrix.cuda_version }}"
+          if (-not $cudaVer) { $cudaVer = "11.4" }
+          Compress-Archive -Path 'EVA_BACKEND\x86_64\win7\cuda\llama.cpp' -DestinationPath "artifacts/llama-win7-cuda${cudaVer}-sm${arch}.zip" -Force
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: llama-win7-cuda-sm${{ inputs.cuda_arch || '75' }}
-          path: artifacts/llama-win7-cuda-sm*.zip
+          name: llama-win7-cuda${{ matrix.cuda_version }}-sm${{ inputs.cuda_arch || '75' }}
+          path: artifacts/llama-win7-cuda*.zip
           if-no-files-found: error

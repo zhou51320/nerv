@@ -1,7 +1,7 @@
 这是为机体eva提供后端的项目
 用于编译llama.cpp whisper.cpp stable-diffusion.cpp用
 当前版本
-llama.cpp b9632
+llama.cpp v0.5.0 (b11146, 7fe450e)
 whisper.cpp 1.8.1 
 stable-diffusion.cpp master-320-1c32fa0
 
