@@ -9,7 +9,18 @@ endif()
 
 set(FASTLLM_WIN7_DIR "${CMAKE_CURRENT_LIST_DIR}")
 
+# Upstream's Windows POST_BUILD for fastllm_tools uses the VS-only
+# $(Configuration) macro, which makes Ninja reject the whole build.ninja.
+# We don't ship fastllm_tools, so drop that step and forward everything else.
+function(add_custom_command)
+    if (ARGC GREATER 1 AND ARGV0 STREQUAL "TARGET" AND ARGV1 STREQUAL "fastllm_tools")
+        return()
+    endif()
+    _add_custom_command(${ARGV})
+endfunction()
+
 # CUDA import libs (cublas, cublasLt, cuda) are linked by bare name upstream.
+cmake_policy(SET CMP0074 NEW)
 find_package(CUDAToolkit QUIET)
 if (CUDAToolkit_LIBRARY_DIR)
     link_directories("${CUDAToolkit_LIBRARY_DIR}")

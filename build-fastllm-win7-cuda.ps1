@@ -221,7 +221,6 @@ if (-not (Test-Path $win7Compat)) { throw "fastllm Win7 compat layer missing: $w
 $defs = @(
   '-DCMAKE_BUILD_TYPE=Release',
   "-DCMAKE_PROJECT_fastllm_INCLUDE:FILEPATH=$win7Compat",
-  "-DCMAKE_C_FLAGS_INIT:STRING=$hostFlags",
   "-DCMAKE_CXX_FLAGS_INIT:STRING=$hostFlags",
   "-DCMAKE_CUDA_FLAGS_INIT:STRING=$cudaCompatFlags",
   "-DCMAKE_CUDA_COMPILER:FILEPATH=$nvccPath",
