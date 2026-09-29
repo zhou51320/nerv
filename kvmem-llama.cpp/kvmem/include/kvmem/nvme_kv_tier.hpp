@@ -26,7 +26,32 @@
 
 #include <sys/stat.h>
 #include <sys/types.h>
+#if defined(_WIN32)
+#include <io.h>
+#include <windows.h>
+
+// The NVMe tier is disabled on the Win7 package, but its header is shared by
+// the host runtime and must still be consumable by MSVC. Keep the POSIX I/O
+// implementation on Unix and provide compile-safe CRT shims on Windows.
+using ssize_t = __int64;
+using off_t = __int64;
+#ifndef O_CLOEXEC
+#define O_CLOEXEC 0
+#endif
+#define open  _open
+#define close _close
+#define unlink _unlink
+inline ssize_t pread(int, void *, unsigned __int64, off_t) {
+    errno = ENOSYS;
+    return -1;
+}
+inline ssize_t pwrite(int, const void *, unsigned __int64, off_t) {
+    errno = ENOSYS;
+    return -1;
+}
+#else
 #include <unistd.h>
+#endif
 
 namespace kvmem {
 
