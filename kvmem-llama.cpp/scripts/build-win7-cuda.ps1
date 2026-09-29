@@ -120,7 +120,15 @@ if (Get-Command dumpbin -ErrorAction SilentlyContinue) {
 }
 
 if ($env:CUDA_PATH -and (Test-Path (Join-Path $env:CUDA_PATH 'bin'))) {
-  foreach ($pattern in @('cublas64_*.dll', 'cublasLt64_*.dll')) {
+  # Keep the complete CUDA 11.x runtime set used by ggml-cuda.  Some of
+  # these DLLs are delay-loaded and therefore do not appear in a plain
+  # dumpbin /dependents listing, but are required on a clean Win7 machine.
+  foreach ($pattern in @(
+      'cudart64_*.dll', 'cublas64_*.dll', 'cublasLt64_*.dll',
+      'nvrtc64_*.dll', 'nvrtc-builtins64_*.dll', 'curand64_*.dll',
+      'cufft64_*.dll', 'cusolver64_*.dll', 'cusparse64_*.dll',
+      'nvJitLink_*.dll'
+    )) {
     $cudaDll = Get-ChildItem -Path (Join-Path $env:CUDA_PATH 'bin') -File -Filter $pattern |
       Sort-Object Name | Select-Object -First 1
     if ($cudaDll) {
@@ -130,7 +138,7 @@ if ($env:CUDA_PATH -and (Test-Path (Join-Path $env:CUDA_PATH 'bin'))) {
     }
   }
 } else {
-  Write-Warning 'CUDA_PATH is not set; bundle cublas64_11.dll and cublasLt64_11.dll manually before shipping.'
+  Write-Warning 'CUDA_PATH is not set; CUDA runtime DLLs must be supplied manually before shipping.'
 }
 
 Write-Host "Done. Artifacts under $Out"
