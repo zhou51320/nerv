@@ -1,6 +1,7 @@
 #include "llama.h"
 #include "llama-kvmem-hooks.h"
 #include "kvmem-spec.h"
+#include "build-info.h"
 
 #include <algorithm>
 #include <chrono>
@@ -113,7 +114,10 @@ int main(int argc, char ** argv) {
             }
             return argv[++i];
         };
-        if (eq(arg, "-h") || eq(arg, "--help")) {
+        if (eq(arg, "--version")) {
+            llama_print_build_info(llama_version());
+            return 0;
+        } else if (eq(arg, "-h") || eq(arg, "--help")) {
             print_usage(argv[0]);
             return 0;
         } else if (eq(arg, "-m") || eq(arg, "--model")) {
