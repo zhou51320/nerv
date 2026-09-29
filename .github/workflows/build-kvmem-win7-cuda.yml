@@ -95,6 +95,12 @@ jobs:
               throw "Missing $pattern"
             }
           }
+          foreach ($name in @('llama.dll', 'ggml.dll', 'ggml-base.dll', 'ggml-cpu.dll', 'ggml-cuda.dll')) {
+            if (-not (Test-Path (Join-Path $out $name))) { throw "Missing runtime DLL $name" }
+          }
+          $runtimeFiles = @(Get-ChildItem -Path $out -File | Where-Object { $_.Extension -in @('.exe', '.dll') })
+          if ($runtimeFiles.Count -lt 10) { throw "Runtime package unexpectedly small: $($runtimeFiles.Count) files" }
+          $runtimeFiles | Select-Object -ExpandProperty Name | Sort-Object | Set-Content (Join-Path $out 'PACKAGE-MANIFEST.txt')
 
       - name: Check Win7 imports
         shell: pwsh

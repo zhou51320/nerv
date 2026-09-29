@@ -1,3 +1,4 @@
+#include "llama-kvmem-diag.h"
 #include "llama-memory-kvmem-mtp.h"
 
 #include "llama-batch.h"
@@ -30,7 +31,7 @@ static uint8_t * kvmem_mtp_cuda_ptr(ggml_tensor * t) {
         return nullptr;
     }
     ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
-    if (!buf || ggml_backend_buffer_is_host(buf)) {
+    if (!buf || ggml_backend_buffer_is_host(buf) || ggml_backend_buffer_is_meta(buf)) {
         return nullptr;
     }
     return static_cast<uint8_t *>(t->data);
@@ -44,12 +45,29 @@ llama_memory_kvmem_mtp::llama_memory_kvmem_mtp(
     model_(model),
     target_(target) {
     GGML_ASSERT(target_ && "MTP follower requires a KVMem target");
-    trace_ = getenv("KVMEM_TRACE") != nullptr;
+    trace_ = kvmem_diag_enabled();
     kv_size_ = target_->kv_size();
     block_tokens_ = target_->block_tokens();
     if (block_tokens_ == 0) {
         block_tokens_ = 32;
     }
+    // Slot marks are indexed by the trunk's gpu_slot, so take the trunk's slot
+    // count instead of recomputing the layout. The span below is a floor
+    // guard, not a second opinion: it only matters if a target ever reported
+    // fewer slots than its own pool spans.
+    n_slots_ = target_->n_slots();
+    const uint32_t n_slots_span = (kv_size_ + block_tokens_ - 1) / block_tokens_;
+    if (n_slots_ < n_slots_span) {
+        n_slots_ = n_slots_span;
+    }
+    // Sized here and never resized, so swap_raw() only fills. That matters
+    // because swap_raw() runs after the trunk's detach has moved its own store
+    // out: an allocation there would leave the trunk attached with no store.
+    // Every entry is false, so no slot is tainted until the first store swap.
+    slot_tainted_.assign(n_slots_, false);
+    GGML_ASSERT((uint64_t) n_slots_ * block_tokens_ >= kv_size_ &&
+            slot_tainted_.size() == n_slots_ &&
+            "MTP follower slot taint must cover every slot of the target's pool");
     n_layer_trunk_ = model.hparams.n_layer();
     il_graph_ = n_layer_trunk_;
     // Only slots follow the target. Byte layout follows the draft cache.
@@ -81,7 +99,7 @@ llama_memory_kvmem_mtp::llama_memory_kvmem_mtp(
             filter,
             nullptr,
             nullptr,
-            "kvmem-mtp");
+            model.split_mode() == LLAMA_SPLIT_MODE_TENSOR ? "" : "kvmem-mtp");
 
     const size_t krow = ggml_row_size(type_k_, n_embd_k_);
     const size_t vrow = ggml_row_size(type_v_, n_embd_v_);
@@ -92,8 +110,40 @@ llama_memory_kvmem_mtp::llama_memory_kvmem_mtp(
             (!v_trans_ && (vt->ne[0] != n_embd_v_ || vt->ne[1] != kv_size_ || vt->nb[1] != vrow))) {
         throw std::runtime_error("KVMem MTP cache layout does not match packed K/V transfers");
     }
+    if (target_->multi_gpu()) {
+        if (model.hparams.n_layer_nextn != 1) {
+            throw std::runtime_error("multi-GPU MTP currently requires one embedded nextn layer");
+        }
+        if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+            for (auto * t : {kt, vt}) {
+                if (!t || !ggml_backend_buffer_is_meta(t->buffer)) {
+                    throw std::runtime_error("tensor MTP follower requires Meta KV buffers");
+                }
+            }
+            kvmem_diag("KVMEM_MTP_FOLLOWER owner=Meta K=%s V=%s cells=%u bytes=%.2f MiB\n",
+                    ggml_type_name(kt->type), ggml_type_name(vt->type), kv_size_,
+                    (ggml_nbytes(kt) + ggml_nbytes(vt)) / (1024.0 * 1024.0));
+        } else {
+            auto * expected = model.dev_layer(static_cast<int>(il_graph_));
+            if (!expected || ggml_backend_dev_type(expected) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                throw std::runtime_error("multi-GPU MTP nextn layer is not on a GPU");
+            }
+            for (auto * t : {kt, vt}) {
+                auto * buffer = t->buffer ? t->buffer : t->view_src ? t->view_src->buffer : nullptr;
+                auto * actual = buffer ? ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buffer)) : nullptr;
+                if (actual != expected) {
+                    throw std::runtime_error("multi-GPU MTP follower KV is not on its nextn layer GPU");
+                }
+            }
+            kvmem_diag("KVMEM_MTP_FOLLOWER owner=%s K=%s V=%s cells=%u bytes=%.2f MiB\n",
+                    ggml_backend_dev_name(expected), ggml_type_name(kt->type), ggml_type_name(vt->type),
+                    kv_size_, (ggml_nbytes(kt) + ggml_nbytes(vt)) / (1024.0 * 1024.0));
+        }
+    }
 
-    kvmem::RawKvStoreConfig rcfg;
+    // Kept as a member so a sibling mirror for another conversation is
+    // configured identically.
+    kvmem::RawKvStoreConfig & rcfg = raw_cfg_;
     rcfg.n_layer = std::max(1u, model.hparams.n_layer_nextn);
     rcfg.n_embd_k = n_embd_k_;
     rcfg.n_embd_v = n_embd_v_;
@@ -125,8 +175,7 @@ llama_memory_kvmem_mtp::llama_memory_kvmem_mtp(
         bytes += kv.second;
     }
     const uint32_t n_layers = (uint32_t) kv_->get_layer_ids().size();
-    fprintf(stderr,
-            "KVMEM_TRACE mtp_pool cells=%u target_cells=%u n_ctx=%u bytes=%zu layers=%u block_tokens=%u"
+    kvmem_diag("KVMEM_TRACE mtp_pool cells=%u target_cells=%u n_ctx=%u bytes=%zu layers=%u block_tokens=%u"
             " type_k=%s type_v=%s k_row_bytes=%zu v_row_bytes=%zu v_trans=%d\n",
             kv_size_, target_->kv_size(), cparams.n_ctx, bytes, n_layers, block_tokens_,
             ggml_type_name(kt->type), ggml_type_name(vt->type), krow, vrow, (int) v_trans_);
@@ -190,8 +239,7 @@ bool llama_memory_kvmem_mtp::fill_from_target(
     }
     pos_queue_.push_back(std::move(pos_note));
     if (trace_ && ubatch.n_tokens > 0) {
-        fprintf(stderr,
-                "KVMEM_TRACE mtp_occupy n=%u first_pos=%d first_slot=%d first_cell=%u "
+        kvmem_diag("KVMEM_TRACE mtp_occupy n=%u first_pos=%d first_slot=%d first_cell=%u "
                 "tgt_slot=%d kv_size=%u\n",
                 ubatch.n_tokens, (int) ubatch.pos[0], (int) first_slot, first_cell,
                 (int) first_slot, kv_size_);
@@ -248,7 +296,9 @@ llama_memory_context_ptr llama_memory_kvmem_mtp::init_update(llama_context * lct
 void llama_memory_kvmem_mtp::clear(bool data) {
     if (target_) target_->note_attention_change();
     kv_->clear(data);
-    raw_->clear();
+    if (raw_) {
+        raw_->clear();
+    }
     pos_queue_.clear();
 }
 
@@ -425,8 +475,15 @@ bool llama_memory_kvmem_mtp::layout_d2d(const LayoutMove * moves, size_t n_moves
     const uint64_t vspan = (uint64_t) block_tokens_ * vrow;
     const uint64_t stride = kspan + vspan;
     uint8_t * scratch = nullptr;
-    if (cudaMalloc(reinterpret_cast<void **>(&scratch),
-                   n_moves * (size_t) stride) != cudaSuccess) {
+    const size_t scratch_bytes = n_moves * (size_t) stride;
+    const cudaError_t alloc_error = cudaMalloc(reinterpret_cast<void **>(&scratch), scratch_bytes);
+    if (alloc_error != cudaSuccess) {
+        if (alloc_error == cudaErrorMemoryAllocation) {
+            // The caller restores packed host KV; do not leak this handled OOM to the next kernel.
+            (void) cudaGetLastError();
+            LLAMA_LOG_WARN("%s: %zu-byte layout scratch unavailable; using host KV fallback\n",
+                           __func__, scratch_bytes);
+        }
         return false;
     }
     kvmem_stagein_gpu_ready((size_t) block_tokens_ * std::max(n_embd_k_, n_embd_v_),
@@ -525,6 +582,12 @@ void llama_memory_kvmem_mtp::write_block_to_gpu(uint32_t block_id) {
     std::vector<uint8_t> kpack((size_t) nt * krow);
     if (raw_->copy_k_gpu(block_id, 0, kpack.data(), nt)) {
         kvmem_tensor_set(kt, kpack.data(), cell0 * krow, nt * krow);
+        if (nt == block_tokens_) {
+            // This slot now holds this conversation's packed draft K end to
+            // end. A partial block leaves its tail cells untouched, so that
+            // slot keeps whatever taint it had.
+            clear_slot_taint(blk.gpu_slot);
+        }
     }
 
     std::vector<uint8_t> vpack((size_t) nt * vrow);
@@ -586,7 +649,7 @@ void llama_memory_kvmem_mtp::follow_retrieval() {
     uint32_t n_host = 0;
     uint32_t n_miss = 0;
     if (trace_) {
-        fprintf(stderr, "KVMEM_TRACE mtp_selected");
+        kvmem_diag("KVMEM_TRACE mtp_selected");
     }
     for (const auto & b : target_->store().blocks()) {
         if (b.gpu_slot < 0 || b.n_tokens == 0) {
@@ -604,15 +667,23 @@ void llama_memory_kvmem_mtp::follow_retrieval() {
             write_block_to_gpu(b.block_id);
             n_host++;
         } else {
-            occupy_block(b.block_id);
+            // The mirror does not cover this block, so occupying its cells
+            // hands the draft layer whatever they already hold: this
+            // conversation's own decoded K on the single-store path, and the
+            // previous conversation's after a store swap. A tainted slot is
+            // left out rather than labelled with this block's positions; the
+            // follower then has no draft context there until this block's
+            // next stage-out mirrors it.
+            if (!slot_tainted(b.gpu_slot)) {
+                occupy_block(b.block_id);
+            }
             n_miss++;
         }
     }
     if (trace_) {
         fprintf(stderr, "\n");
     }
-    fprintf(stderr,
-            "KVMEM_TRACE mtp_follow n_gpu=%u n_keep=%u n_host=%u n_writeback=%u n_no_raw=%u seq_pos=[%d,%d]\n",
+    kvmem_diag("KVMEM_TRACE mtp_follow n_gpu=%u n_keep=%u n_host=%u n_writeback=%u n_no_raw=%u seq_pos=[%d,%d]\n",
             n_gpu, n_keep, n_host, n_keep + n_host, n_miss,
             (int) kv_->seq_pos_min(0), (int) kv_->seq_pos_max(0));
 }

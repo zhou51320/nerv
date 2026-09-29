@@ -1,6 +1,7 @@
 #include "llama.h"
 #include "llama-kvmem-hooks.h"
 #include "kvmem-spec.h"
+#include "kvmem-server-devices.h"
 #include "build-info.h"
 
 #include <algorithm>
@@ -14,6 +15,14 @@
 #include <string>
 #include <vector>
 
+static int kvmem_setenv(const char * name, const char * value) {
+#if defined(_WIN32)
+    return _putenv_s(name, value);
+#else
+    return setenv(name, value, 1);
+#endif
+}
+
 static void print_usage(const char * argv0) {
     fprintf(stderr,
             "usage: %s -m model.gguf [options] [prompt]\n"
@@ -24,7 +33,11 @@ static void print_usage(const char * argv0) {
             "  -c, --ctx-size N           context size (default prompt + n_predict)\n"
             "  -b, --batch-size N         logical batch (default 512)\n"
             "  -ub, --ubatch-size N       physical ubatch (default 512)\n"
-            "  -ngl, --n-gpu-layers N     GPU layers (default 99)\n"
+            "  -ngl, --n-gpu-layers N     GPU layers; all required for multi-GPU (default 99)\n"
+            "  --list-devices            list available ggml devices\n"
+            "  --device NAMES            CUDA devices, e.g. CUDA0,CUDA1\n"
+            "  --split-mode MODE         none | layer | tensor\n"
+            "  --tensor-split N,...      proportions, one per selected GPU\n"
             "  --temp T                   temperature; 0 = greedy (default 0)\n"
             "  --tokens-only              print generated token ids, one per line\n"
             "  --no-prompt                do not echo the prompt (generation only)\n"
@@ -46,27 +59,20 @@ static void print_usage(const char * argv0) {
             "  --kvmem-harvest-v          prefill D2H V with raw-K (default off; RAM until NVMe flush)\n"
             "  --kvmem-raw-k-nvme         store raw-K and V on NVMe (needs --kvmem-nvme-gb)\n"
             "  --kvmem-dump-kv            after prefill, compare raw-rebuild KV vs GPU KV\n"
-            "  --kv-dtype NAME            GPU KV cache type for K and V: f16 | q8_0 | q5_0 | q4_0 (default q8_0)\n"
+            "  --kv-dtype NAME            GPU KV cache type for K and V: f16 | f32 | q8_0 | q5_0 | q4_0 (default q8_0)\n"
             "  -ctk, --cache-type-k TYPE  GPU K cache type (llama.cpp name; default q8_0)\n"
-            "  -ctv, --cache-type-v TYPE  GPU V cache type (must match K when quantized)\n"
+            "  -ctv, --cache-type-v TYPE  GPU V cache type (quantized: independently q8_0 | q5_0 | q4_0)\n"
             "  --spec-type TYPE           none | draft-mtp (default none)\n"
             "  --spec-kv-dtype TYPE       MTP K/V type (default: inherit target K/V types)\n"
             "  --spec-draft-n-max N       MTP draft tokens (default 2)\n"
             "  --spec-draft-p-min P       min draft probability (default 0)\n"
+            "  --kvmem-mtp-state MODE     snapshots | replay (default snapshots)\n"
             "  --spec-draft-model PATH    optional sidecar MTP GGUF\n",
             argv0);
 }
 
 static bool eq(const char * a, const char * b) {
     return std::strcmp(a, b) == 0;
-}
-
-static void set_env_var(const char * name, const char * value) {
-#if defined(_WIN32)
-    _putenv_s(name, value);
-#else
-    setenv(name, value, 1);
-#endif
 }
 
 int main(int argc, char ** argv) {
@@ -80,6 +86,9 @@ int main(int argc, char ** argv) {
     int n_batch = 512;
     int n_ubatch = 512;
     int ngl = 99;
+    bool list_devices = false;
+    kvmem_server_options device_options;
+    kvmem_server_devices device_config;
     float temp = 0.0f;
     bool tokens_only = false;
     bool no_prompt = false;
@@ -133,7 +142,20 @@ int main(int argc, char ** argv) {
         } else if (eq(arg, "-ub") || eq(arg, "--ubatch-size")) {
             n_ubatch = std::atoi(need(arg));
         } else if (eq(arg, "-ngl") || eq(arg, "--n-gpu-layers")) {
-            ngl = std::atoi(need(arg));
+            const char * value = need(arg);
+            ngl = eq(value, "all") ? -2 : std::atoi(value);
+        } else if (eq(arg, "--list-devices")) {
+            list_devices = true;
+        } else if (eq(arg, "--device") || eq(arg, "-dev") ||
+                   eq(arg, "--split-mode") || eq(arg, "-sm") ||
+                   eq(arg, "--tensor-split") || eq(arg, "-ts") ||
+                   eq(arg, "--main-gpu") || eq(arg, "-mg")) {
+            try {
+                device_options.parse(arg, [&](const char *) { return need(arg); });
+            } catch (const std::exception & e) {
+                fprintf(stderr, "invalid GPU option: %s\n", e.what());
+                return 1;
+            }
         } else if (eq(arg, "--temp")) {
             temp = std::atof(need(arg));
         } else if (eq(arg, "--tokens-only")) {
@@ -170,7 +192,7 @@ int main(int argc, char ** argv) {
             bool ok = false;
             const ggml_type t = kvmem_parse_cache_type(need(arg), &ok);
             if (!ok) {
-                fprintf(stderr, "unsupported cache type (want f16|q8_0|q4_0|f32)\n");
+                fprintf(stderr, "unsupported cache type (want f16|f32|q8_0|q5_0|q4_0)\n");
                 return 1;
             }
             if (eq(arg, "-ctv") || eq(arg, "--cache-type-v")) {
@@ -222,6 +244,14 @@ int main(int argc, char ** argv) {
             spec_n_max = std::atoi(need(arg));
         } else if (eq(arg, "--spec-draft-p-min")) {
             spec_p_min = std::strtof(need(arg), nullptr);
+        } else if (eq(arg, "--kvmem-mtp-state")) {
+            const char * mode = need(arg);
+            if (eq(mode, "snapshots")) kparams.mtp_state = 0;
+            else if (eq(mode, "replay")) kparams.mtp_state = 2;
+            else {
+                fprintf(stderr, "unsupported --kvmem-mtp-state (want snapshots|replay)\n");
+                return 1;
+            }
         } else if (eq(arg, "--spec-draft-model") || eq(arg, "-md")) {
             spec_draft_model = need(arg);
         } else if (arg[0] == '-') {
@@ -231,6 +261,27 @@ int main(int argc, char ** argv) {
         } else {
             break;
         }
+    }
+#if !KVMEM_ENABLE_NVME
+    if (kparams.nvme_bytes || kparams.raw_k_nvme) {
+        fprintf(stderr, "NVMe offload is disabled in this build (KVMEM_ENABLE_NVME=OFF)\n");
+        return 1;
+    }
+#endif
+    // Validate before backend initialization and loading a potentially large model.
+    if (!kvmem_cache_types_ok(cache_type_k, cache_type_v)) {
+        fprintf(stderr, "incompatible KV cache types: K=%s, V=%s; quantized K/V must both use q8_0, q5_0 or q4_0; "
+                "set both -ctk and -ctv, or use --kv-dtype TYPE to set both\n",
+                ggml_type_name(cache_type_k), ggml_type_name(cache_type_v));
+        return 1;
+    }
+    if (list_devices) {
+        ggml_backend_load_all();
+        for (size_t d = 0; d < ggml_backend_dev_count(); ++d) {
+            auto * dev = ggml_backend_dev_get(d);
+            fprintf(stdout, "%s: %s\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev));
+        }
+        return 0;
     }
     if (model_path.empty()) {
         print_usage(argv[0]);
@@ -256,6 +307,25 @@ int main(int argc, char ** argv) {
     llama_model_params model_params = llama_model_default_params();
     model_params.n_gpu_layers = ngl;
     model_params.load_mtp = spec_mtp;
+    try {
+        device_config.apply(device_options, model_params);
+    } catch (const std::exception & e) {
+        fprintf(stderr, "invalid GPU configuration: %s\n", e.what());
+        return 1;
+    }
+    if (model_params.split_mode == LLAMA_SPLIT_MODE_TENSOR && spec_mtp && kparams.enabled && kparams.mtp_state != 0) {
+        fprintf(stderr, "tensor KVMem currently supports MTP snapshots only; use --kvmem-mtp-state snapshots\n");
+        return 1;
+    }
+    if (device_config.devices.size() > 2 && spec_mtp && !kparams.enabled &&
+        model_params.split_mode != LLAMA_SPLIT_MODE_TENSOR) {
+        fprintf(stderr, "multi-GPU MTP requires --kvmem\n");
+        return 1;
+    }
+    if (device_config.devices.size() > 2 && spec_mtp && !spec_draft_model.empty()) {
+        fprintf(stderr, "multi-GPU MTP currently requires an embedded nextn draft layer\n");
+        return 1;
+    }
     llama_model * model = llama_model_load_from_file(model_path.c_str(), model_params);
     if (!model) {
         fprintf(stderr, "failed to load model: %s\n", model_path.c_str());
@@ -301,11 +371,16 @@ int main(int argc, char ** argv) {
     }
 
     if (kparams.enabled) {
+        if (!spec_mtp) kparams.mtp_state = 0;
         if (!nvme_dir.empty()) {
             kparams.nvme_dir = nvme_dir.c_str();
         }
         if (dump_kv) {
-            set_env_var("KVMEM_DUMP_CAPTURE", "1");
+#ifdef _WIN32
+            _putenv_s("KVMEM_DUMP_CAPTURE", "1");
+#else
+            kvmem_setenv("KVMEM_DUMP_CAPTURE", "1");
+#endif
         }
         if (query_last > 0 && n_prompt > 0) {
             const int last = std::min(query_last, n_prompt);
@@ -342,10 +417,6 @@ int main(int argc, char ** argv) {
     ctx_params.n_ubatch = static_cast<uint32_t>(n_ubatch);
     ctx_params.n_seq_max = 1;
     ctx_params.no_perf = false;
-    if (!kvmem_cache_types_ok(cache_type_k, cache_type_v)) {
-        fprintf(stderr, "quantized K/V cache types must match (CUDA FA: q8_0/q8_0 or q4_0/q4_0)\n");
-        return 1;
-    }
     ctx_params.type_k = cache_type_k;
     ctx_params.type_v = cache_type_v;
     if (spec_mtp) {
@@ -602,6 +673,19 @@ int main(int argc, char ** argv) {
     }
 
     llama_synchronize(ctx);
+    const char * hash_gdn = std::getenv("KVMEM_GDN_HASH");
+    if (hash_gdn && hash_gdn[0] == '1' && llama_kvmem_has_recurrent()) {
+        const llama_state_seq_flags flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+        const size_t size = llama_state_seq_get_size_ext(ctx, 0, flags);
+        std::vector<uint8_t> state(size);
+        if (!size || llama_state_seq_get_data_ext(ctx, state.data(), size, 0, flags) != size) {
+            fprintf(stderr, "KVMEM_GDN_HASH failed to read recurrent state\n");
+            return 1;
+        }
+        uint64_t hash = 14695981039346656037ull;
+        for (uint8_t byte : state) hash = (hash ^ byte) * 1099511628211ull;
+        fprintf(stderr, "KVMEM_GDN_HASH bytes=%zu fnv64=%016llx\n", size, (unsigned long long) hash);
+    }
     const double gen_wall_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - t_gen0).count();
     llama_perf_context_print(ctx);

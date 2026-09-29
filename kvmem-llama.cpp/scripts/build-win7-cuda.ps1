@@ -48,13 +48,16 @@ $cmakeArgs = @(
   "-DCMAKE_CUDA_FLAGS:STRING=$cudaCompat",
   '-DGGML_CUDA=ON', '-DGGML_CUDA_FA=ON', '-DGGML_CUDA_FA_ALL_QUANTS=ON',
   '-DGGML_CUDA_GRAPHS=ON', '-DGGML_CUDA_NO_VMM=ON', '-DGGML_STATIC=ON',
+  # Match the known-good llama.cpp package: ship llama/ggml backend DLLs
+  # alongside the executables instead of relying on static-only linkage.
+  '-DBUILD_SHARED_LIBS=ON',
   '-DGGML_NATIVE=OFF', '-DGGML_WIN_VER=0x601',
   # Static MSVC/UCRT runtime is required on unmodified Windows 7 systems.
   '-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded',
   '-DCMAKE_C_FLAGS=/MT /D_WIN32_WINNT=0x0601 /DWINVER=0x0601',
   '-DCMAKE_CXX_FLAGS=/MT /EHsc /D_WIN32_WINNT=0x0601 /DWINVER=0x0601',
   "-DYY_THUNKS_OBJ:FILEPATH=$yy",
-  '-DLLAMA_KVMEM=ON', "-DLLAMA_KVMEM_ROOT:PATH=$Root",
+  '-DLLAMA_KVMEM=ON', "-DLLAMA_KVMEM_ROOT:PATH=$Root", '-DKVMEM_ENABLE_NVME=OFF',
   '-DKVMEM_BUILD_LLAMA=ON', '-DLLAMA_BUILD_COMMON=ON', '-DLLAMA_BUILD_TOOLS=ON',
   '-DLLAMA_BUILD_SERVER=OFF', '-DLLAMA_BUILD_EXAMPLES=OFF', '-DLLAMA_BUILD_TESTS=OFF',
   '-DLLAMA_CURL=OFF', '-DLLAMA_OPENSSL=OFF'
@@ -79,8 +82,41 @@ foreach ($name in $names) {
   Copy-Item $hit.FullName (Join-Path $Out $name) -Force
 }
 
-Get-ChildItem -Path $Bdir -Recurse -File -Filter '*.dll' | ForEach-Object {
-  Copy-Item $_.FullName (Join-Path $Out $_.Name) -Force
+Get-ChildItem -Path $Bdir -Recurse -File -Filter '*.dll' |
+  Sort-Object FullName |
+  ForEach-Object { Copy-Item $_.FullName (Join-Path $Out $_.Name) -Force }
+
+# Bundle the transitive CUDA/backend DLL closure.  The previous package only
+# copied DLLs emitted directly by CMake, while cuBLAS and newer ggml backends
+# can load additional CUDA DLLs at process start.  Resolve names reported by
+# dumpbin against the build tree and CUDA_PATH\bin, but never copy Windows
+# system DLLs.
+if (Get-Command dumpbin -ErrorAction SilentlyContinue) {
+  $pending = [System.Collections.Generic.Queue[string]]::new()
+  Get-ChildItem -Path $Out -File | Where-Object { $_.Extension -in @('.exe', '.dll') } |
+    ForEach-Object { $pending.Enqueue($_.FullName) }
+  $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+  while ($pending.Count -gt 0) {
+    $parent = $pending.Dequeue()
+    if (-not $seen.Add($parent)) { continue }
+    $deps = & dumpbin /nologo /dependents $parent 2>$null |
+      ForEach-Object { if ($_ -match '^\s+([A-Za-z0-9_.-]+\.dll)\s*$') { $Matches[1] } }
+    foreach ($dep in $deps) {
+      if (Test-Path (Join-Path $Out $dep)) { $pending.Enqueue((Join-Path $Out $dep)); continue }
+      $src = Get-ChildItem -Path $Bdir -Recurse -File -Filter $dep -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+      if (-not $src -and $env:CUDA_PATH) {
+        $src = Get-ChildItem -Path (Join-Path $env:CUDA_PATH 'bin') -File -Filter $dep -ErrorAction SilentlyContinue |
+          Select-Object -First 1
+      }
+      if ($src) {
+        $dest = Join-Path $Out $src.Name
+        Copy-Item $src.FullName $dest -Force
+        $pending.Enqueue($dest)
+        Write-Host "Bundled dependency $($src.Name) for $(Split-Path $parent -Leaf)"
+      }
+    }
+  }
 }
 
 if ($env:CUDA_PATH -and (Test-Path (Join-Path $env:CUDA_PATH 'bin'))) {
