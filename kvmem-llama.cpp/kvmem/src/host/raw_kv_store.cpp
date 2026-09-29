@@ -2,20 +2,19 @@
 #include "kvmem/nvme_kv_tier.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
-#include <ctime>
-#include <time.h>
 #include <cstdlib>
 #include <stdexcept>
 #include <utility>
 
 namespace {
 uint64_t monotonic_ns() {
-    timespec ts{};
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull +
-           static_cast<uint64_t>(ts.tv_nsec);
+    using clock = std::chrono::steady_clock;
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            clock::now().time_since_epoch()).count());
 }
 } // namespace
 
