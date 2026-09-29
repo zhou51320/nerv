@@ -27,6 +27,9 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <io.h>
 #include <windows.h>
 
@@ -34,13 +37,14 @@
 // the host runtime and must still be consumable by MSVC. Keep the POSIX I/O
 // implementation on Unix and provide compile-safe CRT shims on Windows.
 using ssize_t = __int64;
-using off_t = __int64;
 #ifndef O_CLOEXEC
 #define O_CLOEXEC 0
 #endif
 #define open  _open
 #define close _close
 #define unlink _unlink
+inline int mkdir(const char *path, int) { return _mkdir(path); }
+inline int fdatasync(int) { return 0; }
 inline ssize_t pread(int, void *, unsigned __int64, off_t) {
     errno = ENOSYS;
     return -1;
