@@ -83,6 +83,7 @@ foreach ($name in $names) {
 }
 
 Get-ChildItem -Path $Bdir -Recurse -File -Filter '*.dll' |
+  Where-Object { $_.Name -notmatch '^cudart64_.*\.dll$' } |
   Sort-Object FullName |
   ForEach-Object { Copy-Item $_.FullName (Join-Path $Out $_.Name) -Force }
 
@@ -102,6 +103,7 @@ if (Get-Command dumpbin -ErrorAction SilentlyContinue) {
     $deps = & dumpbin /nologo /dependents $parent 2>$null |
       ForEach-Object { if ($_ -match '^\s+([A-Za-z0-9_.-]+\.dll)\s*$') { $Matches[1] } }
     foreach ($dep in $deps) {
+      if ($dep -match '^cudart64_.*\.dll$') { continue }
       if (Test-Path (Join-Path $Out $dep)) { $pending.Enqueue((Join-Path $Out $dep)); continue }
       $src = Get-ChildItem -Path $Bdir -Recurse -File -Filter $dep -ErrorAction SilentlyContinue |
         Select-Object -First 1
