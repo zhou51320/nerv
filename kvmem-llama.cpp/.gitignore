@@ -1,0 +1,14 @@
+/build/
+/build-cpu/
+/build-cuda/
+/build-win7-cuda/
+/models/
+/.venv/
+/logs/
+compile_commands.json
+*.gguf
+.cache/
+__pycache__/
+*.pyc
+
+/build-ui/

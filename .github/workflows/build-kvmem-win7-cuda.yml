@@ -1,0 +1,131 @@
+name: Build KVMem Win7 CUDA
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'kvmem-llama.cpp/**'
+      - 'third_party/YY-Thunks/**'
+      - '.github/actions/windows-setup-cuda/**'
+      - '.github/workflows/build-kvmem-win7-cuda.yml'
+  workflow_dispatch:
+    inputs:
+      cuda_version:
+        description: 'CUDA Toolkit version (only this version is built)'
+        required: true
+        default: '11.7'
+        type: choice
+        options:
+          - '11.4'
+          - '11.7'
+      cuda_arch:
+        description: 'CUDA Compute Capability (RTX 2080 Ti = 75)'
+        required: true
+        default: '75'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: KVMem Win7 CUDA ${{ inputs.cuda_version || '11.7' }} sm_${{ inputs.cuda_arch || '75' }}
+    runs-on: windows-2022
+    timeout-minutes: 360
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup CUDA Toolkit
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: ${{ inputs.cuda_version || '11.7' }}
+
+      - name: Configure CUDA environment
+        shell: pwsh
+        run: |
+          if (-not $env:CUDA_PATH -or -not (Test-Path $env:CUDA_PATH)) {
+            throw "CUDA_PATH is missing or invalid: $env:CUDA_PATH"
+          }
+          "CUDAToolkit_ROOT=$env:CUDA_PATH" | Out-File -FilePath $env:GITHUB_ENV -Append
+          (Join-Path $env:CUDA_PATH 'bin') | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Patch CUDA host_config for MSVC compatibility
+        shell: pwsh
+        run: |
+          $hostCfg = Join-Path $env:CUDA_PATH 'include\crt\host_config.h'
+          if (Test-Path $hostCfg) {
+            $raw = Get-Content -Raw -LiteralPath $hostCfg
+            $patched = $raw -replace '_MSC_VER\s*>=\s*19\d{2}', '_MSC_VER >= 2000'
+            $patched = $patched -replace '_MSC_VER\s*>\s*19\d{2}', '_MSC_VER > 2000'
+            if ($patched -ne $raw) {
+              Set-Content -LiteralPath $hostCfg -Value $patched -Encoding UTF8
+            }
+          }
+
+      - name: Setup MSVC v142
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+          toolset: 14.29
+
+      - name: Install Ninja
+        shell: pwsh
+        run: choco install ninja --no-progress -y
+
+      - name: Build KVMem
+        shell: pwsh
+        run: |
+          $arch = "${{ inputs.cuda_arch }}"
+          if (-not $arch) { $arch = '75' }
+          Set-Location kvmem-llama.cpp
+          .\scripts\build-win7-cuda.ps1 -Clean -CudaArch $arch -Generator Ninja
+
+      - name: Verify Win7 package
+        shell: pwsh
+        run: |
+          $out = 'EVA_BACKEND\x86_64\win7\cuda\kvmem-llama.cpp'
+          foreach ($name in @('llama-kvmem-server.exe', 'llama-kvmem-cli.exe', 'llama-quantize.exe')) {
+            if (-not (Test-Path (Join-Path $out $name))) { throw "Missing $name" }
+          }
+          foreach ($pattern in @('cublas64_*.dll', 'cublasLt64_*.dll')) {
+            if (-not (Get-ChildItem -Path $out -Filter $pattern -ErrorAction SilentlyContinue)) {
+              throw "Missing $pattern"
+            }
+          }
+
+      - name: Check Win7 imports
+        shell: pwsh
+        run: |
+          $out = 'EVA_BACKEND\x86_64\win7\cuda\kvmem-llama.cpp'
+          $bad = @()
+          Get-ChildItem -Path $out -File | Where-Object { $_.Extension -in '.exe', '.dll' } | ForEach-Object {
+            $deps = & dumpbin /nologo /dependents $_.FullName |
+              Where-Object { $_ -match '^\s+(api-ms-win-core-\S+\.dll)' } |
+              ForEach-Object { $Matches[1] }
+            foreach ($dep in $deps) { $bad += "$($_.Name) -> $dep" }
+          }
+          if ($bad.Count -gt 0) {
+            $bad | ForEach-Object { Write-Error $_ }
+            throw 'Found Windows 8+ api-set imports'
+          }
+
+      - name: Package artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          $cuda = "${{ inputs.cuda_version }}"
+          if (-not $cuda) { $cuda = '11.7' }
+          $arch = "${{ inputs.cuda_arch }}"
+          if (-not $arch) { $arch = '75' }
+          Compress-Archive -Path 'EVA_BACKEND\x86_64\win7\cuda\kvmem-llama.cpp' `
+            -DestinationPath "artifacts/kvmem-llama-win7-cuda${cuda}-sm${arch}.zip" -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kvmem-llama-win7-cuda${{ inputs.cuda_version || '11.7' }}-sm${{ inputs.cuda_arch || '75' }}
+          path: artifacts/kvmem-llama-win7-cuda*.zip
+          if-no-files-found: error
