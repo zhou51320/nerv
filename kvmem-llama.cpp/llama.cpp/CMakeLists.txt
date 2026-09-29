@@ -1,45 +1,10 @@
-if (NOT DEFINED GGML_WIN_VER)
-    if (NOT MSVC)
-        set(GGML_WIN_VER "0x601" CACHE STRING "ggml: Windows version")
-    endif()
-endif()
-
-if (DEFINED GGML_WIN_VER AND NOT "${GGML_WIN_VER}" STREQUAL "")
-    add_compile_definitions(_WIN32_WINNT=${GGML_WIN_VER} WINVER=${GGML_WIN_VER})
-endif()
-
-# YY-Thunks supplies the Windows 7 implementations for API entry points that
-# newer MSVC/CUDA runtimes may reference (for example SetThreadDescription).
-# The path is overridable because KVMem lives beside the main repository's
-# third_party directory rather than inside the llama.cpp checkout.
-if (MSVC AND WIN32)
-    if (NOT DEFINED YY_THUNKS_OBJ)
-        set(_yy_candidates
-            "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/YY-Thunks/objs/x64/YY_Thunks_for_Win7.obj"
-            "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/YY-Thunks/objs/x64/YY_Thunks_for_Win7.obj")
-        foreach (_yy_candidate IN LISTS _yy_candidates)
-            if (EXISTS "${_yy_candidate}")
-                set(YY_THUNKS_OBJ "${_yy_candidate}")
-                break()
-            endif()
-        endforeach()
-    endif()
-    if (DEFINED YY_THUNKS_OBJ AND EXISTS "${YY_THUNKS_OBJ}")
-        message(STATUS "Integrating YY-Thunks for Windows 7: ${YY_THUNKS_OBJ}")
-        file(TO_CMAKE_PATH "${YY_THUNKS_OBJ}" YY_THUNKS_OBJ_NORM)
-        set(CMAKE_C_STANDARD_LIBRARIES "\"${YY_THUNKS_OBJ_NORM}\" ${CMAKE_C_STANDARD_LIBRARIES}" CACHE STRING "" FORCE)
-        set(CMAKE_CXX_STANDARD_LIBRARIES "\"${YY_THUNKS_OBJ_NORM}\" ${CMAKE_CXX_STANDARD_LIBRARIES}" CACHE STRING "" FORCE)
-        set(CMAKE_CUDA_STANDARD_LIBRARIES "\"${YY_THUNKS_OBJ_NORM}\" ${CMAKE_CUDA_STANDARD_LIBRARIES}" CACHE STRING "" FORCE)
-    endif()
-endif()
-
 cmake_minimum_required(VERSION 3.14...3.28) # for add_link_options and implicit target directories.
 project("llama.cpp" C CXX)
 include(CheckIncludeFileCXX)
 
 ### llama.cpp version
 set(LLAMA_VERSION_MAJOR 0)
-set(LLAMA_VERSION_MINOR 3)
+set(LLAMA_VERSION_MINOR 5)
 set(LLAMA_VERSION_PATCH 0)
 set(LLAMA_VERSION_BASE "${LLAMA_VERSION_MAJOR}.${LLAMA_VERSION_MINOR}.${LLAMA_VERSION_PATCH}")
 
@@ -236,6 +201,16 @@ llama_option_depr(WARNING     LLAMA_CURL)
 
 include("cmake/license.cmake")
 license_add_file("llama.cpp" "LICENSE")
+
+#
+# compile options
+#
+
+# clang stores the modification time of the precompiled header sources inside the
+# header and rejects it when they differ, so the timestamp is left out of it
+add_compile_options(
+    "$<$<COMPILE_LANG_AND_ID:C,Clang,IntelLLVM>:SHELL:-Xclang -fno-pch-timestamp>"
+    "$<$<COMPILE_LANG_AND_ID:CXX,Clang,IntelLLVM>:SHELL:-Xclang -fno-pch-timestamp>")
 
 #
 # 3rd-party
