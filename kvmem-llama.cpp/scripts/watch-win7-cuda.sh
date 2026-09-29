@@ -13,18 +13,16 @@ command -v gh >/dev/null || { echo 'gh is required' >&2; exit 2; }
 last_run="${1:-}"
 while true; do
     row="$(gh run list --repo "$REPO" --workflow "$WORKFLOW" --limit 1 \
-        --json databaseId,status,conclusion,headSha,url \
-        --jq '.[0] // empty')"
+        --json databaseId,status,conclusion,url \
+        --jq '.[0] // empty | [.databaseId, .status, (if (.conclusion == null or .conclusion == "") then "-" else .conclusion end), .url] | @tsv')"
     if [[ -z "$row" ]]; then
         echo "[$(date -Is)] no workflow run yet; sleeping ${INTERVAL_SECONDS}s"
         sleep "$INTERVAL_SECONDS"
         continue
     fi
 
-    run_id="$(jq -r '.databaseId' <<<"$row")"
-    status="$(jq -r '.status' <<<"$row")"
-    conclusion="$(jq -r '.conclusion // empty' <<<"$row")"
-    url="$(jq -r '.url' <<<"$row")"
+    IFS=$'\t' read -r run_id status conclusion url <<< "$row"
+    [[ "$conclusion" == "-" ]] && conclusion=""
     echo "[$(date -Is)] run=$run_id status=$status conclusion=$conclusion $url"
 
     if [[ "$status" == completed && "$conclusion" == success ]]; then
