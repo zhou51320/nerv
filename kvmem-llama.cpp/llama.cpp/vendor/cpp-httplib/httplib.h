@@ -12,7 +12,7 @@
 #define CPPHTTPLIB_VERSION_NUM "0x003901"
 
 #ifdef _WIN32
-#if defined(_WIN32_WINNT) && _WIN32_WINNT < 0x0A00
+#if defined(_WIN32_WINNT) && _WIN32_WINNT < 0x0A00 && !defined(CPPHTTPLIB_ALLOW_WIN7)
 #error                                                                         \
     "cpp-httplib doesn't support Windows 8 or lower. Please use Windows 10 or later."
 #endif
