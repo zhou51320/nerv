@@ -60,6 +60,14 @@ static bool eq(const char * a, const char * b) {
     return std::strcmp(a, b) == 0;
 }
 
+static void set_env_var(const char * name, const char * value) {
+#if defined(_WIN32)
+    _putenv_s(name, value);
+#else
+    setenv(name, value, 1);
+#endif
+}
+
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
@@ -293,7 +301,7 @@ int main(int argc, char ** argv) {
             kparams.nvme_dir = nvme_dir.c_str();
         }
         if (dump_kv) {
-            setenv("KVMEM_DUMP_CAPTURE", "1", 1);
+            set_env_var("KVMEM_DUMP_CAPTURE", "1");
         }
         if (query_last > 0 && n_prompt > 0) {
             const int last = std::min(query_last, n_prompt);
