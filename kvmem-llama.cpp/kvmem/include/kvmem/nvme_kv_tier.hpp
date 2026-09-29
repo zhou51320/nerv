@@ -31,6 +31,7 @@
 #define NOMINMAX
 #endif
 #include <io.h>
+#include <direct.h>
 #include <windows.h>
 
 // The NVMe tier is disabled on the Win7 package, but its header is shared by
