@@ -124,7 +124,9 @@ if ($env:CUDA_PATH -and (Test-Path (Join-Path $env:CUDA_PATH 'bin'))) {
   # these DLLs are delay-loaded and therefore do not appear in a plain
   # dumpbin /dependents listing, but are required on a clean Win7 machine.
   foreach ($pattern in @(
-      'cudart64_*.dll', 'cublas64_*.dll', 'cublasLt64_*.dll',
+      # cudart is linked statically (GGML_STATIC=ON); bundling cudart64_*.dll
+      # would introduce Win8-only api-set imports on Windows 7.
+      'cublas64_*.dll', 'cublasLt64_*.dll',
       'nvrtc64_*.dll', 'nvrtc-builtins64_*.dll', 'curand64_*.dll',
       'cufft64_*.dll', 'cusolver64_*.dll', 'cusparse64_*.dll',
       'nvJitLink_*.dll'
