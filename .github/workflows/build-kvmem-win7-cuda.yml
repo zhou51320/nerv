@@ -98,25 +98,18 @@ jobs:
           foreach ($name in @('llama.dll', 'ggml.dll', 'ggml-base.dll', 'ggml-cpu.dll', 'ggml-cuda.dll')) {
             if (-not (Test-Path (Join-Path $out $name))) { throw "Missing runtime DLL $name" }
           }
-          $runtimeFiles = @(Get-ChildItem -Path $out -File | Where-Object { $_.Extension -in @('.exe', '.dll') })
-          if ($runtimeFiles.Count -lt 13) { throw "Runtime package unexpectedly small: $($runtimeFiles.Count) files" }
-          $runtimeFiles | Select-Object -ExpandProperty Name | Sort-Object | Set-Content (Join-Path $out 'PACKAGE-MANIFEST.txt')
+          & .\kvmem-llama.cpp\scripts\verify-win7-package.ps1 -PackageDir $out
 
-      - name: Check Win7 imports
+      - name: Test Win7 package validator
+        shell: pwsh
+        run: .\kvmem-llama.cpp\scripts\test-win7-package.ps1
+
+      - name: Smoke test DLL startup and model file IO
         shell: pwsh
         run: |
-          $out = 'EVA_BACKEND\x86_64\win7\cuda\kvmem-llama.cpp'
-          $bad = @()
-          Get-ChildItem -Path $out -File | Where-Object { $_.Extension -in '.exe', '.dll' } | ForEach-Object {
-            $deps = & dumpbin /nologo /dependents $_.FullName |
-              Where-Object { $_ -match '^\s+(api-ms-win-core-\S+\.dll)' } |
-              ForEach-Object { $Matches[1] }
-            foreach ($dep in $deps) { $bad += "$($_.Name) -> $dep" }
-          }
-          if ($bad.Count -gt 0) {
-            $bad | ForEach-Object { Write-Error $_ }
-            throw 'Found Windows 8+ api-set imports'
-          }
+          python kvmem-llama.cpp/scripts/test_win7_startup.py `
+            EVA_BACKEND/x86_64/win7/cuda/kvmem-llama.cpp/llama-kvmem-server.exe
+          if ($LASTEXITCODE -ne 0) { throw 'Model file IO smoke test failed' }
 
       - name: Package artifact
         shell: pwsh

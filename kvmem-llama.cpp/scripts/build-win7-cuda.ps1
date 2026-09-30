@@ -20,6 +20,7 @@ function Require-Command([string]$Name) {
 Require-Command 'cmake'
 Require-Command 'nvcc'
 Require-Command 'cl'
+Require-Command 'dumpbin'
 if ($Generator -eq 'Ninja') { Require-Command 'ninja' }
 
 $nvcc = (Get-Command nvcc).Source
@@ -41,6 +42,7 @@ $cmakeArgs = @(
   '-S', $Root, '-B', $Bdir, '-G', $Generator,
   '-DCMAKE_BUILD_TYPE=Release',
   '-DCMAKE_CUDA_STANDARD=17', '-DCMAKE_CUDA_STANDARD_REQUIRED=ON',
+  '-DCMAKE_CUDA_RUNTIME_LIBRARY=Static',
   "-DCMAKE_CUDA_COMPILER:FILEPATH=$nvcc",
   '-DCMAKE_CUDA_HOST_COMPILER:FILEPATH=cl.exe',
   "-DCMAKE_CUDA_ARCHITECTURES=$CudaArch",
@@ -52,10 +54,11 @@ $cmakeArgs = @(
   # alongside the executables instead of relying on static-only linkage.
   '-DBUILD_SHARED_LIBS=ON',
   '-DGGML_NATIVE=OFF', '-DGGML_WIN_VER=0x601',
-  # Static MSVC/UCRT runtime is required on unmodified Windows 7 systems.
-  '-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded',
-  '-DCMAKE_C_FLAGS=/MT /D_WIN32_WINNT=0x0601 /DWINVER=0x0601',
-  '-DCMAKE_CXX_FLAGS=/MT /EHsc /DCPPHTTPLIB_ALLOW_WIN7 /D_WIN32_WINNT=0x0601 /DWINVER=0x0601',
+  # FILE*/file descriptors and C++ objects cross the llama/ggml DLL boundary.
+  # Use one shared CRT, as in the regular llama.cpp build; /MT is unsafe here.
+  '-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL',
+  '-DCMAKE_C_FLAGS=/MD /D_WIN32_WINNT=0x0601 /DWINVER=0x0601',
+  '-DCMAKE_CXX_FLAGS=/MD /EHsc /DCPPHTTPLIB_ALLOW_WIN7 /D_WIN32_WINNT=0x0601 /DWINVER=0x0601',
   "-DYY_THUNKS_OBJ:FILEPATH=$yy",
   '-DLLAMA_KVMEM=ON', "-DLLAMA_KVMEM_ROOT:PATH=$Root", '-DKVMEM_ENABLE_NVME=OFF',
   '-DKVMEM_BUILD_LLAMA=ON', '-DLLAMA_BUILD_COMMON=ON', '-DLLAMA_BUILD_TOOLS=ON',
@@ -87,62 +90,47 @@ Get-ChildItem -Path $Bdir -Recurse -File -Filter '*.dll' |
   Sort-Object FullName |
   ForEach-Object { Copy-Item $_.FullName (Join-Path $Out $_.Name) -Force }
 
-# Bundle the transitive CUDA/backend DLL closure.  The previous package only
-# copied DLLs emitted directly by CMake, while cuBLAS and newer ggml backends
-# can load additional CUDA DLLs at process start.  Resolve names reported by
-# dumpbin against the build tree and CUDA_PATH\bin, but never copy Windows
-# system DLLs.
-if (Get-Command dumpbin -ErrorAction SilentlyContinue) {
-  $pending = [System.Collections.Generic.Queue[string]]::new()
-  Get-ChildItem -Path $Out -File | Where-Object { $_.Extension -in @('.exe', '.dll') } |
-    ForEach-Object { $pending.Enqueue($_.FullName) }
-  $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-  while ($pending.Count -gt 0) {
-    $parent = $pending.Dequeue()
-    if (-not $seen.Add($parent)) { continue }
-    $deps = & dumpbin /nologo /dependents $parent 2>$null |
-      ForEach-Object { if ($_ -match '^\s+([A-Za-z0-9_.-]+\.dll)\s*$') { $Matches[1] } }
-    foreach ($dep in $deps) {
-      if ($dep -match '^cudart64_.*\.dll$') { continue }
-      if (Test-Path (Join-Path $Out $dep)) { $pending.Enqueue((Join-Path $Out $dep)); continue }
-      $src = Get-ChildItem -Path $Bdir -Recurse -File -Filter $dep -ErrorAction SilentlyContinue |
-        Select-Object -First 1
-      if (-not $src -and $env:CUDA_PATH) {
-        $src = Get-ChildItem -Path (Join-Path $env:CUDA_PATH 'bin') -File -Filter $dep -ErrorAction SilentlyContinue |
-          Select-Object -First 1
-      }
-      if ($src) {
-        $dest = Join-Path $Out $src.Name
-        Copy-Item $src.FullName $dest -Force
-        $pending.Enqueue($dest)
-        Write-Host "Bundled dependency $($src.Name) for $(Split-Path $parent -Leaf)"
-      }
+# Only cuBLAS and its companion DLL are required by this backend. Copying an
+# entire toolkit adds unrelated DLLs with their own OS/runtime requirements.
+$cudaBin = Join-Path (Split-Path (Split-Path $nvcc -Parent) -Parent) 'bin'
+foreach ($pattern in @('cublas64_*.dll', 'cublasLt64_*.dll')) {
+  $cudaDll = @(Get-ChildItem -Path $cudaBin -File -Filter $pattern)
+  if ($cudaDll.Count -ne 1) { throw "Expected one $pattern in $cudaBin" }
+  Copy-Item $cudaDll[0].FullName (Join-Path $Out $cudaDll[0].Name) -Force
+}
+
+# Resolve backend/toolkit dependencies, but do not pull CRT DLLs from the CI
+# runner: VCToolsRedistDir can point to VC 14.44 even with the v142 compiler.
+$pending = [System.Collections.Generic.Queue[string]]::new()
+Get-ChildItem -Path $Out -File | Where-Object { $_.Extension -in @('.exe', '.dll') } |
+  ForEach-Object { $pending.Enqueue($_.FullName) }
+$seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+while ($pending.Count -gt 0) {
+  $parent = $pending.Dequeue()
+  if (-not $seen.Add($parent)) { continue }
+  $dump = & dumpbin /nologo /dependents $parent 2>&1
+  if ($LASTEXITCODE -ne 0) { throw "dumpbin failed for ${parent}: $dump" }
+  $deps = $dump | ForEach-Object {
+    if ($_ -match '^\s+([A-Za-z0-9_.-]+\.dll)\s*$') { $Matches[1] }
+  }
+  foreach ($dep in $deps) {
+    if ($dep -match '^cudart64_.*\.dll$') {
+      throw "$(Split-Path $parent -Leaf) still imports $dep; fix static cudart linkage, do not omit the DLL."
+    }
+    if (Test-Path (Join-Path $Out $dep)) { $pending.Enqueue((Join-Path $Out $dep)); continue }
+    $src = Get-ChildItem -Path $Bdir -Recurse -File -Filter $dep | Select-Object -First 1
+    if (-not $src) {
+      $src = Get-ChildItem -Path $cudaBin -File -Filter $dep | Select-Object -First 1
+    }
+    if ($src) {
+      $dest = Join-Path $Out $src.Name
+      Copy-Item $src.FullName $dest -Force
+      $pending.Enqueue($dest)
+      Write-Host "Bundled dependency $($src.Name) for $(Split-Path $parent -Leaf)"
     }
   }
 }
 
-if ($env:CUDA_PATH -and (Test-Path (Join-Path $env:CUDA_PATH 'bin'))) {
-  # Keep the complete CUDA 11.x runtime set used by ggml-cuda.  Some of
-  # these DLLs are delay-loaded and therefore do not appear in a plain
-  # dumpbin /dependents listing, but are required on a clean Win7 machine.
-  foreach ($pattern in @(
-      # cudart is linked statically (GGML_STATIC=ON); bundling cudart64_*.dll
-      # would introduce Win8-only api-set imports on Windows 7.
-      'cublas64_*.dll', 'cublasLt64_*.dll',
-      'nvrtc64_*.dll', 'nvrtc-builtins64_*.dll', 'curand64_*.dll',
-      'cufft64_*.dll', 'cusolver64_*.dll', 'cusparse64_*.dll',
-      'nvJitLink_*.dll'
-    )) {
-    $cudaDll = Get-ChildItem -Path (Join-Path $env:CUDA_PATH 'bin') -File -Filter $pattern |
-      Sort-Object Name | Select-Object -First 1
-    if ($cudaDll) {
-      Copy-Item $cudaDll.FullName (Join-Path $Out $cudaDll.Name) -Force
-    } else {
-      Write-Warning "$pattern not found under CUDA_PATH\bin"
-    }
-  }
-} else {
-  Write-Warning 'CUDA_PATH is not set; CUDA runtime DLLs must be supplied manually before shipping.'
-}
-
+Copy-Item (Join-Path $PSScriptRoot 'WIN7-RUNTIME.txt') $Out -Force
+& (Join-Path $PSScriptRoot 'verify-win7-package.ps1') -PackageDir $Out
 Write-Host "Done. Artifacts under $Out"

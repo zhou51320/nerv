@@ -1,0 +1,25 @@
+KVMem / Windows 7 SP1 x64
+========================
+
+Required on the target machine (same shared CRT policy as regular llama.cpp):
+- Visual C++ 2019 x64 Redistributable, version 14.29 (including OpenMP/vcomp140).
+- Windows Universal C Runtime (KB2999226 and its prerequisites).
+- An NVIDIA driver compatible with Windows 7 and the selected CUDA 11.x toolkit.
+- An AVX2-capable CPU; GGML_NATIVE=OFF does not disable AVX2.
+
+Do not use the latest VC++ 2022/2026 runtime as a substitute for VC++ 2019.
+Do not copy system DLLs, api-ms-win-core DLLs or cudart64_110.dll into this folder.
+CUDA cudart is linked statically into both llama and ggml-cuda. The shared
+MSVC CRT is intentional: FILE pointers/descriptors cross the ggml/llama DLLs.
+
+Extract into a NEW directory; do not overlay an older CUDA/KVMem package.
+Native Win7 startup must work without VxKex. Import checks on Windows Server
+2022 are not a substitute for an actual Windows 7 model-load/inference test.
+
+If startup stops, run from cmd.exe and preserve both output streams:
+  llama-kvmem-server.exe -m "D:\models\model.gguf" --verbosity 4 --kvmem-trace > win7-startup.log 2>&1
+  echo ExitCode=%ERRORLEVEL%
+
+For isolation, repeat with --no-kvmem -ngl 0 --load-mode none, then enable GPU
+and KVMem separately. Record the command, exit code, and Windows Event Viewer
+faulting module/exception code. Do not infer OOM from the last log line alone.

@@ -716,7 +716,7 @@ diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
 index afdaddc79..c8c28ec95 100644
 --- a/src/CMakeLists.txt
 +++ b/src/CMakeLists.txt
-@@ -70,6 +70,43 @@ target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
+@@ -70,6 +70,48 @@ target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
  
  target_link_libraries(llama PUBLIC ggml)
  
@@ -752,7 +752,12 @@ index afdaddc79..c8c28ec95 100644
 +    if (GGML_CUDA)
 +        find_package(CUDAToolkit QUIET)
 +        if (CUDAToolkit_FOUND)
-+            target_link_libraries(llama PRIVATE CUDA::cudart)
++            if (GGML_STATIC)
++                target_link_libraries(llama PRIVATE CUDA::cudart_static)
++                set_property(TARGET llama PROPERTY CUDA_RUNTIME_LIBRARY Static)
++            else()
++                target_link_libraries(llama PRIVATE CUDA::cudart)
++            endif()
 +        endif()
 +    endif()
 +endif()

@@ -1,6 +1,15 @@
 cmake_minimum_required(VERSION 3.16)
 project(kvmem_llamacpp LANGUAGES CXX)
 
+# Apply to the root executables and all DLLs, not only the llama.cpp subdirectory.
+if (MSVC AND WIN32 AND DEFINED YY_THUNKS_OBJ)
+    if (NOT EXISTS "${YY_THUNKS_OBJ}")
+        message(FATAL_ERROR "YY-Thunks object not found: ${YY_THUNKS_OBJ}")
+    endif()
+    message(STATUS "Integrating YY-Thunks for Windows 7: ${YY_THUNKS_OBJ}")
+    add_link_options("${YY_THUNKS_OBJ}")
+endif()
+
 # Guard against a poisoned build directory. If the very first configure cannot
 # identify the compiler (clang++ not yet on PATH, for example), CMake never
 # loads Platform/Windows-Clang.cmake and caches CMAKE_CXX_FLAGS_RELEASE as an
