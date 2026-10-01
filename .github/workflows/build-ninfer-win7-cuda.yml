@@ -1,0 +1,149 @@
+name: Build NInfer Win7 CUDA
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-ninfer:
+    name: NInfer only (CUDA 11.7, sm75, v142)
+    runs-on: windows-2022
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Checkout NInfer and build dependencies only
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          submodules: false
+          sparse-checkout: |
+            .github/actions/windows-setup-cuda
+            NInfer
+            third_party/YY-Thunks
+
+      - name: Check source prerequisites
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($path in @('NInfer/CMakeLists.txt', 'third_party/YY-Thunks/objs/x64/YY_Thunks_for_Win7.obj')) {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+              throw "Missing source prerequisite: $path. Push the NInfer sources before running this workflow."
+            }
+          }
+
+      - name: Setup MSVC v142
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+          toolset: '14.29'
+
+      - name: Setup CUDA 11.7
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: '11.7'
+
+      - name: Check build tools
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:VCToolsVersion -or $env:VCToolsVersion.Trim() -notlike '14.29*') {
+            throw "Expected MSVC v142 14.29; got $env:VCToolsVersion"
+          }
+          if (-not (Get-Command ninja.exe -ErrorAction SilentlyContinue)) {
+            choco install ninja --no-progress -y
+            if ($LASTEXITCODE -ne 0) { throw "Ninja installation failed: $LASTEXITCODE" }
+          }
+          if (-not $env:CUDA_PATH) { throw 'CUDA_PATH was not set by the CUDA setup action.' }
+          foreach ($relative in @('bin/nvcc.exe', 'include/cuda_runtime.h', 'lib/x64/cudart_static.lib')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $env:CUDA_PATH $relative))) {
+              throw "Incomplete CUDA toolkit: $relative"
+            }
+          }
+          $nvcc = Join-Path $env:CUDA_PATH 'bin/nvcc.exe'
+          $version = (& $nvcc --version 2>&1) -join "`n"
+          if ($LASTEXITCODE -ne 0 -or $version -notmatch 'release 11\.7,') {
+            throw "Expected CUDA 11.7: $version"
+          }
+          Write-Host $version
+          cmake --version
+          if ($LASTEXITCODE -ne 0) { throw 'CMake is unavailable.' }
+          ninja --version
+          if ($LASTEXITCODE -ne 0) { throw 'Ninja is unavailable.' }
+
+      # The local package script requires a real Win7 System32 baseline. CI only
+      # compiles; it must not pretend that a windows-2022 runner qualifies Win7.
+      - name: Configure NInfer only
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $build = Join-Path $env:GITHUB_WORKSPACE 'NInfer/build-win7-cuda'
+          New-Item -ItemType Directory -Force -Path $build | Out-Null
+          $arguments = @(
+            '-S', 'NInfer', '-B', $build, '-G', 'Ninja',
+            '-DCMAKE_BUILD_TYPE=Release',
+            "-DCMAKE_CUDA_COMPILER=$($env:CUDA_PATH)/bin/nvcc.exe",
+            "-DCUDAToolkit_ROOT=$env:CUDA_PATH",
+            '-DCMAKE_CUDA_ARCHITECTURES=75-real',
+            '-DNINFER_WIN7=ON', '-DNINFER_TEXT_ONLY=ON',
+            '-DNINFER_BUILD_APPS=ON', '-DNINFER_BUILD_SERVER=OFF',
+            '-DNINFER_DISABLE_NVTX=ON',
+            '-DBUILD_TESTING=OFF', '-DNINFER_BUILD_BENCHMARKS=OFF'
+          )
+          & cmake @arguments 2>&1 | Tee-Object -FilePath (Join-Path $build 'configure.log')
+          if ($LASTEXITCODE -ne 0) { throw "NInfer configuration failed: $LASTEXITCODE" }
+
+      - name: Compile and link ninfer
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $build = Join-Path $env:GITHUB_WORKSPACE 'NInfer/build-win7-cuda'
+          cmake --build $build --config Release --target ninfer -j 2>&1 |
+            Tee-Object -FilePath (Join-Path $build 'build.log')
+          if ($LASTEXITCODE -ne 0) { throw "NInfer compilation failed: $LASTEXITCODE" }
+
+      - name: Collect unverified build output
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = 'NInfer/build-win7-cuda/apps/ninfer.exe'
+          if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw "Missing output: $exe" }
+          $out = 'EVA_BACKEND/x86_64/win/cuda/NInfer'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Copy-Item -LiteralPath $exe -Destination $out
+          Copy-Item -LiteralPath 'NInfer/LICENSE', 'NInfer/UPSTREAM.json', 'NInfer/scripts/WIN7-RUNTIME.txt' -Destination $out
+          Copy-Item -LiteralPath 'NInfer/third_party/nlohmann/LICENSE.MIT' -Destination "$out/nlohmann-LICENSE.MIT"
+          Copy-Item -LiteralPath 'NInfer/third_party/utf8proc/LICENSE.md' -Destination "$out/utf8proc-LICENSE.md"
+          @(
+            'NInfer build-only artifact. NOT a Win7-qualified runtime package.',
+            "Source commit: $env:GITHUB_SHA",
+            "MSVC: $env:VCToolsVersion; CUDA: 11.7; architecture: sm75 cubin",
+            'Text-only CLI; static cudart; no CUDA Graph/MTP/server/NVTX.',
+            'No target-Win7 import validation, executable startup, GPU/model or numerical test was run.',
+            'No CUDA, NVIDIA driver or Visual C++ runtime DLLs were copied from the runner.',
+            'Before use, validate dependencies against the real Win7 installation and run native smoke tests.'
+          ) | Set-Content -LiteralPath "$out/BUILD-INFO.txt" -Encoding utf8
+          'NInfer alone was compiled. The artifact is unverified on Win7; no inference or Release publication was performed.' |
+            Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
+      - name: Upload NInfer build
+        uses: actions/upload-artifact@v4
+        with:
+          name: NInfer-win7-cuda11.7-sm75-unverified-${{ github.run_number }}
+          path: EVA_BACKEND/x86_64/win/cuda/NInfer/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload configure and compiler diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: NInfer-win7-cuda11.7-build-logs-${{ github.run_number }}
+          path: |
+            NInfer/build-win7-cuda/configure.log
+            NInfer/build-win7-cuda/build.log
+            NInfer/build-win7-cuda/CMakeCache.txt
+            NInfer/build-win7-cuda/CMakeFiles/CMakeConfigureLog.yaml
+          if-no-files-found: warn
+          retention-days: 14

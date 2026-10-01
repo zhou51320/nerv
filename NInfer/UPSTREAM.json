@@ -1,0 +1,10 @@
+{
+  "repository": "https://github.com/mr-september/ninfer-2080ti-22g",
+  "commit": "6460bf03a86f1288dc7b240d70c30887199099af",
+  "archive_url": "https://codeload.github.com/mr-september/ninfer-2080ti-22g/tar.gz/6460bf03a86f1288dc7b240d70c30887199099af",
+  "archive_sha256": "dee6a10d003e15137b824ae49f03614b198990cb51b710136f538703f148ce09",
+  "original_project": "https://github.com/Neroued/ninfer",
+  "license": "Apache-2.0; vendored dependencies retain their own licenses",
+  "artifact_format": 2,
+  "local_changes": "Windows 7 / CUDA 11.7 / sm75 text-only baseline; see README.md"
+}

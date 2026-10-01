@@ -1,0 +1,118 @@
+NInfer / Windows 7 SP1 x64 / CUDA 11.7 / RTX 2080 Ti 22GB
+======================================================
+
+Product boundary
+----------------
+Only ninfer.exe, pure-text CLI, one visible GPU and one request.
+Model: explicit local .ninfer version-2 artifact with identity
+qwen3.6-27b/groupwise-int. No automatic model selection or download.
+No Vision, server, MTP/DFlash, CUDA Graphs or NVTX in this package.
+The executable uses sm_75 SASS (75-real), static cudart and shared /MD CRT.
+NInfer uses its own kernels; cuBLAS is not a presumed dependency. A toolkit
+DLL is included only if it is actually imported and passes the same checks.
+
+This is a project-specific compatibility target, NOT a claim that NVIDIA
+supports CUDA Toolkit 11.7 on Windows 7. Build/import checks do not qualify
+native startup, driver execution, numerical correctness or performance.
+
+Target prerequisites (install manually, not into the package)
+-----------------------------------------------------------
+- Windows 7 SP1 x64, with its servicing/SHA-2 updates and NVIDIA driver
+  prerequisites. Run natively without VxKex or other OS API emulation.
+- Visual C++ 2019 x64 Redistributable, controlled version 14.29, including
+  msvcp140.dll, vcruntime140.dll and vcruntime140_1.dll. Do not substitute
+  the newest VC++ 2022/2026 runtime. The verifier checks any additional
+  imported CRT DLL, such as msvcp140_1.dll, against the target baseline.
+- Windows Universal CRT: KB2999226 and its applicable prerequisites.
+- A Win7 x64 NVIDIA driver supporting RTX 2080 Ti, at least 452.39 for
+  CUDA 11.x minor-version compatibility. A Win7 driver such as 475.14 is
+  a candidate, not a qualification result for this backend.
+- RTX 2080 Ti, compute capability 7.5, 22GB-class VRAM (the smoke requires
+  at least 21 GiB visible; an unmodified 11GB card is not this target).
+- x64 Windows PowerShell 5.1 / WMF 5.1 and its .NET prerequisites for the
+  scripts. Direct execution of ninfer.exe does not require PowerShell.
+
+The CUDA Toolkit is NOT a target prerequisite. nvcuda.dll belongs to the
+installed driver. Never bundle it, cudart64_*.dll, system/API-set DLLs,
+UCRT, or any VC runtime in this directory. Do not overlay another backend
+package. The import verifier deliberately rejects these bundled files.
+A driver's reported CUDA API can be 11.x below 11.7: the build is SASS-only,
+not dependent on PTX JIT. Minor-version compatibility is not sufficient
+proof that every used CUDA feature works; run the real inference smoke.
+
+Build (on a Windows build machine; no downloads/installers in the script)
+------------------------------------------------------------------------
+Prerequisites: CMake >= 3.28, Ninja, CUDA Toolkit exactly 11.7.x, MSVC v142
+14.29 with x64 host/target tools, and the enclosing nerv repository's file:
+  third_party\YY-Thunks\objs\x64\YY_Thunks_for_Win7.obj
+The script validates the compiler, linker, dumpbin, nvcc and final link map.
+It does not use --allow-unsupported-compiler or silently select a toolset.
+
+Activate vcvars64.bat -vcvars_ver=14.29 from VS 2019/Build Tools (or a VS
+installation with that exact toolset installed), put CUDA v11.7\bin and
+CMake/Ninja on PATH, and run from the NInfer directory:
+
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-win7-cuda.ps1 -Win7SystemDir D:\win7-baseline\System32
+
+-Win7SystemDir is REQUIRED: supply a trusted COPY of the intended target's
+x64 System32 after installing the controlled CRT/UCRT/driver prerequisites.
+It must contain the Win7 SP1 kernel32.dll (6.1.7601), imported system/CRT
+DLLs and any forwarded-export targets. Do not use the build host's System32
+or a collection of guessed DLL downloads. No baseline DLL is packaged.
+
+Fixed build directory: NInfer\build-win7-cuda
+Fixed package directory, relative to the enclosing nerv repository:
+  EVA_BACKEND\x86_64\win\cuda\NInfer\
+The path intentionally uses win, NOT a separate win7 system category.
+Build target: ninfer only; cmake --build ... -j (no numeric job limit).
+C++20, CUDA C++17; NINFER_WIN7/TEXT_ONLY/DISABLE_NVTX=ON;
+NINFER_BUILD_APPS=ON, NINFER_BUILD_SERVER/BUILD_TESTING/BENCHMARKS=OFF.
+NINFER_WIN7_THUNKS must be linked into the final CLI by CMake. The script
+checks the final map and checks sm_75 device code plus absence of PTX.
+
+A nonempty output is rejected unless -Clean is explicitly supplied AND
+its .ninfer-win7-owned marker identifies this script's own package.
+-Clean also resets only this script's marked build directory. Unmarked
+nonempty directories are NEVER removed, even with -Clean; move those aside
+manually after inspection. Reparse-point paths are refused. A new package
+is staged and verified before replacing a marked previous package. Sibling
+backends and model directories are not touched. Failed staging stays under
+the owned build directory for diagnosis.
+
+Verification
+------------
+Windows policy tests (mock dumpbin; no MSVC or GPU required):
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\test-win7-package.ps1
+
+Read-only package validation in a dumpbin-enabled developer shell:
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\verify-win7-package.ps1 -PackageDir . -Win7SystemDir D:\win7-baseline\System32
+
+The validator recursively scans package PE files, enforces a flat loader
+layout and x64/Win7 PE headers, resolves normal and delay imports, checks
+CRT/system prerequisites and checks named/ordinal APIs against exact target
+exports (including forwarders). It does not resolve through the build
+machine's PATH/System32. Dynamic LoadLibrary/GetProcAddress calls are not
+statically provable; native startup/inference is a separate mandatory gate.
+
+Native Win7 smoke, from the packaged directory:
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\smoke-win7-package.ps1 -PackageDir .
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\smoke-win7-package.ps1 -PackageDir . -Model D:\models\qwen3_6_27b.ninfer
+
+Both commands check OS, CRT, NVIDIA driver, CUDA API, GPU name, sm75 and
+VRAM BEFORE running ninfer --help. For multiple physical GPUs, select the
+2080 Ti with CUDA_VISIBLE_DEVICES before starting PowerShell. Without
+-Model, inference is explicitly SKIPPED, not reported as passed.
+With -Model, the smoke checks framing/identity and performs actual loading
+and text generation (greedy, no thinking, INT8 KV, context 2048, prefill 256,
+32 new tokens, no graphs, no speculative options). Exit failures/timeouts
+propagate; stdout and stderr are drained separately and displayed. This is
+a functional smoke, not a numerical oracle or a speed measurement.
+
+Equivalent direct CLI invocation:
+  ninfer.exe D:\models\qwen3_6_27b.ninfer --prompt "Explain CUDA briefly." --no-thinking --greedy --max-context 2048 --prefill-chunk 256 --max-new 32 --kv-dtype int8 --no-cuda-graph
+
+If startup/inference fails, preserve both output streams, exit code, GPU
+and driver versions, artifact identity, and any Event Viewer faulting
+module/exception code. Do not infer OOM from the last log line alone.
+BUILD-INFO.txt records static build/package checks only; it never asserts
+that this machine has already passed native Win7 inference.
