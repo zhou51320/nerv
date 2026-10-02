@@ -138,7 +138,12 @@ void bidirectional_gqa_attention_launch(const Tensor& q, const Tensor& query_k,
             throw std::invalid_argument("bidirectional_gqa_attention: inconsistent plan");
         }
 
-        const auto launch_split = [&](auto key_block_tag) {
+        // v142 needs these template constants to belong to this lambda, rather than
+        // be captured from the enclosing dispatch lambda in CUDA's generated host code.
+        const auto launch_split = [&](auto split_tokens_tag, auto split_warps_tag,
+                                      auto key_block_tag) {
+            constexpr int Tokens = decltype(split_tokens_tag)::value;
+            constexpr int Warps = decltype(split_warps_tag)::value;
             constexpr int KeyBlock = decltype(key_block_tag)::value;
             constexpr std::size_t SmemBytes =
                 2u * KeyBlock * kBidirectionalGqaHeadDim * sizeof(__nv_bfloat16);
@@ -172,12 +177,12 @@ void bidirectional_gqa_attention_launch(const Tensor& q, const Tensor& query_k,
             CUDA_CHECK(cudaGetLastError());
         };
         if (plan.key_block == 32) {
-            launch_split(DispatchValue<32>{});
+            launch_split(tokens_tag, warps_tag, DispatchValue<32>{});
             return;
         }
         if constexpr (Tokens > 8) {
             if (plan.key_block == 64) {
-                launch_split(DispatchValue<64>{});
+                launch_split(tokens_tag, warps_tag, DispatchValue<64>{});
                 return;
             }
         }

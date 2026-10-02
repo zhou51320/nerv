@@ -223,7 +223,11 @@ __launch_bounds__(256) __global__ void gqa_attention_prefill_fill_i8_page_kernel
 }
 
 template <typename Geometry, typename Metadata>
-__global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
+__global__
+#if __CUDACC_VER_MAJOR__ > 12 || (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ >= 4)
+__maxnreg__(120)
+#endif
+void gqa_attention_prefill_i8_kernel(
     const __nv_bfloat16* __restrict__ q, const std::int8_t* __restrict__ cache_k,
     const std::int8_t* __restrict__ cache_v, const __half* __restrict__ cache_k_scale,
     const __half* __restrict__ cache_v_scale, Metadata metadata,
