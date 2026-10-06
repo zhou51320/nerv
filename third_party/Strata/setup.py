@@ -3061,8 +3061,17 @@ def data_folder(requested: str | None) -> tuple:
     """(the data folder, folders on other drives that still hold model files).  Moves the model files of this folder
     and of earlier Strata folders on the same drive into the data folder, and points their configs there."""
     settings = load_settings()
-    dest = Path(requested).expanduser().resolve() if requested else \
-        Path(settings["data_dir"]) if settings.get("data_dir") else ROOT.parent / "Strata-data"
+    # Offline bundles are portable: keep models beside the bundled engine so
+    # extracting the archive does not create a confusing sibling Strata-data
+    # directory. Normal upstream installs retain the shared sibling folder.
+    if requested:
+        dest = Path(requested).expanduser().resolve()
+    elif os.environ.get("STRATA_PORTABLE") == "1":
+        dest = ROOT
+    elif settings.get("data_dir"):
+        dest = Path(settings["data_dir"])
+    else:
+        dest = ROOT.parent / "Strata-data"
     try:
         dest.mkdir(parents=True, exist_ok=True)
     except OSError as e:                                # e.g. no write access next to the Strata folder

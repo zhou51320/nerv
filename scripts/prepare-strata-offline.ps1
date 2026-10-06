@@ -59,7 +59,7 @@ Set-Content -LiteralPath ($llamaDest + '.done') -Value 'offline-bundled' -Encodi
 # Match Strata's normal layout: setup.py resolves the engine from engine/.
 $engine = Join-Path $PackageDir 'engine'
 New-Item -ItemType Directory -Force -Path $engine | Out-Null
-foreach ($name in @('strata.exe','strata-device.exe','strata-vision.exe','BUILD.json','cublas64_*.dll','cublasLt64_*.dll')) {
+foreach ($name in @('strata.exe','strata-device.exe','strata-vision.exe','BUILD.json','cublas64_*.dll','cublasLt64_*.dll','cudart64_*.dll')) {
   Get-ChildItem -LiteralPath $PackageDir -File -Filter $name -ErrorAction SilentlyContinue |
     Move-Item -Destination $engine -Force
 }
@@ -71,9 +71,9 @@ New-Item -ItemType Directory -Force -Path $modelDir | Out-Null
    'Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf') |
   Set-Content -LiteralPath (Join-Path $modelDir 'PLACE-MODEL-FILES-HERE.txt') -Encoding UTF8
 
-@('@echo off','setlocal','set STRATA_OFFLINE=1','cd /d "%~dp0"','python\python.exe setup.py %*','if errorlevel 1 pause') |
+@('@echo off','setlocal','set STRATA_OFFLINE=1','set STRATA_PORTABLE=1','cd /d "%~dp0"','python\python.exe setup.py %*','if errorlevel 1 pause') |
   Set-Content -LiteralPath (Join-Path $PackageDir 'START-HERE.bat') -Encoding ASCII
-@('@echo off','setlocal','set STRATA_OFFLINE=1','cd /d "%~dp0"',
+@('@echo off','setlocal','set STRATA_OFFLINE=1','set STRATA_PORTABLE=1','cd /d "%~dp0"',
   'if not exist "models\qwen3.8-flash-next\IQ3_XXS\Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf" (',
   '  echo Put both IQ3_XXS GGUF shards into models\qwen3.8-flash-next\IQ3_XXS first.','  pause','  exit /b 1',')',
   'python\python.exe setup.py --yes --family qwen --model IQ3_XXS --gguf-dir "models\qwen3.8-flash-next\IQ3_XXS" --context 32768 --vision no --no-start',

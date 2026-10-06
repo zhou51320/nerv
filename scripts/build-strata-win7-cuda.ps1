@@ -97,8 +97,9 @@ try {
   }
 
   # These are Strata-owned, small runtime resources. Model GGUF/pack files,
-  # CUDA driver DLLs and system DLLs stay outside the package. Static cudart
-  # is linked into the executable; cuBLAS remains a runtime DLL like llama.cpp.
+  # Bundle the CUDA DLLs used by both the engine and the vision/llama.cpp
+  # executable. The main engine uses static cudart, while vision currently
+  # resolves cudart dynamically on Windows.
   $dataStage = Join-Path $stage 'data'
   New-Item -ItemType Directory -Force -Path $dataStage | Out-Null
   Get-ChildItem -LiteralPath (Join-Path $Source 'data') -File -Filter '*.bin' |
@@ -108,9 +109,9 @@ try {
   }
 
   if (-not $env:CUDA_PATH -or -not (Test-Path $env:CUDA_PATH)) {
-    throw 'CUDA_PATH is required to bundle the cuBLAS runtime DLLs'
+    throw 'CUDA_PATH is required to bundle the CUDA runtime DLLs'
   }
-  foreach ($pattern in @('cublas64_*.dll', 'cublasLt64_*.dll')) {
+  foreach ($pattern in @('cublas64_*.dll', 'cublasLt64_*.dll', 'cudart64_*.dll')) {
     $dll = Get-ChildItem -Path $env:CUDA_PATH -Recurse -File -Filter $pattern -ErrorAction SilentlyContinue |
       Sort-Object FullName | Select-Object -First 1
     if (-not $dll) { throw "Required CUDA runtime DLL missing: $pattern" }
@@ -151,7 +152,7 @@ try {
   $buildJson | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $stage 'BUILD.json') -Encoding UTF8
   Get-ChildItem -LiteralPath $stage -Recurse -File -Filter '*.dll' |
     ForEach-Object {
-      if ($_.Name -notmatch '^(cublas64_|cublasLt64_).*\.dll$') {
+      if ($_.Name -notmatch '^(cublas64_|cublasLt64_|cudart64_).*\.dll$') {
         throw "Refusing non-cuBLAS DLL in Strata package: $($_.FullName)"
       }
     }

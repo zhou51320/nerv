@@ -118,13 +118,13 @@ jobs:
           foreach ($name in @('engine\strata.exe', 'engine\strata-device.exe', 'engine\strata-vision.exe', 'engine\BUILD.json', 'START-HERE.bat', 'RUN-IQ3-XXS.bat', 'python\python.exe')) {
             if (-not (Test-Path (Join-Path $out $name))) { throw "Missing Strata artifact: $name" }
           }
-          foreach ($pattern in @('cublas64_*.dll', 'cublasLt64_*.dll')) {
+          foreach ($pattern in @('cublas64_*.dll', 'cublasLt64_*.dll', 'cudart64_*.dll')) {
             if (-not (Get-ChildItem -LiteralPath (Join-Path $out 'engine') -File -Filter $pattern)) {
               throw "Missing required Strata CUDA runtime DLL: $pattern"
             }
           }
           $forbidden = Get-ChildItem -LiteralPath (Join-Path $out 'engine') -Recurse -File -Filter '*.dll' |
-            Where-Object { $_.Name -notmatch '^(cublas64_|cublasLt64_).*\.dll$' }
+            Where-Object { $_.Name -notmatch '^(cublas64_|cublasLt64_|cudart64_).*\.dll$' }
           if ($forbidden) { throw "Strata package contains forbidden DLL: $($forbidden.FullName -join ', ')" }
 
       - name: Package Strata artifact
