@@ -98,8 +98,9 @@ try {
 
   # These are Strata-owned, small runtime resources. Model GGUF/pack files,
   # Bundle the CUDA DLLs used by both the engine and the vision/llama.cpp
-  # executable. The main engine uses static cudart, while vision currently
-  # resolves cudart dynamically on Windows.
+  # executable. CUDA runtime is linked statically; cuBLAS remains app-local.
+  # nvcuda.dll is the NVIDIA display-driver API and must come from the
+  # installed Win7-compatible NVIDIA driver, never from this archive.
   $dataStage = Join-Path $stage 'data'
   New-Item -ItemType Directory -Force -Path $dataStage | Out-Null
   Get-ChildItem -LiteralPath (Join-Path $Source 'data') -File -Filter '*.bin' |

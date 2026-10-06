@@ -81,7 +81,7 @@ New-Item -ItemType Directory -Force -Path $modelDir | Out-Null
   Set-Content -LiteralPath (Join-Path $PackageDir 'RUN-IQ3-XXS.bat') -Encoding ASCII
 @('Strata Win7 CUDA 11.7 offline package','','Put both IQ3_XXS GGUF shards into models\qwen3.8-flash-next\IQ3_XXS\',
   'Then double-click RUN-IQ3-XXS.bat and open http://127.0.0.1:8080.',
-  'Python 3.8.10, service code, engine, strata-vision.exe, CUDA DLLs and llama.cpp archive are bundled.') |
+  'Python 3.8.10, service code, engine, strata-vision.exe, cuBLAS DLLs and llama.cpp archive are bundled. The NVIDIA driver supplies nvcuda.dll.') |
   Set-Content -LiteralPath (Join-Path $PackageDir 'README-OFFLINE-WIN7.txt') -Encoding UTF8
 
 Write-Host "Prepared offline Strata package: $PackageDir"

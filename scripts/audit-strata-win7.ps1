@@ -70,4 +70,5 @@ if ($PackageDir) {
 }
 Write-Host "Strata Win7 source audit passed: $Source"
 Write-Host 'Runtime features retained: C++ engine, Python HTTP/OpenAI/Anthropic/MCP/image service.'
+Write-Host 'CUDA driver nvcuda.dll is intentionally not bundled; it must come from the installed Win7 NVIDIA driver.'
 Write-Host 'Native compilation and Win7 GPU startup still require the Windows qualification host.'

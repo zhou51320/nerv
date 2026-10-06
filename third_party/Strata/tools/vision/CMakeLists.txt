@@ -39,6 +39,11 @@ else()
 endif()
 set(GGML_BACKEND_DL OFF CACHE BOOL "" FORCE)
 set(GGML_CUDA ${STRATA_VISION_CUDA} CACHE BOOL "" FORCE)
+# llama.cpp's CUDA backend otherwise links the shared cudart on Windows.
+# Use its static CUDA runtime so Win7 does not need the CUDA 11 API-set DLLs
+# that cudart64_110.dll imports. cuBLAS remains app-local and nvcuda.dll is
+# intentionally supplied by the installed NVIDIA display driver.
+set(GGML_STATIC ON CACHE BOOL "" FORCE)
 
 add_subdirectory(${LLAMA_DIR} llama EXCLUDE_FROM_ALL)
 
