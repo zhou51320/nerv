@@ -222,7 +222,10 @@ elseif(STRATA_ENABLE_CUDA)
     add_compile_definitions(STRATA_EXPERIMENTAL_SM60=1)
   endif()
   message(STATUS "Strata: CUDA enabled, arch ${CMAKE_CUDA_ARCHITECTURES}")
-  set(_strata_gpu_runtime_target CUDA::cudart)
+  # Keep host-only C++ targets on the same static CUDA runtime as the CUDA
+  # language targets. Linking CUDA::cudart here would add cudart.lib beside
+  # cudart_static.lib and MSVC reports every runtime symbol twice.
+  set(_strata_gpu_runtime_target CUDA::cudart_static)
   set(_strata_gpu_blas_target CUDA::cublas)
   set(_strata_gpu_include_directories ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
 elseif(STRATA_ENABLE_HIP)
