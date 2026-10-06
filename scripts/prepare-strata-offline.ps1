@@ -20,7 +20,9 @@ New-Item -ItemType Directory -Force -Path $pyStage | Out-Null
 try {
   Expand-Archive -LiteralPath $pyZip -DestinationPath $pyStage -Force
   New-Item -ItemType Directory -Force -Path (Join-Path $PackageDir 'python') | Out-Null
-  Copy-Item -LiteralPath (Join-Path $pyStage '*') -Destination (Join-Path $PackageDir 'python') -Recurse -Force
+  # `-LiteralPath` does not expand the wildcard; use `-Path` so the
+  # embeddable distribution's files are copied into the package.
+  Copy-Item -Path (Join-Path $pyStage '*') -Destination (Join-Path $PackageDir 'python') -Recurse -Force
 } finally {
   if (Test-Path $pyStage) { Remove-Item -LiteralPath $pyStage -Recurse -Force }
 }
