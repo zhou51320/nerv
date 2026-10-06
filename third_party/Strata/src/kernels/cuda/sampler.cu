@@ -929,6 +929,12 @@ bool sample_greedy_cluster(const float* logits, int n_tokens, int n_vocab, int* 
 #if defined(__HIPCC__)
     (void) logits; (void) n_tokens; (void) n_vocab; (void) out; (void) stream;
     return false;
+#elif defined(CUDART_VERSION) && CUDART_VERSION < 12000
+    // Thread-block cluster launch APIs were introduced after CUDA 11. RTX 20
+    // builds use the ordinary one-block sampler below; keep this dispatcher
+    // as a cheap false result so CUDA 11 can compile the complete engine.
+    (void) logits; (void) n_tokens; (void) n_vocab; (void) out; (void) stream;
+    return false;
 #else
     if (n_tokens <= 0 || n_vocab <= 0) return true;
     if (n_tokens > 65535) return false;

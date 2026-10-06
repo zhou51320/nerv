@@ -1145,6 +1145,11 @@ bool qsa_block_topk_cluster(const float* scores, const int32_t* steps, int64_t n
 #if defined(__HIPCC__)
     (void) scores; (void) steps; (void) nq; (void) max_blocks; (void) cap; (void) s; (void) ids; (void) stream;
     return false;
+#elif defined(CUDART_VERSION) && CUDART_VERSION < 12000
+    // CUDA 11 has no thread-block cluster launch API. The caller falls back
+    // to the portable one-CTA top-k path below.
+    (void) scores; (void) steps; (void) nq; (void) max_blocks; (void) cap; (void) s; (void) ids; (void) stream;
+    return false;
 #else
     if (nq <= 0) return true;
     if (s.idx_block != R || cap < qsa_selection_width(kTopkMaxCells, s) || nq > 65535 || max_blocks <= 0) return false;
