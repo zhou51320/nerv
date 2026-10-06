@@ -37,8 +37,12 @@ foreach ($api in @('GetThreadSelectedCpuSets', 'SetThreadSelectedCpuSets', 'GetS
 
 if (Test-Path (Join-Path $BuildDir 'CMakeCache.txt')) {
   $cache = Get-Content (Join-Path $BuildDir 'CMakeCache.txt') -Raw
-  foreach ($needle in @('STRATA_WIN7:BOOL=ON', 'CMAKE_CUDA_ARCHITECTURES:STRING=75-real', 'CMAKE_CUDA_RUNTIME_LIBRARY:STRING=Static')) {
-    if ($cache -notmatch [regex]::Escape($needle)) { throw "Build cache missing: $needle" }
+  foreach ($check in @(
+      @{ pattern = 'STRATA_WIN7:(BOOL|STRING)=ON'; label = 'STRATA_WIN7=ON' },
+      @{ pattern = 'CMAKE_CUDA_ARCHITECTURES:(BOOL|STRING)=.*75-real'; label = 'CUDA architecture 75-real' },
+      @{ pattern = 'CMAKE_CUDA_RUNTIME_LIBRARY:(BOOL|STRING)=.*Static'; label = 'static CUDA runtime' }
+    )) {
+    if ($cache -notmatch $check.pattern) { throw "Build cache missing: $($check.label)" }
   }
 }
 if ($PackageDir) {
