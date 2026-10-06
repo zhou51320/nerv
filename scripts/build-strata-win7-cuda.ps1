@@ -51,12 +51,10 @@ if ($BuildVision) {
   $LlamaDir = (Resolve-Path $LlamaDir).Path
   $VisionBuildDir = Join-Path $Root 'build-strata-win7-vision'
   if ($Clean -and (Test-Path $VisionBuildDir)) { Remove-Item -LiteralPath $VisionBuildDir -Recurse -Force }
-  $win7Flags = '/D_WIN32_WINNT=0x0601 /DWINVER=0x0601 /DNTDDI_VERSION=0x06010000 /DWIN32_LEAN_AND_MEAN'
   $visionArgs = @('-S', (Join-Path $Source 'tools\vision'), '-B', $VisionBuildDir, '-G', 'Ninja',
-    '-DCMAKE_BUILD_TYPE=Release', '-DSTRATA_VISION_CUDA=ON', '-DSTRATA_PORTABLE=ON',
+    '-DCMAKE_BUILD_TYPE=Release', '-DSTRATA_VISION_CUDA=ON', '-DSTRATA_PORTABLE=ON', '-DSTRATA_WIN7=ON',
     '-DCMAKE_CUDA_ARCHITECTURES=75-real', '-DCMAKE_CUDA_STANDARD=17', '-DCMAKE_CUDA_STANDARD_REQUIRED=ON',
     '-DCMAKE_CUDA_RUNTIME_LIBRARY=Static', "-DLLAMA_DIR=$LlamaDir",
-    "-DCMAKE_CXX_FLAGS=$win7Flags", "-DCMAKE_CUDA_FLAGS=$win7Flags",
     "-DCMAKE_EXE_LINKER_FLAGS=$yy /SUBSYSTEM:CONSOLE,6.01 /OSVERSION:6.1")
   Write-Host "==> Configuring Strata vision Win7 CUDA 11.x sm75-real"
   & cmake @visionArgs
