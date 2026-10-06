@@ -18,6 +18,7 @@ on:
       - '.github/workflows/build-strata-win7-cuda.yml'
       - '.github/actions/windows-setup-cuda/**'
       - 'scripts/build-strata-win7-cuda.ps1'
+      - 'scripts/prepare-strata-offline.ps1'
       - 'scripts/audit-strata-win7.ps1'
       - 'third_party/Strata/**'
       - 'third_party/strata-upstream.json'
@@ -86,21 +87,43 @@ jobs:
             if ($patched -ne $raw) { Set-Content -LiteralPath $hostCfg -Value $patched -Encoding UTF8 }
           }
 
+      - name: Prepare pinned llama.cpp source for vision and offline setup
+        run: |
+          $commit = '3cf03257f219afbe7334045ff7c6a06ac68c627d'
+          $zip = Join-Path $env:RUNNER_TEMP "llama.cpp-$($commit.Substring(0,7)).zip"
+          Invoke-WebRequest -UseBasicParsing -Uri "https://github.com/ggml-org/llama.cpp/archive/$commit.zip" -OutFile $zip
+          $stage = Join-Path $env:RUNNER_TEMP 'llama-stage'
+          if (Test-Path $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
+          Expand-Archive -LiteralPath $zip -DestinationPath $stage -Force
+          $top = Get-ChildItem -LiteralPath $stage -Directory | Select-Object -First 1
+          if (Test-Path 'third_party/llama.cpp') { Remove-Item -LiteralPath 'third_party/llama.cpp' -Recurse -Force }
+          Move-Item -LiteralPath $top.FullName -Destination 'third_party/llama.cpp'
+          "STRATA_LLAMA_ZIP=$zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Setup embedded Python build host
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.8.10'
+          architecture: x64
+
       - name: Build Strata only
-        run: .\scripts\build-strata-win7-cuda.ps1 -Clean -CleanPackage -OutputDir artifacts\Strata
+        run: .\scripts\build-strata-win7-cuda.ps1 -Clean -CleanPackage -BuildVision -LlamaDir third_party\llama.cpp -OutputDir artifacts\Strata
+
+      - name: Assemble offline Strata runtime
+        run: .\scripts\prepare-strata-offline.ps1 -PackageDir artifacts\Strata -SourceDir third_party\Strata -LlamaZip $env:STRATA_LLAMA_ZIP
 
       - name: Verify Strata artifact
         run: |
           $out = 'artifacts\Strata'
-          foreach ($name in @('strata.exe', 'strata-device.exe', 'BUILD.json')) {
+          foreach ($name in @('engine\strata.exe', 'engine\strata-device.exe', 'engine\strata-vision.exe', 'engine\BUILD.json', 'START-HERE.bat', 'RUN-IQ3-XXS.bat', 'python\python.exe')) {
             if (-not (Test-Path (Join-Path $out $name))) { throw "Missing Strata artifact: $name" }
           }
           foreach ($pattern in @('cublas64_*.dll', 'cublasLt64_*.dll')) {
-            if (-not (Get-ChildItem -LiteralPath $out -File -Filter $pattern)) {
+            if (-not (Get-ChildItem -LiteralPath (Join-Path $out 'engine') -File -Filter $pattern)) {
               throw "Missing required Strata CUDA runtime DLL: $pattern"
             }
           }
-          $forbidden = Get-ChildItem -LiteralPath $out -Recurse -File -Filter '*.dll' |
+          $forbidden = Get-ChildItem -LiteralPath (Join-Path $out 'engine') -Recurse -File -Filter '*.dll' |
             Where-Object { $_.Name -notmatch '^(cublas64_|cublasLt64_).*\.dll$' }
           if ($forbidden) { throw "Strata package contains forbidden DLL: $($forbidden.FullName -join ', ')" }
 

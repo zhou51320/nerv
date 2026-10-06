@@ -1453,6 +1453,14 @@ def pip_install(packages, what):
     """pip install into .venv, skipped when the same list was installed before.  An install from before the pinned
     requirements (#214) recorded bare names: those packages are kept as they are (nothing is reinstalled), and the
     pinned dependencies it already has count as installed."""
+    if os.environ.get("STRATA_OFFLINE") == "1":
+        build_only = {"cmake", "ninja"}
+        missing = [p for p in packages if req_name(p) not in build_only and not _installed(req_name(p))]
+        if missing:
+            fail("offline Python runtime is missing: " + ", ".join(req_name(p) for p in missing),
+                 "recreate the offline package with its bundled Python dependencies")
+        ok(f"{what} already installed (offline)")
+        return
     stamp = Path(sys.prefix) / ".strata-pip.json"
     have = json.loads(stamp.read_text(encoding="utf-8")) if stamp.exists() else []
     bare = {p.lower() for p in have if req_name(p) == p.lower()}
@@ -4660,7 +4668,10 @@ def main() -> int:
         eng = None if a.build or hip else get_prebuilt(a.prebuilt, gpu, vision, **({"toolkit": 12} if cuda_tk == 12
                                                                                     else {}))
     if eng is not None and not hip and json.loads((eng / "BUILD.json").read_text(encoding="utf-8")).get("source") != "local":
-        pip_cuda_libs(cuda_tk)
+        # Offline bundles carry the exact cuBLAS DLLs beside the engine; do
+        # not attempt to fetch NVIDIA wheels in that case.
+        if not json.loads((eng / "BUILD.json").read_text(encoding="utf-8")).get("bundled_cuda_dlls"):
+            pip_cuda_libs(cuda_tk)
         if vision != "none" and not (eng / VEXE).exists():
             warn("the ready-made engine has no image encoder: compiling it")
             eng = None

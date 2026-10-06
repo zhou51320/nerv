@@ -5,11 +5,13 @@ param(
   [string]$BuildDir = '',
   [string]$Win7SystemDir = '',
   [string]$OutputDir = '',
+  [string]$LlamaDir = '',
   [string]$CudaArch = '75-real',
   [int]$Jobs = 0,
   [switch]$Clean,
   [switch]$CleanPackage,
   [switch]$NoPackage,
+  [switch]$BuildVision,
   [switch]$SkipAudit
 )
 
@@ -44,6 +46,24 @@ Write-Host "==> Configuring Strata Win7 CUDA 11.x sm75-real: $Source"
 if ($LASTEXITCODE -ne 0) { throw "cmake configure failed: $LASTEXITCODE" }
 & cmake --build $BuildDir --target strata strata-device --parallel $Jobs
 if ($LASTEXITCODE -ne 0) { throw "cmake build failed: $LASTEXITCODE" }
+if ($BuildVision) {
+  if (-not $LlamaDir) { throw '-LlamaDir is required with -BuildVision' }
+  $LlamaDir = (Resolve-Path $LlamaDir).Path
+  $VisionBuildDir = Join-Path $Root 'build-strata-win7-vision'
+  if ($Clean -and (Test-Path $VisionBuildDir)) { Remove-Item -LiteralPath $VisionBuildDir -Recurse -Force }
+  $win7Flags = '/D_WIN32_WINNT=0x0601 /DWINVER=0x0601 /DNTDDI_VERSION=0x06010000 /DWIN32_LEAN_AND_MEAN'
+  $visionArgs = @('-S', (Join-Path $Source 'tools\vision'), '-B', $VisionBuildDir, '-G', 'Ninja',
+    '-DCMAKE_BUILD_TYPE=Release', '-DSTRATA_VISION_CUDA=ON', '-DSTRATA_PORTABLE=ON',
+    '-DCMAKE_CUDA_ARCHITECTURES=75-real', '-DCMAKE_CUDA_STANDARD=17', '-DCMAKE_CUDA_STANDARD_REQUIRED=ON',
+    '-DCMAKE_CUDA_RUNTIME_LIBRARY=Static', "-DLLAMA_DIR=$LlamaDir",
+    "-DCMAKE_CXX_FLAGS=$win7Flags", "-DCMAKE_CUDA_FLAGS=$win7Flags",
+    "-DCMAKE_EXE_LINKER_FLAGS=$yy /SUBSYSTEM:CONSOLE,6.01 /OSVERSION:6.1")
+  Write-Host "==> Configuring Strata vision Win7 CUDA 11.x sm75-real"
+  & cmake @visionArgs
+  if ($LASTEXITCODE -ne 0) { throw "vision cmake configure failed: $LASTEXITCODE" }
+  & cmake --build $VisionBuildDir --target strata-vision --parallel $Jobs
+  if ($LASTEXITCODE -ne 0) { throw "vision cmake build failed: $LASTEXITCODE" }
+}
 if (-not $SkipAudit) { & (Join-Path $PSScriptRoot 'audit-strata-win7.ps1') -Source $Source -BuildDir $BuildDir }
 if ($NoPackage) {
   Write-Host "Build complete (package skipped). Engine: $(Join-Path $BuildDir 'strata.exe')"
@@ -63,7 +83,9 @@ $markerText = 'strata-win7-cuda/v1'
 New-Item -ItemType Directory -Force -Path $stage | Out-Null
 Set-Content -LiteralPath (Join-Path $stage $markerName) -Value $markerText -Encoding ASCII
 try {
-  foreach ($name in @('strata', 'strata-device')) {
+  $binaryNames = @('strata', 'strata-device')
+  if ($BuildVision) { $binaryNames += 'strata-vision' }
+  foreach ($name in $binaryNames) {
     $exe = Find-Binary $name
     Copy-Item -LiteralPath $exe -Destination (Join-Path $stage "$name.exe") -Force
     $pdb = [IO.Path]::ChangeExtension($exe, '.pdb')
@@ -111,8 +133,15 @@ try {
     yy_thunks = 'YY_Thunks_for_Win7.obj'
     optional_win8_plus_apis = 'runtime-probed-with-fallback'
     dynamic_cuda_or_system_dlls_bundled = $true
-    bundled_cuda_dlls = @('cublas64_*.dll', 'cublasLt64_*.dll')
-    binaries = @('strata.exe', 'strata-device.exe')
+    binaries = @('strata.exe', 'strata-device.exe') + $(if ($BuildVision) { @('strata-vision.exe') } else { @() })
+    version = '0.1.40'
+    backend = 'cuda'
+    source = 'prebuilt'
+    archs = @(75)
+    ptx = $true
+    vision = $(if ($BuildVision) { 'gpu' } else { 'none' })
+    bundled_cuda_dlls = $true
+    lib_dirs = @('engine')
     resources = @('data/*.bin', 'WIN7.md')
     build_directory = [IO.Path]::GetFullPath($BuildDir)
     qualification = 'compiled-on-modern-Windows; native-Win7/GPU/model-smoke-pending'
