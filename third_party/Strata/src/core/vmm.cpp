@@ -1,8 +1,9 @@
 #include "strata/core/vmm.hpp"
 
+#include <cuda_runtime.h>
+
 #if !defined(STRATA_USE_HIP) && (!defined(CUDART_VERSION) || CUDART_VERSION >= 12000)
 #include <cuda.h>
-#include <cuda_runtime.h>
 
 #include <mutex>
 
