@@ -1,0 +1,8 @@
+{
+  "repository": "https://github.com/Niko1221/Strata",
+  "commit": "1735d6471df29b42c26170efaac1f1446a58640f",
+  "archive_url": "https://codeload.github.com/Niko1221/Strata/zip/1735d6471df29b42c26170efaac1f1446a58640f",
+  "archive_sha256": "bfbee31f10ac4a1ed5164ac20da256e887317c53e98b3b120b08f69da14273be",
+  "license": "MIT; vendored dependencies retain their own licenses",
+  "local_changes": "STRATA_WIN7 profile; runtime probing for Win8+ optional APIs; see scripts/build-strata-win7-cuda.ps1"
+}

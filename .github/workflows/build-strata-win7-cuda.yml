@@ -1,0 +1,118 @@
+name: Build Strata Win7 CUDA
+
+on:
+  workflow_dispatch:
+    inputs:
+      cuda_version:
+        description: 'CUDA Toolkit version'
+        required: true
+        default: '11.7'
+        type: choice
+        options:
+          - '11.7'
+          - '11.8'
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/build-strata-win7-cuda.yml'
+      - '.github/actions/windows-setup-cuda/**'
+      - 'scripts/build-strata-win7-cuda.ps1'
+      - 'scripts/audit-strata-win7.ps1'
+      - 'third_party/Strata/**'
+      - 'third_party/strata-upstream.json'
+      - 'third_party/YY-Thunks/**'
+
+permissions:
+  contents: read
+
+jobs:
+  build-strata:
+    name: Strata only (CUDA ${{ inputs.cuda_version || '11.7' }}, sm75, MSVC v142)
+    runs-on: windows-2022
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout Strata sources and Win7 build inputs
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          submodules: false
+          sparse-checkout: |
+            .github/actions/windows-setup-cuda
+            .github/workflows/build-strata-win7-cuda.yml
+            scripts/audit-strata-win7.ps1
+            scripts/build-strata-win7-cuda.ps1
+            third_party/Strata
+            third_party/strata-upstream.json
+            third_party/YY-Thunks
+
+      - name: Setup CUDA Toolkit
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: ${{ inputs.cuda_version || '11.7' }}
+
+      - name: Setup MSVC v142
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+          toolset: 14.29
+
+      - name: Install Ninja
+        run: choco install ninja --no-progress -y
+
+      - name: Configure toolchain
+        run: |
+          if (-not $env:CUDA_PATH -or -not (Test-Path $env:CUDA_PATH)) {
+            throw "CUDA_PATH is missing or invalid: $env:CUDA_PATH"
+          }
+          "CUDAToolkit_ROOT=$env:CUDA_PATH" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          (Join-Path $env:CUDA_PATH 'bin') | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          where.exe cl
+          where.exe nvcc
+          cmake --version
+          ninja --version
+          nvcc --version
+
+      - name: Patch CUDA host compiler compatibility
+        run: |
+          $hostCfg = Join-Path $env:CUDA_PATH 'include\crt\host_config.h'
+          if (Test-Path $hostCfg) {
+            $raw = Get-Content -Raw -LiteralPath $hostCfg
+            $patched = $raw -replace '_MSC_VER\s*>=\s*19\d{2}', '_MSC_VER >= 2000'
+            $patched = $patched -replace '_MSC_VER\s*>\s*19\d{2}', '_MSC_VER > 2000'
+            if ($patched -ne $raw) { Set-Content -LiteralPath $hostCfg -Value $patched -Encoding UTF8 }
+          }
+
+      - name: Build Strata only
+        run: .\scripts\build-strata-win7-cuda.ps1 -Clean -CleanPackage -OutputDir artifacts\Strata
+
+      - name: Verify Strata artifact
+        run: |
+          $out = 'artifacts\Strata'
+          foreach ($name in @('strata.exe', 'strata-device.exe', 'BUILD.json')) {
+            if (-not (Test-Path (Join-Path $out $name))) { throw "Missing Strata artifact: $name" }
+          }
+          foreach ($pattern in @('cublas64_*.dll', 'cublasLt64_*.dll')) {
+            if (-not (Get-ChildItem -LiteralPath $out -File -Filter $pattern)) {
+              throw "Missing required Strata CUDA runtime DLL: $pattern"
+            }
+          }
+          $forbidden = Get-ChildItem -LiteralPath $out -Recurse -File -Filter '*.dll' |
+            Where-Object { $_.Name -notmatch '^(cublas64_|cublasLt64_).*\.dll$' }
+          if ($forbidden) { throw "Strata package contains forbidden DLL: $($forbidden.FullName -join ', ')" }
+
+      - name: Package Strata artifact
+        run: |
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          Compress-Archive -Path 'artifacts\Strata' `
+            -DestinationPath 'artifacts/strata-win7-cuda-sm75.zip' -Force
+
+      - name: Upload Strata artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: strata-win7-cuda-sm75-${{ inputs.cuda_version || '11.7' }}
+          path: artifacts/strata-win7-cuda-sm75.zip
+          if-no-files-found: error
