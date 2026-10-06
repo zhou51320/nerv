@@ -2,6 +2,7 @@
 #include "strata/core/session.hpp"
 #include "strata/kernels/mrope.hpp"
 #include "strata/core/progress.hpp"
+#include "strata/platform/cuda_compat.hpp"
 
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/elementwise.hpp"
@@ -249,7 +250,7 @@ bool session_capture(const WeightTable& tables, const ModelGeometry& g, SessionS
                       cudaGetErrorString(ce) + " (a synchronous call in the layer?)";
                 return false;
             }
-            if (cudaGraphInstantiate(out, graph, 0) != cudaSuccess) {
+            if (strata_cuda_graph_instantiate(out, graph, 0) != cudaSuccess) {
                 err = "session_capture: instantiate failed at layer " + std::to_string(l);
                 return false;
             }
@@ -894,7 +895,7 @@ bool session_capture_token(const WeightTable& tables, const ModelGeometry& g, Se
         err = std::string("session_capture_token: end capture: ") + cudaGetErrorString(ce);
         return false;
     }
-    const cudaError_t ie = cudaGraphInstantiate(&tg.exec, graph, 0);
+    const cudaError_t ie = strata_cuda_graph_instantiate(&tg.exec, graph, 0);
     cudaGraphDestroy(graph);
     if (ie != cudaSuccess) {
         err = std::string("session_capture_token: instantiate: ") + cudaGetErrorString(ie);
