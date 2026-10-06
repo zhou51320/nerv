@@ -1,5 +1,6 @@
 #include "strata/core/remote_experts.hpp"
 #include "strata/core/remote_expert_opt.hpp"
+#include "strata/platform/cuda_compat.hpp"
 
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/iq_kernels.hpp"
@@ -76,7 +77,13 @@ bool RemoteExperts::preflight(int device, double& free_gib, std::string& err) {
     // before the device's context exists, so first thing; STRATA_REMOTE_SPIN=0 keeps the driver's default.
 #if !defined(STRATA_USE_HIP)
     const char* spin = std::getenv("STRATA_REMOTE_SPIN");
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 12000
     if (!(spin && spin[0] == '0')) cudaInitDevice(device, cudaDeviceScheduleSpin | cudaDeviceMapHost, 0);
+#else
+    // cudaInitDevice was added in CUDA 12. CUDA 11 initializes the primary
+    // context through cudaSetDevice; retain the default scheduler there.
+    (void) spin;
+#endif
     cudaGetLastError();
 #endif
     // HIP has no cudaInitDevice equivalent; retain its default scheduling policy.
