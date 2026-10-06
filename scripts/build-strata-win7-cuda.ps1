@@ -69,7 +69,11 @@ if ($NoPackage) {
 }
 
 function Find-Binary([string]$Name) {
-  $hit = Get-ChildItem -LiteralPath $BuildDir -Recurse -File -Filter "$Name.exe" |
+  $searchRoots = @($BuildDir)
+  if ($BuildVision -and $Name -eq 'strata-vision') {
+    $searchRoots += (Join-Path $Root 'build-strata-win7-vision')
+  }
+  $hit = Get-ChildItem -Path $searchRoots -Recurse -File -Filter "$Name.exe" |
     Select-Object -First 1
   if (-not $hit) { throw "Built binary not found: $Name.exe" }
   return $hit.FullName
