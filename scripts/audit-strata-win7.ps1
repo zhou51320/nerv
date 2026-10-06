@@ -54,11 +54,11 @@ if ($PackageDir) {
   }
   $dlls = @(Get-ChildItem -LiteralPath $PackageDir -Recurse -File -Filter '*.dll')
   foreach ($dll in $dlls) {
-    if ($dll.Name -notmatch '^(cublas64_|cublasLt64_).*\.dll$') {
+    if ($dll.Name -notmatch '^(cublas64_|cublasLt64_|cudart64_).*\.dll$') {
       throw "Strata package contains forbidden DLL: $($dll.FullName)"
     }
   }
-  foreach ($pattern in @('cublas64_*.dll', 'cublasLt64_*.dll')) {
+  foreach ($pattern in @('cublas64_*.dll', 'cublasLt64_*.dll', 'cudart64_*.dll')) {
     if (-not (Get-ChildItem -LiteralPath $PackageDir -File -Filter $pattern)) {
       throw "Strata package missing required CUDA runtime DLL: $pattern"
     }
