@@ -50,4 +50,11 @@ add_subdirectory(${LLAMA_DIR} llama EXCLUDE_FROM_ALL)
 add_executable(strata-vision strata_vision.cpp)
 target_link_libraries(strata-vision PRIVATE mtmd llama)
 target_compile_features(strata-vision PRIVATE cxx_std_17)
+if(MSVC AND STRATA_VISION_CUDA)
+  # Do not make `strata-vision.exe --help` require a GPU driver at process
+  # load time. The CUDA backend calls nvcuda only after real image work starts.
+  # This matches llama.cpp's CLI behavior on a Win7 VM without an NVIDIA card.
+  target_link_options(strata-vision PRIVATE "/DELAYLOAD:nvcuda.dll")
+  target_link_libraries(strata-vision PRIVATE delayimp)
+endif()
 set_target_properties(strata-vision PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
