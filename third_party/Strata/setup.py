@@ -110,6 +110,7 @@ PREBUILT_ASSET = "strata-windows-x64.zip" if WIN else "strata-linux-x64.zip"
 # the CUDA libraries the ready-made engine loads (the same CUDA 13.0 it is built with), from NVIDIA's pip packages
 CUDA_WHEELS = ["nvidia-cublas==13.0.2.14", "nvidia-cuda-runtime==13.0.96"]
 MIN_DRIVER = 580                       # CUDA 13.0
+BUNDLED_WIN7_MIN_DRIVER = 450         # local CUDA 11.x sm75 package
 # Older NVIDIA GPUs (experimental): CUDA 13 dropped Pascal (sm_60/61) and Volta (sm_70), so a model whose GPUs include
 # one runs a second engine, built with CUDA 12.9 (-DSTRATA_EXPERIMENTAL_SM60=ON) and kept in its own folder: the
 # ready-made one is CUDA12_ASSET (Windows; on Linux it is compiled here with a CUDA 12.x toolkit).  One engine runs per
@@ -659,7 +660,21 @@ def gpus():
                           "driver": drv})
         except ValueError:
             continue
-    return found
+    if found:
+        return found
+
+    # Older Win7 drivers (notably 47x) may reject the compute_cap query even
+    # though the bundled CUDA engine can enumerate the card. Fall back to the
+    # engine's own device probe and preserve the RTX 20xx sm75 result.
+    probe = ROOT / "engine" / ("strata-device.exe" if WIN else "strata-device")
+    text = out([str(probe), "--list-devices"])
+    m = re.search(r"device\s+(\d+):\s*(.+?)\s*\n\s*compute capability\s+(\d+)\.(\d+),\s*([\d.]+)\s*GiB", text, re.I)
+    if not m:
+        return []
+    idx, name, major, minor, mem = m.groups()
+    drv = out(["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader,nounits"]).strip()
+    return [{"index": int(idx), "name": name.strip(), "vram_gb": float(mem),
+             "arch": major + minor, "driver": (drv.splitlines() or ["unknown"])[0].strip()}]
 
 
 def gpu_drives_display(g) -> bool:
@@ -4330,6 +4345,8 @@ def main() -> int:
         if why:
             (warn if cuda_tk == 13 or str(a.cuda) == "12" else ok)(f"CUDA {cuda_tk}: {why}")
         min_driver = CUDA12_MIN_DRIVER if cuda_tk == 12 else MIN_DRIVER
+        if os.environ.get("STRATA_WIN7_CUDA11") == "1" and cuda_tk != 12:
+            min_driver = BUNDLED_WIN7_MIN_DRIVER
         if driver_major(gpu) < min_driver:
             fail(f"the NVIDIA driver is too old ({gpu['driver']}; {min_driver} or newer is needed)",
                  "update it with the NVIDIA App or from https://www.nvidia.com/drivers, restart, and run this again" +

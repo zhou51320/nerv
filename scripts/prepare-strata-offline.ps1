@@ -49,7 +49,10 @@ Copy-Item -LiteralPath (Join-Path $SourceDir 'setup.py') -Destination (Join-Path
 Copy-Item -LiteralPath (Join-Path $SourceDir 'requirements.txt') -Destination (Join-Path $PackageDir 'requirements.txt') -Force
 Copy-Item -LiteralPath (Join-Path $SourceDir 'serve') -Destination (Join-Path $PackageDir 'serve') -Recurse -Force
 New-Item -ItemType Directory -Force -Path (Join-Path $PackageDir 'tools') | Out-Null
-Copy-Item -LiteralPath (Join-Path $SourceDir 'tools\strata_mcp.py') -Destination (Join-Path $PackageDir 'tools\strata_mcp.py') -Force
+# setup.py imports gguf_reader while validating model shards. Bundle every
+# first-party Python tool needed by the offline setup, not just the MCP tool.
+Get-ChildItem -LiteralPath (Join-Path $SourceDir 'tools') -File -Filter '*.py' |
+  Copy-Item -Destination (Join-Path $PackageDir 'tools') -Force
 $thirdParty = Join-Path $PackageDir 'third_party'
 New-Item -ItemType Directory -Force -Path $thirdParty | Out-Null
 $llamaDest = Join-Path $thirdParty ([IO.Path]::GetFileName($llamaZipPath))
@@ -67,15 +70,16 @@ Set-Content -LiteralPath (Join-Path $PackageDir 'python\.strata-pip.json') -Valu
 
 $modelDir = Join-Path $PackageDir 'models\qwen3.8-flash-next\IQ3_XXS'
 New-Item -ItemType Directory -Force -Path $modelDir | Out-Null
-@('Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf',
-   'Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf') |
+@('Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00003.gguf',
+   'Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00003.gguf',
+   'Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00003-of-00003.gguf') |
   Set-Content -LiteralPath (Join-Path $modelDir 'PLACE-MODEL-FILES-HERE.txt') -Encoding UTF8
 
-@('@echo off','setlocal','set STRATA_OFFLINE=1','set STRATA_PORTABLE=1','cd /d "%~dp0"','python\python.exe setup.py %*','if errorlevel 1 pause') |
+@('@echo off','setlocal','set STRATA_OFFLINE=1','set STRATA_PORTABLE=1','set STRATA_WIN7_CUDA11=1','cd /d "%~dp0"','python\python.exe setup.py %*','if errorlevel 1 pause') |
   Set-Content -LiteralPath (Join-Path $PackageDir 'START-HERE.bat') -Encoding ASCII
-@('@echo off','setlocal','set STRATA_OFFLINE=1','set STRATA_PORTABLE=1','cd /d "%~dp0"',
-  'if not exist "models\qwen3.8-flash-next\IQ3_XXS\Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf" (',
-  '  echo Put both IQ3_XXS GGUF shards into models\qwen3.8-flash-next\IQ3_XXS first.','  pause','  exit /b 1',')',
+@('@echo off','setlocal','set STRATA_OFFLINE=1','set STRATA_PORTABLE=1','set STRATA_WIN7_CUDA11=1','cd /d "%~dp0"',
+  'if not exist "models\qwen3.8-flash-next\IQ3_XXS\Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00003-of-00003.gguf" (',
+  '  echo Put all three GSQ-RCO IQ3_XXS GGUF shards into models\qwen3.8-flash-next\IQ3_XXS first.','  pause','  exit /b 1',')',
   'python\python.exe setup.py --yes --family qwen --model IQ3_XXS --gguf-dir "models\qwen3.8-flash-next\IQ3_XXS" --context 32768 --vision no --no-start',
   'if errorlevel 1 pause ^& exit /b 1','python\python.exe setup.py','if errorlevel 1 pause') |
   Set-Content -LiteralPath (Join-Path $PackageDir 'RUN-IQ3-XXS.bat') -Encoding ASCII
