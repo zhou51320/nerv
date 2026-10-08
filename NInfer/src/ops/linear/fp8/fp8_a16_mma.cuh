@@ -205,10 +205,8 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
         }
         const unsigned top_scale_bits    = __shfl_sync(kMask, lane_scale, lane & ~3);
         const unsigned bottom_scale_bits = __shfl_sync(kMask, lane_scale, (lane & ~3) + 1);
-        const float top_scale =
-            __bfloat162float(__ushort_as_bfloat16(static_cast<std::uint16_t>(top_scale_bits)));
-        const float bottom_scale =
-            __bfloat162float(__ushort_as_bfloat16(static_cast<std::uint16_t>(bottom_scale_bits)));
+        const float top_scale    = bf16_low_to_float(top_scale_bits);
+        const float bottom_scale = bf16_low_to_float(bottom_scale_bits);
 
 #pragma unroll
         for (int token_mma = 0; token_mma < kTokenMmas; ++token_mma) {

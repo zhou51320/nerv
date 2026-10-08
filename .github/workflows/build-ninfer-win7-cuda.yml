@@ -100,7 +100,8 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $false
           $build = Join-Path $env:GITHUB_WORKSPACE 'NInfer/build-win7-cuda'
-          cmake --build $build --config Release --target ninfer -j 2>&1 |
+          # Collect independent compiler failures in one run; Ninja still exits nonzero.
+          cmake --build $build --config Release --target ninfer -j -- -k0 2>&1 |
             Tee-Object -FilePath (Join-Path $build 'build.log')
           if ($LASTEXITCODE -ne 0) { throw "NInfer compilation failed: $LASTEXITCODE" }
 
