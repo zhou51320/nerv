@@ -279,7 +279,7 @@ void launch_bf16_prefill_mma(Bf16GdnGatingTokenVariant variant, const Tensor& x,
         CUDA_CHECK(attr);
         if constexpr (SplitK > 1) {
             CUDA_CHECK(pdl::launch_cooperative(
-                pdl::LaunchConfig{grid, block, kSmemBytes, stream},
+                pdl::LaunchConfig{grid, block, static_cast<std::size_t>(kSmemBytes), stream},
                 bf16_gdn_gating_proj_gemm_mma_kernel<Geometry, SplitK, FullTokens, Warps,
                                                      NormalizeInput, NormTokenCapacity>,
                 static_cast<const __nv_bfloat16*>(x.data),
